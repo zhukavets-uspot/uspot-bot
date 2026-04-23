@@ -43,14 +43,24 @@ bot.onText(/\/start/, async (msg) => {
   const name   = msg.from?.first_name || "друг";
   console.log(`👋 /start from ${chatId} (${name})`);
 
-  await send(chatId,
-    `👋 Привет, ${name}!\n\n` +
-    `Теперь вы будете получать уведомления от <b>Uspot</b>:\n\n` +
-    `✅ Подтверждение записей\n` +
-    `⏰ Напоминания за 24 ч и за 1 ч\n` +
-    `✨ Статус после сеанса\n\n` +
-    `Возвращайтесь в приложение — всё готово! 💜`
-  );
+  try {
+    await bot.sendMessage(chatId,
+      `👋 Привет, ${name}! Добро пожаловать в <b>Uspot</b> — сервис записи к мастерам красоты Минска.\n\n` +
+      `Выберите, как хотите продолжить:`,
+      {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "📅 Записаться к Мастеру Uspot", url: "https://t.me/UspotTG_bot/Uspot_BY" }],
+            [{ text: "💅 Вход в Кабинет Мастера Uspot", url: "https://t.me/UspotTG_bot/Uspot_BY?startapp=master" }]
+          ]
+        }
+      }
+    );
+  } catch (e) {
+    console.error(`⚠️  Failed to send /start reply to ${chatId}:`, e.message);
+  }
 });
 
 // ── Helper: send a Telegram message safely ───────────────────
@@ -296,12 +306,61 @@ app.post("/notify", async (req, res) => {
   res.json({ ok: true, sent, total: recipients.length });
 });
 
+// ════════════════════════════════════════════════════════════
+// 5. POST /broadcast — shareholders send promos to clients
+//    Body: { master_id?: "uuid", message: "text", shareholder_id?: "tg_id" }
+//    If master_id supplied → sends to clients who booked that master.
+//    If omitted → sends to ALL clients who ever made a booking.
+// ════════════════════════════════════════════════════════════
+app.post("/broadcast", async (req, res) => {
+  const { master_id, message, shareholder_id } = req.body;
+  if (!message) return res.status(400).json({ error: "Missing message" });
+
+  // Optional: verify sender is a shareholder
+  if (shareholder_id) {
+    try {
+      const { data: sh } = await db.from("shareholders").select("id").eq("telegram_id", String(shareholder_id)).single();
+      if (!sh) return res.status(403).json({ error: "Not a shareholder" });
+    } catch (e) {
+      return res.status(403).json({ error: "Shareholder check failed" });
+    }
+  }
+
+  // Fetch distinct client Telegram IDs from bookings
+  let clientIds = [];
+  try {
+    let query = db.from("bookings").select("client_telegram_id").not("client_telegram_id", "is", null);
+    if (master_id) query = query.eq("master_id", master_id);
+    const { data, error } = await query;
+    if (error) throw error;
+    clientIds = [...new Set((data || []).map(r => r.client_telegram_id).filter(Boolean))];
+  } catch (e) {
+    console.error("Broadcast: DB error fetching clients:", e.message);
+    return res.status(500).json({ error: e.message });
+  }
+
+  console.log(`📣 Broadcasting to ${clientIds.length} clients…`);
+  let sent = 0;
+  for (const chatId of clientIds) {
+    try {
+      await bot.sendMessage(chatId, message, { parse_mode: "HTML", disable_web_page_preview: true });
+      sent++;
+    } catch (e) {
+      console.error(`Broadcast failed to ${chatId}:`, e.message);
+    }
+  }
+
+  console.log(`📣 Broadcast done: ${sent}/${clientIds.length} sent`);
+  res.json({ ok: true, sent, total: clientIds.length });
+});
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true, uptime: Math.round(process.uptime()) + "s" });
 });
 
 app.listen(PORT, () => {
   console.log(`🤖 Uspot bot HTTP server running on port ${PORT}`);
-  console.log(`📡 POST /notify  — send Telegram messages`);
-  console.log(`💚 GET  /health  — uptime check`);
+  console.log(`📡 POST /notify     — send Telegram messages`);
+  console.log(`📣 POST /broadcast  — shareholder promo to clients`);
+  console.log(`💚 GET  /health     — uptime check`);
 });
