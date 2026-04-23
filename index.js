@@ -38,7 +38,25 @@ const db  = createClient(SUPABASE_URL, SUPABASE_KEY);
 // The Mini App shows an "Enable notifications" button that
 // opens this chat. One tap = notifications unlocked forever.
 // ════════════════════════════════════════════════════════════
-bot.onText(/\/start/, async (msg) => {
+// /start notify — sent when user taps "Enable notifications" in the Mini App
+// Must be registered BEFORE the generic /start handler
+bot.onText(/\/start notify/, async (msg) => {
+  const chatId = msg.chat.id;
+  const name   = msg.from?.first_name || "друг";
+  console.log(`🔔 /start notify from ${chatId} (${name})`);
+
+  await send(chatId,
+    `👋 Привет, ${name}!\n\n` +
+    `Теперь вы будете получать уведомления от <b>Uspot</b>:\n\n` +
+    `✅ Подтверждение записей\n` +
+    `⏰ Напоминания за 24 ч и за 1 ч\n` +
+    `✨ Статус после сеанса\n\n` +
+    `Возвращайтесь в приложение — всё готово! 💜`
+  );
+});
+
+// /start — regular welcome with two Mini App buttons
+bot.onText(/\/start$/, async (msg) => {
   const chatId = msg.chat.id;
   const name   = msg.from?.first_name || "друг";
   console.log(`👋 /start from ${chatId} (${name})`);
