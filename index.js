@@ -147,7 +147,7 @@ db.channel("uspot-new-bookings")
       }
     }
 
-    // → Master: new booking alert
+    // → Master: new booking alert (Uspot = deep link to master dashboard)
     if (masterTgId) {
       await send(masterTgId,
         `📅 <b>Новая запись!</b>\n\n` +
@@ -155,7 +155,7 @@ db.channel("uspot-new-bookings")
         `💇 ${b.service_name || "Услуга"}\n` +
         `📆 ${date}, ${time}\n` +
         `💳 ${price}\n\n` +
-        `Откройте Uspot для подтверждения.`
+        `Откройте <a href="https://t.me/UspotTG_bot/Uspot_BY?startapp=master">Uspot</a> для подтверждения.`
       );
     }
 
@@ -220,7 +220,7 @@ db.channel("uspot-completed-bookings")
       `✨ <b>Сеанс завершён!</b>\n\n` +
       `💇 ${b.service_name || "Услуга"}\n` +
       `💳 Итого: <b>${finalPrice} BYN</b>${payLine}\n\n` +
-      `Спасибо! Оставьте отзыв в Uspot 💜`
+      `Спасибо, что выбрали Uspot! 💜`
     );
   })
   .subscribe((status) => {
@@ -271,6 +271,10 @@ const runReminders = async () => {
     const hoursUntil = (bookingDt - now) / 3600000;
     if (hoursUntil < 23 || hoursUntil > 25) continue;
 
+    // Skip if booking was just created (less than 4 hours ago) —
+    // client already got a confirmation, no need to pile on immediately
+    if (b.created_at && (now - new Date(b.created_at)) / 3600000 < 4) continue;
+
     const master = Array.isArray(b.masters) ? b.masters[0] : b.masters;
     await send(b.client_telegram_id,
       `⏰ <b>Напоминание на завтра</b>\n\n` +
@@ -280,6 +284,27 @@ const runReminders = async () => {
       (master?.location ? `📍 ${master.location}\n` : "") +
       (b.total_price ? `💳 ${b.total_price} BYN\n` : "") +
       `\nДо встречи в Uspot! 💜`
+    );
+  }
+
+  // Review request — confirmed bookings from today that ended 3-4h ago
+  const { data: pastBookings } = await db
+    .from("bookings")
+    .select("*")
+    .eq("status", "confirmed")
+    .eq("booked_date", todayStr);
+
+  for (const b of pastBookings || []) {
+    if (!b.client_telegram_id) continue;
+    const bookingDt = new Date(`${b.booked_date}T${b.booked_time}`);
+    const hoursAgo = (now - bookingDt) / 3600000;
+    if (hoursAgo < 3 || hoursAgo > 4) continue;
+
+    await send(b.client_telegram_id,
+      `💜 <b>Как прошёл визит?</b>\n\n` +
+      `Надеемся, всё понравилось! Оставьте короткий отзыв — ` +
+      `это очень важно для вашего мастера 🙏\n\n` +
+      `👉 <a href="https://t.me/UspotTG_bot/Uspot_BY">Открыть Uspot</a>`
     );
   }
 
