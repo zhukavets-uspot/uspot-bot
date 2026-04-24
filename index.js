@@ -17,6 +17,9 @@ const { createClient } = require("@supabase/supabase-js");
 const express = require("express");
 const cors = require("cors");
 
+// Founders bot runs in the same process — requires FOUNDERS_BOT_TOKEN to activate
+require("./founders-bot");
+
 // ── Config ───────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://heiyayufhuvlxhirgvyc.supabase.co";
