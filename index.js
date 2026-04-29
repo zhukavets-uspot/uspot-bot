@@ -25,6 +25,8 @@ const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const SUPABASE_URL = process.env.SUPABASE_URL || "https://heiyayufhuvlxhirgvyc.supabase.co";
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const PORT         = process.env.PORT || 3000;
+// Direct HTTPS URL of the hosted Mini App (set in Railway env vars)
+const MINI_APP_URL = process.env.MINI_APP_URL || "https://uspot.netlify.app";
 
 if (!BOT_TOKEN || !SUPABASE_KEY) {
   console.error("❌ Missing TELEGRAM_BOT_TOKEN or SUPABASE_SERVICE_KEY in environment");
@@ -58,7 +60,7 @@ bot.onText(/\/start notify/, async (msg) => {
   );
 });
 
-// /start — regular welcome with two Mini App buttons
+// /start — welcome message + persistent sticky keyboard at the bottom of chat
 bot.onText(/\/start$/, async (msg) => {
   const chatId = msg.chat.id;
   const name   = msg.from?.first_name || "друг";
@@ -67,15 +69,18 @@ bot.onText(/\/start$/, async (msg) => {
   try {
     await bot.sendMessage(chatId,
       `👋 Привет, ${name}! Добро пожаловать в <b>Uspot</b> — сервис записи к мастерам красоты Минска.\n\n` +
-      `Выберите, как хотите продолжить:`,
+      `Используйте кнопки ниже, чтобы открыть приложение:`,
       {
         parse_mode: "HTML",
-        disable_web_page_preview: true,
         reply_markup: {
-          inline_keyboard: [
-            [{ text: "📅 Записаться к Мастеру Uspot", url: "https://t.me/UspotTG_bot/Uspot_BY" }],
-            [{ text: "💅 Вход в Кабинет Мастера Uspot", url: "https://t.me/UspotTG_bot/Uspot_BY?startapp=master" }]
-          ]
+          // web_app buttons open the Mini App directly; persistent:true keeps
+          // the keyboard pinned below the input field forever (Bot API 6.1+)
+          keyboard: [[
+            { text: "📅 Записаться к Мастеру Uspot",    web_app: { url: MINI_APP_URL } },
+            { text: "💅 Вход в Кабинет Мастера Uspot",  web_app: { url: MINI_APP_URL + "?startapp=master" } }
+          ]],
+          resize_keyboard: true,
+          persistent: true
         }
       }
     );
@@ -695,9 +700,25 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, uptime: Math.round(process.uptime()) + "s" });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`🤖 Uspot bot HTTP server running on port ${PORT}`);
   console.log(`📡 POST /notify     — send Telegram messages`);
   console.log(`📣 POST /broadcast  — shareholder promo to clients`);
   console.log(`💚 GET  /health     — uptime check`);
 });
+
+// Graceful shutdown — stops polling before process exits so Railway
+// can start the new instance without getting a 409 Conflict from Telegram
+const shutdown = async (signal) => {
+  console.log(`\n[${signal}] Shutting down gracefully…`);
+  try { await bot.stopPolling(); } catch (e) { /* ignore */ }
+  server.close(() => {
+    console.log("HTTP server closed. Bye!");
+    process.exit(0);
+  });
+  // Force exit after 5 s if something hangs
+  setTimeout(() => process.exit(0), 5000).unref();
+};
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT",  () => shutdown("SIGINT"));
