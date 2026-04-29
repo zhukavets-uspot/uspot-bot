@@ -347,8 +347,143 @@ db.channel("uspot-founders-cancellations")
     if (status === "SUBSCRIBED") console.log("[Founders] Realtime: listening for cancellations");
   });
 
+// ════════════════════════════════════════════════════════════
+// FEEDBACK — receive from Mini App, let founders reply inline
+// ════════════════════════════════════════════════════════════
+
+// founderId → { clientTelegramId, clientName } for pending replies
+const pendingReplies = new Map();
+
+// Realtime: new feedback row → broadcast to all founders with Reply button
+db.channel("uspot-founders-feedback")
+  .on("postgres_changes", {
+    event: "INSERT",
+    schema: "public",
+    table: "feedback",
+  }, async (payload) => {
+    const f = payload.new;
+    console.log(`[Founders] Feedback from ${f.user_name} (${f.user_telegram_id})`);
+
+    for (const chatId of registeredFounders) {
+      try {
+        await bot.sendMessage(String(chatId),
+          `💬 <b>Обратная связь</b>\n\n` +
+          `👤 <b>${f.user_name}</b>\n` +
+          `🆔 ${f.user_telegram_id}\n\n` +
+          `"${f.message}"`,
+          {
+            parse_mode: "HTML",
+            disable_web_page_preview: true,
+            reply_markup: {
+              inline_keyboard: [[
+                {
+                  text: "✉️ Ответить",
+                  callback_data: `reply_${f.user_telegram_id}_${encodeURIComponent(f.user_name || "Пользователь")}`
+                }
+              ]]
+            }
+          }
+        );
+      } catch (e) {
+        console.error(`[Founders] Feedback notify failed for ${chatId}:`, e.message);
+      }
+    }
+  })
+  .subscribe((status) => {
+    if (status === "SUBSCRIBED") console.log("[Founders] Realtime: listening for feedback");
+  });
+
+// Handle "✉️ Ответить" button click
+bot.on("callback_query", async (query) => {
+  const founderId = String(query.from.id);
+  if (!registeredFounders.has(founderId)) {
+    await bot.answerCallbackQuery(query.id).catch(() => {}); return;
+  }
+
+  const data = query.data || "";
+  if (data.startsWith("reply_")) {
+    const [clientId, encodedName] = data.slice(6).split("_");
+    const clientName = encodedName ? decodeURIComponent(encodedName) : "клиенту";
+    pendingReplies.set(founderId, { clientTelegramId: clientId, clientName });
+    await bot.answerCallbackQuery(query.id).catch(() => {});
+    await send(founderId,
+      `✉️ Введите текст ответа для <b>${clientName}</b>:\n\n` +
+      `<i>Следующее сообщение будет отправлено клиенту</i>`
+    );
+  }
+});
+
+// Forward next founder message as a reply to the client
+bot.on("message", async (msg) => {
+  const founderId = String(msg.chat.id);
+  if (!registeredFounders.has(founderId)) return;
+  if (msg.text?.startsWith("/")) return; // let commands pass through
+
+  const pending = pendingReplies.get(founderId);
+  if (pending && msg.text) {
+    pendingReplies.delete(founderId);
+    try {
+      await bot.sendMessage(pending.clientTelegramId,
+        `💜 <b>Ответ от команды Uspot:</b>\n\n${msg.text}`,
+        { parse_mode: "HTML" }
+      );
+      await send(founderId, `✅ Ответ отправлен <b>${pending.clientName}</b>`);
+    } catch (e) {
+      await send(founderId, `⚠️ Не удалось отправить: ${e.message}`);
+    }
+  }
+});
+
 // ── Init ─────────────────────────────────────────────────────
 loadFounders();
 console.log("[Founders] Uspot Founders bot started ✅");
 
-module.exports = {};
+// ════════════════════════════════════════════════════════════
+// EXPORTED — called by index.js POST /feedback endpoint.
+// Direct send to all founders WITH the Reply button.
+// Bypasses Realtime entirely — no table/publication needed.
+// ════════════════════════════════════════════════════════════
+const notifyFeedback = async ({ message, user_name, user_telegram_id }) => {
+  // Save to DB for audit trail (non-fatal if it fails)
+  try {
+    await db.from("feedback").insert({ message, user_name, user_telegram_id });
+  } catch (e) {
+    console.warn("[Founders] feedback DB save failed (non-fatal):", e.message);
+  }
+
+  if (registeredFounders.size === 0) {
+    console.warn("[Founders] notifyFeedback: no registered founders to notify");
+    return { sent: 0 };
+  }
+
+  let sent = 0;
+  for (const chatId of registeredFounders) {
+    try {
+      await bot.sendMessage(String(chatId),
+        `💬 <b>Обратная связь</b>\n\n` +
+        `👤 <b>${user_name || "Пользователь"}</b>\n` +
+        `🆔 ${user_telegram_id}\n\n` +
+        `"${message}"`,
+        {
+          parse_mode: "HTML",
+          disable_web_page_preview: true,
+          reply_markup: {
+            inline_keyboard: [[
+              {
+                text: "✉️ Ответить",
+                callback_data: `reply_${user_telegram_id}_${encodeURIComponent(user_name || "Пользователь")}`
+              }
+            ]]
+          }
+        }
+      );
+      sent++;
+    } catch (e) {
+      console.error(`[Founders] notifyFeedback to ${chatId} failed:`, e.message);
+    }
+  }
+  console.log(`[Founders] notifyFeedback: sent to ${sent}/${registeredFounders.size} founder(s)`);
+  return { sent };
+};
+
+module.exports = { notifyFeedback };

@@ -18,7 +18,7 @@ const express = require("express");
 const cors = require("cors");
 
 // Founders bot runs in the same process — requires FOUNDERS_BOT_TOKEN to activate
-require("./founders-bot");
+const { notifyFeedback } = require("./founders-bot");
 
 // ── Config ───────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
@@ -673,6 +673,22 @@ app.post("/notify_reschedule", async (req, res) => {
     `💳 ${price || "—"}`
   );
   res.json({ ok: true });
+});
+
+// ── POST /feedback — mini-app sends feedback, founders notified instantly ──
+// Body: { message, user_name, user_telegram_id }
+// Does NOT depend on Realtime or the feedback table existing.
+app.post("/feedback", async (req, res) => {
+  const { message, user_name, user_telegram_id } = req.body;
+  if (!message) return res.status(400).json({ error: "Missing message" });
+
+  try {
+    const result = await notifyFeedback({ message, user_name, user_telegram_id });
+    res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error("/feedback error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 app.get("/health", (_req, res) => {
