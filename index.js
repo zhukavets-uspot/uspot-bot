@@ -118,9 +118,36 @@ const dateRu = (iso) => {
 
 const timeShort = (t) => (t || "").substring(0, 5);
 
+// ── Helper: send with inline keyboard ───────────────────────
+const sendWithKeyboard = async (chatId, text, keyboard) => {
+  if (!chatId) return;
+  try {
+    await bot.sendMessage(String(chatId), text, {
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: keyboard },
+    });
+  } catch (e) {
+    console.error(`⚠️  Failed to send keyboard msg to ${chatId}:`, e.message);
+  }
+};
+
+// ── In-memory: clients awaiting free-text cancel reason ─────
+// Map<clientTgId, { bookingId, masterTgId, bookingInfo }>
+const pendingCancelText = new Map();
+
+// ── Cancel reason codes → Russian text ──────────────────────
+const CANCEL_REASONS = {
+  "1": "Нет времени",
+  "2": "Изменились планы",
+  "3": "Нашла другого мастера",
+  "4": "Не устраивает цена",
+};
+
 // ════════════════════════════════════════════════════════════
 // 1. SUPABASE REALTIME — New booking (INSERT)
-//    Fires instantly when a client books any service
+//    status = 'pending'  → master gets confirm/suggest buttons
+//    status = 'confirmed' → legacy/fallback, direct confirm
 // ════════════════════════════════════════════════════════════
 db.channel("uspot-new-bookings")
   .on("postgres_changes", {
@@ -129,52 +156,81 @@ db.channel("uspot-new-bookings")
     table: "bookings",
   }, async (payload) => {
     const b = payload.new;
-    console.log("📥 New booking inserted:", b.id);
+    if (b.client_name?.startsWith("🔒")) return; // skip manual blocks
+    console.log("📥 New booking inserted:", b.id, "status:", b.status);
 
-    const date = dateRu(b.booked_date);
-    const time = timeShort(b.booked_time);
+    const date  = dateRu(b.booked_date);
+    const time  = timeShort(b.booked_time);
     const price = b.total_price ? `${b.total_price} BYN` : "—";
 
-    // Get master's Telegram ID (needed for notification)
-    let masterTgId = null;
-    let masterName = b.master_name || "Мастер";
+    // Resolve master's Telegram ID
+    let masterTgId  = null;
+    let masterName  = b.master_name || "Мастер";
     if (b.master_id) {
       const { data: master } = await db
-        .from("masters")
-        .select("name, telegram_user_id")
-        .eq("id", b.master_id)
-        .single();
-      if (master) {
-        masterTgId = master.telegram_user_id;
-        masterName = master.name || masterName;
+        .from("masters").select("name, telegram_user_id").eq("id", b.master_id).single();
+      if (master) { masterTgId = master.telegram_user_id; masterName = master.name || masterName; }
+    }
+
+    if (b.status === "pending") {
+      // ── NEW FLOW: master must confirm ──────────────────────
+      // Master gets notification WITH confirm/suggest buttons
+      if (masterTgId) {
+        await sendWithKeyboard(masterTgId,
+          `📅 <b>Новая запись!</b>\n\n` +
+          `👤 ${b.client_name || "Клиент"}\n` +
+          `💇 ${b.service_name || "Услуга"}\n` +
+          `📆 ${date}, ${time}\n` +
+          `💳 ${price}\n\n` +
+          `Подтвердите или предложите другое время:`,
+          [[
+            { text: "✅ Подтвердить",              callback_data: `confirm_${b.id}` },
+            { text: "⏰ Предложить другое время",   callback_data: `suggest_${b.id}` },
+          ]]
+        );
+      }
+
+      // Client gets "pending" message
+      if (b.client_telegram_id) {
+        await send(b.client_telegram_id,
+          `⏳ <b>Запись отправлена!</b>\n\n` +
+          `👩‍🎨 ${masterName}\n` +
+          `💇 ${b.service_name || "Услуга"}\n` +
+          `📆 ${date}, ${time}\n` +
+          `💳 ${price}\n\n` +
+          `Мастер подтвердит запись в ближайшее время. Мы сразу сообщим вам! 💜`
+        );
+      }
+
+    } else {
+      // ── LEGACY / FALLBACK FLOW: already confirmed ──────────
+      if (masterTgId) {
+        await send(masterTgId,
+          `📅 <b>Новая запись!</b>\n\n` +
+          `👤 ${b.client_name || "Клиент"}\n` +
+          `💇 ${b.service_name || "Услуга"}\n` +
+          `📆 ${date}, ${time}\n` +
+          `💳 ${price}\n\n` +
+          `Откройте <a href="https://t.me/UspotTG_bot/Uspot_BY?startapp=master">Uspot</a> для управления записями.`
+        );
+      }
+      if (b.client_telegram_id) {
+        await sendWithKeyboard(b.client_telegram_id,
+          `✅ <b>Запись подтверждена!</b>\n\n` +
+          `👩‍🎨 ${masterName}\n` +
+          `💇 ${b.service_name || "Услуга"}\n` +
+          `📆 ${date}, ${time}\n` +
+          `💳 ${price}\n\n` +
+          `До встречи в Uspot! 💜`,
+          [[
+            { text: "📅 Перенести", url: `https://t.me/UspotTG_bot/Uspot_BY?startapp=reschedule_${b.id}_${b.master_id}` },
+            { text: "❌ Отменить",  callback_data: `client_cancel_${b.id}` },
+          ]]
+        );
       }
     }
 
-    // → Master: new booking alert (Uspot = deep link to master dashboard)
-    if (masterTgId) {
-      await send(masterTgId,
-        `📅 <b>Новая запись!</b>\n\n` +
-        `👤 ${b.client_name || "Клиент"}\n` +
-        `💇 ${b.service_name || "Услуга"}\n` +
-        `📆 ${date}, ${time}\n` +
-        `💳 ${price}\n\n` +
-        `Откройте <a href="https://t.me/UspotTG_bot/Uspot_BY?startapp=master">Uspot</a> для подтверждения.`
-      );
-    }
-
-    // → Client: booking confirmation
-    if (b.client_telegram_id) {
-      await send(b.client_telegram_id,
-        `✅ <b>Запись подтверждена!</b>\n\n` +
-        `👩‍🎨 ${masterName}\n` +
-        `💇 ${b.service_name || "Услуга"}\n` +
-        `📆 ${date}, ${time}\n` +
-        `💳 ${price}\n\n` +
-        `До встречи в Uspot! 💜`
-      );
-    }
-
-    // → Shareholders: summary
+    // → Shareholders: summary (always)
     const shareholderIds = await getShareholderIds("notify_bookings");
     for (const id of shareholderIds) {
       await send(id,
@@ -189,10 +245,10 @@ db.channel("uspot-new-bookings")
   });
 
 // ════════════════════════════════════════════════════════════
-// 2. SUPABASE REALTIME — Booking completed (UPDATE)
-//    Fires when master marks session as done
+// 2. SUPABASE REALTIME — Booking status changes (UPDATE)
+//    Handles: pending→confirmed, →declined, →cancelled, →completed
 // ════════════════════════════════════════════════════════════
-db.channel("uspot-completed-bookings")
+db.channel("uspot-booking-updates")
   .on("postgres_changes", {
     event: "UPDATE",
     schema: "public",
@@ -200,38 +256,237 @@ db.channel("uspot-completed-bookings")
   }, async (payload) => {
     const b   = payload.new;
     const old = payload.old;
+    if (b.status === old.status) return; // no status change, skip
 
-    // Only react when status changes to "completed"
-    if (b.status !== "completed" || old.status === "completed") return;
-    console.log("✅ Booking completed:", b.id);
+    const date  = dateRu(b.booked_date);
+    const time  = timeShort(b.booked_time);
+    const price = b.total_price ? `${b.total_price} BYN` : "—";
 
-    if (!b.client_telegram_id) return;
+    // ── pending → confirmed ──────────────────────────────────
+    if (b.status === "confirmed" && old.status === "pending") {
+      console.log("✅ Booking confirmed by master:", b.id);
 
-    const finalPrice = b.final_price ?? b.total_price;
-    const origPrice  = b.total_price || 0;
-    const diff = finalPrice - (b.payment_status === "paid" ? Math.round(origPrice * 0.30) : 0);
+      // Resolve master name
+      let masterName = b.master_name || "Мастер";
+      if (!masterName && b.master_id) {
+        const { data: m } = await db.from("masters").select("name").eq("id", b.master_id).single();
+        if (m?.name) masterName = m.name;
+      }
 
-    let payLine = "";
-    if (b.payment_status === "paid") {
-      if (diff < 0)      payLine = `\n↩️ Возврат: <b>${Math.abs(diff)} BYN</b>`;
-      else if (diff > 0) payLine = `\n💵 Доплата: <b>${diff} BYN</b>`;
-    } else {
-      payLine = `\n💵 К оплате: <b>${finalPrice} BYN</b>`;
+      if (b.client_telegram_id) {
+        await sendWithKeyboard(b.client_telegram_id,
+          `✅ <b>Мастер подтвердил вашу запись!</b>\n\n` +
+          `👩‍🎨 ${masterName}\n` +
+          `💇 ${b.service_name || "Услуга"}\n` +
+          `📆 ${date}, ${time}\n` +
+          `💳 ${price}\n\n` +
+          `Ждём вас в Uspot! 💜`,
+          [[
+            { text: "📅 Перенести", url: `https://t.me/UspotTG_bot/Uspot_BY?startapp=reschedule_${b.id}_${b.master_id}` },
+            { text: "❌ Отменить",  callback_data: `client_cancel_${b.id}` },
+          ]]
+        );
+      }
     }
 
-    await send(b.client_telegram_id,
-      `✨ <b>Сеанс завершён!</b>\n\n` +
-      `💇 ${b.service_name || "Услуга"}\n` +
-      `💳 Итого: <b>${finalPrice} BYN</b>${payLine}\n\n` +
-      `Спасибо, что выбрали Uspot! 💜`
-    );
+    // ── any → declined (master suggested other time) ─────────
+    else if (b.status === "declined" && old.status !== "declined") {
+      console.log("⏰ Master declined booking:", b.id);
+      if (b.client_telegram_id) {
+        await sendWithKeyboard(b.client_telegram_id,
+          `😔 К сожалению, у Мастера произошла накладка и он не может принять вас в это время.\n\n` +
+          `💇 ${b.service_name || "Услуга"}\n` +
+          `📆 ${date}, ${time}\n\n` +
+          `Вы можете выбрать другое удобное время:`,
+          [[
+            { text: "📅 Выбрать новое время", url: `https://t.me/UspotTG_bot/Uspot_BY?startapp=m${b.master_id}` },
+          ]]
+        );
+      }
+    }
+
+    // ── any → cancelled (with client cancel reason) ──────────
+    else if (b.status === "cancelled" && old.status !== "cancelled") {
+      const reason = b.cancel_reason || "";
+      if (reason.startsWith("client:") || reason === "client_reschedule") {
+        console.log("❌ Client cancelled booking:", b.id, "reason:", reason);
+        // Notify master
+        let masterTgId = null;
+        if (b.master_id) {
+          const { data: m } = await db.from("masters").select("telegram_user_id").eq("id", b.master_id).single();
+          masterTgId = m?.telegram_user_id;
+        }
+        if (masterTgId) {
+          const reasonText = reason === "client_reschedule"
+            ? "Клиент переносит запись на другое время"
+            : reason.slice(7); // strip "client:"
+          const isReschedule = reason === "client_reschedule";
+          await send(masterTgId,
+            (isReschedule ? `📅 <b>Перенос записи</b>` : `❌ <b>Отмена от клиента</b>`) + `\n\n` +
+            `👤 ${b.client_name || "Клиент"}\n` +
+            `💇 ${b.service_name || "Услуга"}\n` +
+            `📆 ${date}, ${time}\n` +
+            `💳 ${price}\n` +
+            `💬 Причина: ${reasonText}` +
+            (isReschedule ? `\n\nОжидайте новую запись от клиента 👆` : "")
+          );
+        }
+      }
+      // force_majeure cancellations: founders-bot handles those
+    }
+
+    // ── any → completed ──────────────────────────────────────
+    else if (b.status === "completed" && old.status !== "completed") {
+      console.log("✅ Booking completed:", b.id);
+      if (!b.client_telegram_id) return;
+
+      const finalPrice = b.final_price ?? b.total_price;
+      const origPrice  = b.total_price || 0;
+      const diff = finalPrice - (b.payment_status === "paid" ? Math.round(origPrice * 0.30) : 0);
+      let payLine = "";
+      if (b.payment_status === "paid") {
+        if (diff < 0)      payLine = `\n↩️ Возврат: <b>${Math.abs(diff)} BYN</b>`;
+        else if (diff > 0) payLine = `\n💵 Доплата: <b>${diff} BYN</b>`;
+      } else {
+        payLine = `\n💵 К оплате: <b>${finalPrice} BYN</b>`;
+      }
+      await send(b.client_telegram_id,
+        `✨ <b>Сеанс завершён!</b>\n\n` +
+        `💇 ${b.service_name || "Услуга"}\n` +
+        `💳 Итого: <b>${finalPrice} BYN</b>${payLine}\n\n` +
+        `Спасибо, что выбрали Uspot! 💜`
+      );
+    }
   })
   .subscribe((status) => {
-    if (status === "SUBSCRIBED") console.log("✅ Realtime: listening for completed bookings");
+    if (status === "SUBSCRIBED") console.log("✅ Realtime: listening for booking status changes");
   });
 
 // ════════════════════════════════════════════════════════════
-// 3. SCHEDULED REMINDERS — runs every hour
+// 3. CALLBACK QUERIES — master confirm/suggest + client cancel
+// ════════════════════════════════════════════════════════════
+bot.on("callback_query", async (query) => {
+  const data     = query.data || "";
+  const chatId   = String(query.message?.chat?.id || query.from.id);
+  const msgId    = query.message?.message_id;
+
+  // ── Master: ✅ Подтвердить ───────────────────────────────
+  if (data.startsWith("confirm_")) {
+    const bookingId = data.slice(8);
+    try {
+      await db.from("bookings").update({ status: "confirmed" }).eq("id", bookingId);
+      await bot.answerCallbackQuery(query.id, { text: "✅ Запись подтверждена!" });
+      // Edit master's message to remove buttons
+      await bot.editMessageText(
+        `✅ <b>Запись подтверждена</b>\n\nКлиент получит уведомление. Ждём его в Uspot! 💜`,
+        { chat_id: chatId, message_id: msgId, parse_mode: "HTML" }
+      ).catch(() => {}); // non-fatal if message too old
+    } catch (e) {
+      await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка, попробуйте ещё раз" });
+      console.error("[Callback] confirm error:", e.message);
+    }
+    return;
+  }
+
+  // ── Master: ⏰ Предложить другое время ───────────────────
+  if (data.startsWith("suggest_")) {
+    const bookingId = data.slice(8);
+    try {
+      await db.from("bookings").update({ status: "declined" }).eq("id", bookingId);
+      await bot.answerCallbackQuery(query.id, { text: "⏰ Клиент получит уведомление" });
+      await bot.editMessageText(
+        `⏰ <b>Другое время предложено</b>\n\nКлиент получит уведомление и сможет перезаписаться.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: "HTML" }
+      ).catch(() => {});
+    } catch (e) {
+      await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка, попробуйте ещё раз" });
+      console.error("[Callback] suggest error:", e.message);
+    }
+    return;
+  }
+
+  // ── Client: ❌ Отменить — show reason options ────────────
+  if (data.startsWith("client_cancel_")) {
+    const bookingId = data.slice(14);
+    await bot.answerCallbackQuery(query.id);
+    await sendWithKeyboard(chatId,
+      `❌ <b>Отмена записи</b>\n\nУкажите причину — мастер её увидит:`,
+      [
+        [{ text: "⏱ Нет времени",             callback_data: `cr_${bookingId}_1` }],
+        [{ text: "📅 Изменились планы",         callback_data: `cr_${bookingId}_2` }],
+        [{ text: "💅 Нашла другого мастера",    callback_data: `cr_${bookingId}_3` }],
+        [{ text: "💰 Не устраивает цена",       callback_data: `cr_${bookingId}_4` }],
+        [{ text: "✏️ Написать своё",            callback_data: `cr_text_${bookingId}` }],
+      ]
+    );
+    return;
+  }
+
+  // ── Client: selected cancel reason ───────────────────────
+  if (data.startsWith("cr_")) {
+    const rest = data.slice(3);
+
+    // Free-text path
+    if (rest.startsWith("text_")) {
+      const bookingId = rest.slice(5);
+      const { data: bk } = await db.from("bookings").select("*").eq("id", bookingId).single();
+      pendingCancelText.set(chatId, {
+        bookingId,
+        masterInfo: bk,
+      });
+      await bot.answerCallbackQuery(query.id);
+      await send(chatId, `✏️ Напишите причину отмены — мастер её увидит:`);
+      return;
+    }
+
+    // Quick-pick reason
+    const underIdx = rest.lastIndexOf("_");
+    const bookingId  = rest.slice(0, underIdx);
+    const reasonCode = rest.slice(underIdx + 1);
+    const reasonText = CANCEL_REASONS[reasonCode] || reasonCode;
+
+    try {
+      await db.from("bookings")
+        .update({ status: "cancelled", cancel_reason: `client:${reasonText}` })
+        .eq("id", bookingId);
+      await bot.answerCallbackQuery(query.id, { text: "✅ Запись отменена" });
+      await send(chatId,
+        `✅ <b>Запись отменена</b>\n\nПричина: <i>${reasonText}</i>\n\nНадеемся увидеть вас снова в Uspot! 💜`
+      );
+    } catch (e) {
+      await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка" });
+      console.error("[Callback] cancel reason error:", e.message);
+    }
+    return;
+  }
+});
+
+// ── Message handler: free-text cancel reasons ───────────────
+bot.on("message", async (msg) => {
+  const chatId = String(msg.chat.id);
+  if (!msg.text || msg.text.startsWith("/")) return;
+
+  const pending = pendingCancelText.get(chatId);
+  if (!pending) return;
+
+  pendingCancelText.delete(chatId);
+  const reasonText = msg.text.trim();
+
+  try {
+    await db.from("bookings")
+      .update({ status: "cancelled", cancel_reason: `client:${reasonText}` })
+      .eq("id", pending.bookingId);
+    await send(chatId,
+      `✅ <b>Запись отменена</b>\n\nПричина: <i>${reasonText}</i>\n\nНадеемся увидеть вас снова в Uspot! 💜`
+    );
+  } catch (e) {
+    console.error("[Message] cancel text error:", e.message);
+    await send(chatId, "⚠️ Не удалось отменить запись. Напишите нам — поможем!");
+  }
+});
+
+// ════════════════════════════════════════════════════════════
+// 4. SCHEDULED REMINDERS — runs every hour
 //    Sends 24h and 1h reminders to clients
 // ════════════════════════════════════════════════════════════
 const runReminders = async () => {
@@ -398,6 +653,26 @@ app.post("/broadcast", async (req, res) => {
 
   console.log(`📣 Broadcast done: ${sent}/${clientIds.length} sent`);
   res.json({ ok: true, sent, total: clientIds.length });
+});
+
+// ── POST /notify_reschedule — client rescheduled, notify master ──
+// Body: { masterTgId, clientName, svc, price, oldDate, oldTime, newDate, newTime }
+app.post("/notify_reschedule", async (req, res) => {
+  const { masterTgId, clientName, svc, price, oldDate, oldTime, newDate, newTime } = req.body;
+  if (!masterTgId) return res.status(400).json({ error: "Missing masterTgId" });
+
+  const oldLabel = oldDate ? `${dateRu(oldDate)}, ${timeShort(oldTime)}` : "—";
+  const newLabel = newDate ? `${dateRu(newDate)}, ${timeShort(newTime)}` : "—";
+
+  await send(masterTgId,
+    `📅 <b>Перенос записи</b>\n\n` +
+    `👤 ${clientName || "Клиент"}\n` +
+    `💇 ${svc || "Услуга"}\n` +
+    `📅 Было: <b>${oldLabel}</b>\n` +
+    `📅 Стало: <b>${newLabel}</b>\n` +
+    `💳 ${price || "—"}`
+  );
+  res.json({ ok: true });
 });
 
 app.get("/health", (_req, res) => {
