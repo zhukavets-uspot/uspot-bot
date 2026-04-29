@@ -413,6 +413,12 @@ bot.on("callback_query", async (query) => {
   }
 });
 
+// Main bot instance — set by index.js after startup so client replies
+// go through the bot the client already started (founders bot can't
+// initiate conversations with users who never messaged it).
+let mainBot = null;
+const setMainBot = (b) => { mainBot = b; };
+
 // Forward next founder message as a reply to the client
 bot.on("message", async (msg) => {
   const founderId = String(msg.chat.id);
@@ -423,7 +429,10 @@ bot.on("message", async (msg) => {
   if (pending && msg.text) {
     pendingReplies.delete(founderId);
     try {
-      await bot.sendMessage(pending.clientTelegramId,
+      // Use the main bot (which the client has started) to deliver the reply.
+      // Falls back to founders bot only if mainBot not injected yet.
+      const sender = mainBot || bot;
+      await sender.sendMessage(pending.clientTelegramId,
         `💜 <b>Ответ от команды Uspot:</b>\n\n${msg.text}`,
         { parse_mode: "HTML" }
       );
@@ -486,4 +495,4 @@ const notifyFeedback = async ({ message, user_name, user_telegram_id }) => {
   return { sent };
 };
 
-module.exports = { notifyFeedback };
+module.exports = { notifyFeedback, setMainBot };

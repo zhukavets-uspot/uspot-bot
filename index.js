@@ -18,7 +18,7 @@ const express = require("express");
 const cors = require("cors");
 
 // Founders bot runs in the same process — requires FOUNDERS_BOT_TOKEN to activate
-const { notifyFeedback } = require("./founders-bot");
+const { notifyFeedback, setMainBot } = require("./founders-bot");
 
 // ── Config ───────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
@@ -35,6 +35,9 @@ if (!BOT_TOKEN || !SUPABASE_KEY) {
 
 // polling: true so the bot can receive /start messages from users
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// Give founders-bot a reference to the main bot so it can send replies
+// to clients (who started this bot, not the founders bot)
+setMainBot(bot);
 const db  = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ════════════════════════════════════════════════════════════
