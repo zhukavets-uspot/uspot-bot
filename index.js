@@ -70,14 +70,12 @@ bot.onText(/\/start$/, async (msg) => {
   console.log(`👋 /start from ${chatId} (${name})`);
 
   try {
+    // Welcome text — sets the persistent reply keyboard (always-visible bar)
     await bot.sendMessage(chatId,
-      `👋 Привет, ${name}! Добро пожаловать в <b>Uspot</b> — сервис записи к мастерам красоты Минска.\n\n` +
-      `Используйте кнопки ниже, чтобы открыть приложение:`,
+      `👋 Привет, ${name}! Добро пожаловать в <b>Uspot</b> — сервис записи к мастерам красоты Минска.`,
       {
         parse_mode: "HTML",
         reply_markup: {
-          // web_app buttons open the Mini App directly; persistent:true keeps
-          // the keyboard pinned below the input field forever (Bot API 6.1+)
           keyboard: [[
             { text: "📅 Записаться к Мастеру Uspot",    web_app: { url: MINI_APP_URL } },
             { text: "💅 Вход в Кабинет Мастера Uspot",  web_app: { url: MINI_APP_URL + "?startapp=master" } }
@@ -90,6 +88,9 @@ bot.onText(/\/start$/, async (msg) => {
   } catch (e) {
     console.error(`⚠️  Failed to send /start reply to ${chatId}:`, e.message);
   }
+
+  // Sticky menu message — always the last visible item
+  await refreshMenu(chatId);
 });
 
 // ── Helper: send a Telegram message safely ───────────────────
@@ -105,6 +106,45 @@ const send = async (chatId, text) => {
     console.error(`⚠️  Failed to send to ${chatId}:`, e.message);
   }
 };
+
+// ════════════════════════════════════════════════════════════
+// STICKY MENU — always the last message in the chat
+// After every notification we delete the old menu message and
+// re-send it so the user always sees action buttons at the bottom.
+// ════════════════════════════════════════════════════════════
+const menuMsgIds = new Map(); // chatId (string) → message_id
+
+const MENU_TEXT =
+  `👇 <b>Быстрый доступ к Uspot:</b>`;
+
+async function refreshMenu(chatId) {
+  const key = String(chatId);
+
+  // Delete the previous menu message so it doesn't pile up
+  const prevId = menuMsgIds.get(key);
+  if (prevId) {
+    try { await bot.deleteMessage(key, prevId); } catch (_) {
+      // Message may be too old (>48h) or already gone — fine
+    }
+    menuMsgIds.delete(key);
+  }
+
+  // Send fresh menu as the last message
+  try {
+    const sent = await bot.sendMessage(key, MENU_TEXT, {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📅 Записаться к Мастеру Uspot",   web_app: { url: MINI_APP_URL } }],
+          [{ text: "💅 Вход в Кабинет Мастера Uspot", web_app: { url: MINI_APP_URL + "?startapp=master" } }],
+        ]
+      }
+    });
+    menuMsgIds.set(key, sent.message_id);
+  } catch (e) {
+    console.error(`⚠️  refreshMenu failed for ${chatId}:`, e.message);
+  }
+}
 
 // ── Helper: get shareholders by notification type ────────────
 const getShareholderIds = async (field = "notify_bookings") => {
@@ -182,7 +222,6 @@ db.channel("uspot-new-bookings")
 
     if (b.status === "pending") {
       // ── NEW FLOW: master must confirm ──────────────────────
-      // Master gets notification WITH confirm/suggest buttons
       if (masterTgId) {
         await sendWithKeyboard(masterTgId,
           `📅 <b>Новая запись!</b>\n\n` +
@@ -196,9 +235,9 @@ db.channel("uspot-new-bookings")
             { text: "⏰ Предложить другое время",   callback_data: `suggest_${b.id}` },
           ]]
         );
+        await refreshMenu(masterTgId);
       }
 
-      // Client gets "pending" message
       if (b.client_telegram_id) {
         await send(b.client_telegram_id,
           `⏳ <b>Запись отправлена!</b>\n\n` +
@@ -208,6 +247,7 @@ db.channel("uspot-new-bookings")
           `💳 ${price}\n\n` +
           `Мастер подтвердит запись в ближайшее время. Мы сразу сообщим вам! 💜`
         );
+        await refreshMenu(b.client_telegram_id);
       }
 
     } else {
@@ -221,6 +261,7 @@ db.channel("uspot-new-bookings")
           `💳 ${price}\n\n` +
           `Откройте <a href="https://t.me/UspotTG_bot/Uspot_BY?startapp=master">Uspot</a> для управления записями.`
         );
+        await refreshMenu(masterTgId);
       }
       if (b.client_telegram_id) {
         await sendWithKeyboard(b.client_telegram_id,
@@ -235,6 +276,7 @@ db.channel("uspot-new-bookings")
             { text: "❌ Отменить",  callback_data: `client_cancel_${b.id}` },
           ]]
         );
+        await refreshMenu(b.client_telegram_id);
       }
     }
 
@@ -294,6 +336,7 @@ db.channel("uspot-booking-updates")
             { text: "❌ Отменить",  callback_data: `client_cancel_${b.id}` },
           ]]
         );
+        await refreshMenu(b.client_telegram_id);
       }
     }
 
@@ -310,6 +353,7 @@ db.channel("uspot-booking-updates")
             { text: "📅 Выбрать новое время", url: `https://t.me/UspotTG_bot/Uspot_BY?startapp=m${b.master_id}` },
           ]]
         );
+        await refreshMenu(b.client_telegram_id);
       }
     }
 
@@ -318,7 +362,6 @@ db.channel("uspot-booking-updates")
       const reason = b.cancel_reason || "";
       if (reason.startsWith("client:") || reason === "client_reschedule") {
         console.log("❌ Client cancelled booking:", b.id, "reason:", reason);
-        // Notify master
         let masterTgId = null;
         if (b.master_id) {
           const { data: m } = await db.from("masters").select("telegram_user_id").eq("id", b.master_id).single();
@@ -327,7 +370,7 @@ db.channel("uspot-booking-updates")
         if (masterTgId) {
           const reasonText = reason === "client_reschedule"
             ? "Клиент переносит запись на другое время"
-            : reason.slice(7); // strip "client:"
+            : reason.slice(7);
           const isReschedule = reason === "client_reschedule";
           await send(masterTgId,
             (isReschedule ? `📅 <b>Перенос записи</b>` : `❌ <b>Отмена от клиента</b>`) + `\n\n` +
@@ -338,6 +381,7 @@ db.channel("uspot-booking-updates")
             `💬 Причина: ${reasonText}` +
             (isReschedule ? `\n\nОжидайте новую запись от клиента 👆` : "")
           );
+          await refreshMenu(masterTgId);
         }
       }
       // force_majeure cancellations: founders-bot handles those
@@ -364,6 +408,7 @@ db.channel("uspot-booking-updates")
         `💳 Итого: <b>${finalPrice} BYN</b>${payLine}\n\n` +
         `Спасибо, что выбрали Uspot! 💜`
       );
+      await refreshMenu(b.client_telegram_id);
     }
   })
   .subscribe((status) => {
@@ -461,6 +506,7 @@ bot.on("callback_query", async (query) => {
       await send(chatId,
         `✅ <b>Запись отменена</b>\n\nПричина: <i>${reasonText}</i>\n\nНадеемся увидеть вас снова в Uspot! 💜`
       );
+      await refreshMenu(chatId);
     } catch (e) {
       await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка" });
       console.error("[Callback] cancel reason error:", e.message);
@@ -487,6 +533,7 @@ bot.on("message", async (msg) => {
     await send(chatId,
       `✅ <b>Запись отменена</b>\n\nПричина: <i>${reasonText}</i>\n\nНадеемся увидеть вас снова в Uspot! 💜`
     );
+    await refreshMenu(chatId);
   } catch (e) {
     console.error("[Message] cancel text error:", e.message);
     await send(chatId, "⚠️ Не удалось отменить запись. Напишите нам — поможем!");
@@ -557,6 +604,7 @@ const runReminders = async () => {
       (master?.location ? `📍 ${master.location}\n` : "") +
       `\nВремя: <b>${timeShort(b.booked_time)}</b> — ждём вас! 💜`
     );
+    await refreshMenu(b.client_telegram_id);
     sentReminders.add(key);
     console.log(`✉️  1h reminder sent: booking ${b.id}`);
   }
@@ -595,6 +643,7 @@ const runReminders = async () => {
       (b.total_price ? `💳 ${b.total_price} BYN\n` : "") +
       `\nДо встречи в Uspot! 💜`
     );
+    await refreshMenu(b.client_telegram_id);
     sentReminders.add(key);
     console.log(`✉️  24h reminder sent: booking ${b.id}`);
   }
@@ -624,6 +673,7 @@ const runReminders = async () => {
       `это очень важно для вашего мастера 🙏\n\n` +
       `👉 <a href="https://t.me/UspotTG_bot/Uspot_BY">Открыть Uspot</a>`
     );
+    await refreshMenu(b.client_telegram_id);
     sentReminders.add(key);
     console.log(`✉️  Review request sent: booking ${b.id}`);
   }
