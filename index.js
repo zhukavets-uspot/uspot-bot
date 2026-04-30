@@ -497,12 +497,40 @@ bot.on("message", async (msg) => {
 // 4. SCHEDULED REMINDERS — runs every hour
 //    Sends 24h and 1h reminders to clients
 // ════════════════════════════════════════════════════════════
+
+// ── Timezone: Belarus is UTC+3, no DST ──────────────────────
+// All booked_date / booked_time values are stored in Minsk local time.
+// Railway servers run UTC. We must convert before comparing with `now`.
+const MINSK_OFFSET_MS = 3 * 60 * 60 * 1000; // UTC+3
+
+/**
+ * Build a UTC Date from Minsk-local date/time strings.
+ * e.g. parseMinsKDt("2024-01-15", "10:00:00") → 07:00 UTC
+ */
+const parseMinsKDt = (dateStr, timeStr) =>
+  new Date(new Date(`${dateStr}T${timeStr}Z`).getTime() - MINSK_OFFSET_MS);
+
+/**
+ * Get the current date string in Minsk local time (YYYY-MM-DD).
+ * Avoids using server UTC date, which rolls over at 21:00 Minsk.
+ */
+const minskDateStr = (offsetDays = 0) => {
+  const minskNow = new Date(Date.now() + MINSK_OFFSET_MS + offsetDays * 86400000);
+  return minskNow.toISOString().split("T")[0];
+};
+
+// In-memory dedup: track which reminders we already sent this process run.
+// Key format: "<bookingId>_1h" | "<bookingId>_24h" | "<bookingId>_review"
+// Resets on restart — window tightening (below) prevents double-sends on restart.
+const sentReminders = new Set();
+
 const runReminders = async () => {
   console.log("⏰ Running reminder check…");
-  const now = new Date();
+  const now = new Date(); // UTC
 
-  // 1-hour reminder — today's bookings 50-70 min from now
-  const todayStr = now.toISOString().split("T")[0];
+  // ── 1-hour reminder ─────────────────────────────────────────
+  // Fetch today's (Minsk) confirmed bookings
+  const todayStr    = minskDateStr(0);
   const { data: todayBookings } = await db
     .from("bookings")
     .select("*, masters(name, location)")
@@ -510,9 +538,16 @@ const runReminders = async () => {
     .eq("booked_date", todayStr);
 
   for (const b of todayBookings || []) {
-    const bookingDt = new Date(`${b.booked_date}T${b.booked_time}`);
-    const minsUntil = (bookingDt - now) / 60000;
-    if (minsUntil < 50 || minsUntil > 70) continue;
+    if (!b.client_telegram_id) continue;
+    const key = `${b.id}_1h`;
+    if (sentReminders.has(key)) continue;
+
+    // Convert Minsk booking time → UTC for comparison
+    const bookingUtc = parseMinsKDt(b.booked_date, b.booked_time || "00:00:00");
+    const minsUntil  = (bookingUtc - now) / 60000;
+
+    // Window: 55–65 min before (tight 10-min window → fires in exactly one hourly tick)
+    if (minsUntil < 55 || minsUntil > 65) continue;
 
     const master = Array.isArray(b.masters) ? b.masters[0] : b.masters;
     await send(b.client_telegram_id,
@@ -522,10 +557,13 @@ const runReminders = async () => {
       (master?.location ? `📍 ${master.location}\n` : "") +
       `\nВремя: <b>${timeShort(b.booked_time)}</b> — ждём вас! 💜`
     );
+    sentReminders.add(key);
+    console.log(`✉️  1h reminder sent: booking ${b.id}`);
   }
 
-  // 24-hour reminder — tomorrow's bookings 23-25h from now
-  const tomorrowStr = new Date(now.getTime() + 24 * 3600 * 1000).toISOString().split("T")[0];
+  // ── 24-hour reminder ─────────────────────────────────────────
+  // Fetch tomorrow's (Minsk) confirmed bookings
+  const tomorrowStr = minskDateStr(1);
   const { data: tomorrowBookings } = await db
     .from("bookings")
     .select("*, masters(name, location)")
@@ -533,9 +571,15 @@ const runReminders = async () => {
     .eq("booked_date", tomorrowStr);
 
   for (const b of tomorrowBookings || []) {
-    const bookingDt = new Date(`${b.booked_date}T${b.booked_time}`);
-    const hoursUntil = (bookingDt - now) / 3600000;
-    if (hoursUntil < 23 || hoursUntil > 25) continue;
+    if (!b.client_telegram_id) continue;
+    const key = `${b.id}_24h`;
+    if (sentReminders.has(key)) continue;
+
+    const bookingUtc  = parseMinsKDt(b.booked_date, b.booked_time || "00:00:00");
+    const hoursUntil  = (bookingUtc - now) / 3600000;
+
+    // Window: 23.5–24.5h (tight 1-hour window → fires in exactly one hourly tick)
+    if (hoursUntil < 23.5 || hoursUntil > 24.5) continue;
 
     // Skip if booking was just created (less than 4 hours ago) —
     // client already got a confirmation, no need to pile on immediately
@@ -551,9 +595,12 @@ const runReminders = async () => {
       (b.total_price ? `💳 ${b.total_price} BYN\n` : "") +
       `\nДо встречи в Uspot! 💜`
     );
+    sentReminders.add(key);
+    console.log(`✉️  24h reminder sent: booking ${b.id}`);
   }
 
-  // Review request — confirmed bookings from today that ended 3-4h ago
+  // ── Review request ───────────────────────────────────────────
+  // Confirmed bookings from today (Minsk) that ended 3–4h ago
   const { data: pastBookings } = await db
     .from("bookings")
     .select("*")
@@ -562,8 +609,13 @@ const runReminders = async () => {
 
   for (const b of pastBookings || []) {
     if (!b.client_telegram_id) continue;
-    const bookingDt = new Date(`${b.booked_date}T${b.booked_time}`);
-    const hoursAgo = (now - bookingDt) / 3600000;
+    const key = `${b.id}_review`;
+    if (sentReminders.has(key)) continue;
+
+    const bookingUtc = parseMinsKDt(b.booked_date, b.booked_time || "00:00:00");
+    const hoursAgo   = (now - bookingUtc) / 3600000;
+
+    // Window: 3–4h after booking (tight 1-hour window → fires once)
     if (hoursAgo < 3 || hoursAgo > 4) continue;
 
     await send(b.client_telegram_id,
@@ -572,6 +624,8 @@ const runReminders = async () => {
       `это очень важно для вашего мастера 🙏\n\n` +
       `👉 <a href="https://t.me/UspotTG_bot/Uspot_BY">Открыть Uspot</a>`
     );
+    sentReminders.add(key);
+    console.log(`✉️  Review request sent: booking ${b.id}`);
   }
 
   console.log("⏰ Reminder check done");
