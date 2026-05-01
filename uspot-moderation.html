@@ -1,0 +1,1398 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Uspot — Центр модерации</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --purple: #7C3AED;
+      --teal: #06B6D4;
+      --bg: #f8f6ff;
+      --card-shadow: 0 2px 12px rgba(124,58,237,0.08);
+      --radius: 16px;
+      --green: #10B981;
+      --red: #EF4444;
+      --amber: #F59E0B;
+      --text: #1a1a2e;
+      --muted: #6b7280;
+      --border: #e5e7eb;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    /* ── HEADER ── */
+    header {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 100;
+      background: linear-gradient(135deg, #7C3AED, #06B6D4);
+      padding: 0 24px;
+      height: 64px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      box-shadow: 0 2px 16px rgba(124,58,237,0.25);
+    }
+
+    .logo {
+      font-size: 22px;
+      font-weight: 700;
+      color: #fff;
+      letter-spacing: -0.5px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .logo-dot {
+      width: 8px; height: 8px;
+      background: #fff;
+      border-radius: 50%;
+      opacity: 0.7;
+    }
+
+    .header-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: rgba(255,255,255,0.85);
+      border-left: 1px solid rgba(255,255,255,0.3);
+      padding-left: 16px;
+    }
+
+    .header-spacer { flex: 1; }
+
+    #conn-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 500;
+      padding: 5px 12px;
+      border-radius: 20px;
+      background: rgba(255,255,255,0.15);
+      color: #fff;
+      transition: background 0.3s;
+    }
+    #conn-badge .dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: #94a3b8;
+      transition: background 0.3s;
+    }
+    #conn-badge.ok .dot { background: #4ade80; }
+    #conn-badge.err .dot { background: #f87171; }
+    #conn-badge.ok { background: rgba(74,222,128,0.2); }
+    #conn-badge.err { background: rgba(248,113,113,0.2); }
+
+    .refresh-btn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 14px;
+      border-radius: 20px;
+      background: rgba(255,255,255,0.18);
+      border: 1px solid rgba(255,255,255,0.25);
+      color: #fff;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.2s;
+      font-family: inherit;
+    }
+    .refresh-btn:hover { background: rgba(255,255,255,0.28); }
+    .refresh-btn:active { transform: scale(0.97); }
+    .refresh-btn svg { transition: transform 0.4s; }
+    .refresh-btn.spinning svg { transform: rotate(360deg); }
+
+    /* ── MAIN ── */
+    main {
+      max-width: 860px;
+      margin: 0 auto;
+      padding: 88px 20px 60px;
+    }
+
+    /* ── TABS ── */
+    .tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 24px;
+    }
+
+    .tab-btn {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 20px;
+      border-radius: 12px;
+      border: 2px solid transparent;
+      background: #fff;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+      box-shadow: var(--card-shadow);
+      font-family: inherit;
+    }
+    .tab-btn:hover { border-color: var(--purple); color: var(--purple); }
+    .tab-btn.active {
+      background: linear-gradient(135deg, #7C3AED, #06B6D4);
+      color: #fff;
+      border-color: transparent;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 20px;
+      height: 20px;
+      padding: 0 6px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 700;
+      background: rgba(255,255,255,0.25);
+      color: #fff;
+      line-height: 1;
+    }
+    .tab-btn:not(.active) .badge {
+      background: #ede9fe;
+      color: var(--purple);
+    }
+
+    /* ── TAB PANELS ── */
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* ── STATES ── */
+    .state-box {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 60px 20px;
+      gap: 16px;
+      text-align: center;
+    }
+
+    .spinner {
+      width: 40px; height: 40px;
+      border: 3px solid #ede9fe;
+      border-top-color: var(--purple);
+      border-radius: 50%;
+      animation: spin 0.75s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .state-box p {
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .empty-icon {
+      font-size: 56px;
+      line-height: 1;
+    }
+    .empty-title {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .empty-sub {
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    /* ── ERROR BOX ── */
+    .error-box {
+      background: #fffbeb;
+      border: 1px solid #fcd34d;
+      border-radius: 12px;
+      padding: 20px 24px;
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .error-box-icon { font-size: 22px; flex-shrink: 0; margin-top: 2px; }
+    .error-box h4 { font-size: 14px; font-weight: 600; color: #92400e; margin-bottom: 6px; }
+    .error-box p { font-size: 13px; color: #a16207; }
+
+    /* ── CARD ── */
+    .card {
+      background: #fff;
+      border-radius: var(--radius);
+      box-shadow: var(--card-shadow);
+      margin-bottom: 16px;
+      overflow: hidden;
+      transition: opacity 0.4s, transform 0.4s, max-height 0.4s;
+    }
+    .card.fade-out {
+      opacity: 0;
+      transform: translateX(30px) scale(0.97);
+      max-height: 0;
+      margin-bottom: 0;
+      padding: 0;
+      pointer-events: none;
+    }
+
+    .card-body { padding: 20px 24px 24px; }
+
+    /* ── MASTER ROW ── */
+    .master-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+
+    .master-avatar {
+      width: 38px; height: 38px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      flex-shrink: 0;
+    }
+
+    .master-name {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .tag-chip {
+      display: inline-block;
+      padding: 2px 10px;
+      border-radius: 20px;
+      font-size: 11px;
+      font-weight: 600;
+      background: #ede9fe;
+      color: var(--purple);
+      letter-spacing: 0.02em;
+    }
+
+    .master-date {
+      margin-left: auto;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    /* ── STARS ── */
+    .stars {
+      display: inline-flex;
+      gap: 2px;
+      align-items: center;
+      font-size: 16px;
+    }
+
+    /* ── CLIENT ROW ── */
+    .client-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+      font-size: 13px;
+      color: var(--muted);
+      flex-wrap: wrap;
+    }
+    .client-row strong { color: var(--text); font-weight: 600; }
+    .tg-id {
+      font-family: monospace;
+      font-size: 12px;
+      padding: 2px 8px;
+      background: #f3f4f6;
+      border-radius: 6px;
+      color: var(--muted);
+    }
+
+    /* ── PHOTOS ── */
+    .photos-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+
+    .photo-strip {
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      padding-bottom: 6px;
+      margin-bottom: 16px;
+      scrollbar-width: thin;
+      scrollbar-color: #e5e7eb transparent;
+    }
+    .photo-strip::-webkit-scrollbar { height: 4px; }
+    .photo-strip::-webkit-scrollbar-thumb { background: #e5e7eb; border-radius: 2px; }
+
+    .photo-wrap {
+      position: relative;
+      flex-shrink: 0;
+      width: 80px; height: 80px;
+      border-radius: 10px;
+      overflow: visible;
+    }
+    .photo-wrap img {
+      width: 80px; height: 80px;
+      object-fit: cover;
+      border-radius: 10px;
+      display: block;
+      border: 2px solid var(--border);
+      transition: border-color 0.2s;
+    }
+    .photo-wrap:hover img { border-color: var(--purple); }
+
+    .photo-remove {
+      position: absolute;
+      top: -6px; right: -6px;
+      width: 20px; height: 20px;
+      border-radius: 50%;
+      background: var(--red);
+      color: #fff;
+      font-size: 12px;
+      line-height: 20px;
+      text-align: center;
+      cursor: pointer;
+      border: 2px solid #fff;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+      transition: background 0.2s, transform 0.1s;
+      z-index: 5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .photo-remove:hover { background: #dc2626; transform: scale(1.1); }
+
+    .no-photos {
+      font-size: 13px;
+      color: var(--muted);
+      font-style: italic;
+      margin-bottom: 16px;
+    }
+
+    /* ── TEXTAREA ── */
+    .field-label {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 6px;
+    }
+
+    .editable-text {
+      width: 100%;
+      min-height: 80px;
+      border: 1.5px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-family: inherit;
+      font-size: 14px;
+      color: var(--text);
+      resize: vertical;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      line-height: 1.55;
+      margin-bottom: 18px;
+      background: #fafafa;
+    }
+    .editable-text:focus {
+      border-color: var(--purple);
+      box-shadow: 0 0 0 3px rgba(124,58,237,0.1);
+      background: #fff;
+    }
+    .editable-text::placeholder { color: #d1d5db; }
+
+    /* ── ACTION BUTTONS ── */
+    .card-actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .btn-approve, .btn-decline {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 9px 20px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      font-family: inherit;
+      transition: opacity 0.2s, transform 0.1s, box-shadow 0.2s;
+    }
+    .btn-approve:active, .btn-decline:active { transform: scale(0.97); }
+    .btn-approve:disabled, .btn-decline:disabled { opacity: 0.55; cursor: not-allowed; }
+
+    .btn-approve {
+      background: linear-gradient(135deg, #10B981, #059669);
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(16,185,129,0.3);
+    }
+    .btn-approve:hover:not(:disabled) { box-shadow: 0 4px 14px rgba(16,185,129,0.4); }
+
+    .btn-decline {
+      background: #fff;
+      color: var(--red);
+      border: 2px solid #fecaca;
+    }
+    .btn-decline:hover:not(:disabled) {
+      background: #fef2f2;
+      border-color: var(--red);
+    }
+
+    .mod-note {
+      font-size: 11px;
+      color: var(--muted);
+      margin-left: auto;
+      font-style: italic;
+    }
+
+    /* ── DIVIDER ── */
+    .card-divider {
+      height: 1px;
+      background: var(--border);
+      margin: 0 24px;
+    }
+
+    /* ── SQL SECTION ── */
+    .sql-section {
+      margin-top: 48px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border);
+      overflow: hidden;
+      background: #fff;
+      box-shadow: var(--card-shadow);
+    }
+
+    .sql-toggle {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 16px 24px;
+      cursor: pointer;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text);
+      user-select: none;
+      transition: background 0.15s;
+      list-style: none;
+    }
+    .sql-toggle:hover { background: #f9f7ff; }
+    .sql-toggle::marker, .sql-toggle::-webkit-details-marker { display: none; }
+
+    .sql-arrow {
+      margin-left: auto;
+      font-size: 12px;
+      color: var(--muted);
+      transition: transform 0.25s;
+    }
+    details[open] .sql-arrow { transform: rotate(180deg); }
+
+    .sql-body {
+      padding: 0 24px 24px;
+      border-top: 1px solid var(--border);
+    }
+
+    .sql-body p {
+      font-size: 13px;
+      color: var(--muted);
+      margin: 14px 0 10px;
+    }
+
+    pre.sql-code {
+      background: #1e1b4b;
+      color: #c4b5fd;
+      border-radius: 10px;
+      padding: 16px 18px;
+      font-size: 12.5px;
+      font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+      overflow-x: auto;
+      line-height: 1.6;
+      white-space: pre;
+    }
+    pre.sql-code .sql-comment { color: #6b7280; }
+    pre.sql-code .sql-kw { color: #818cf8; }
+    pre.sql-code .sql-str { color: #86efac; }
+
+    .copy-btn {
+      margin-top: 10px;
+      padding: 7px 16px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #fff;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      color: var(--purple);
+      font-family: inherit;
+      transition: background 0.15s;
+    }
+    .copy-btn:hover { background: #f5f3ff; }
+
+    /* ── TOAST ── */
+    #toast {
+      position: fixed;
+      bottom: 28px;
+      left: 50%;
+      transform: translateX(-50%) translateY(80px);
+      background: #1e1b4b;
+      color: #fff;
+      padding: 12px 24px;
+      border-radius: 30px;
+      font-size: 14px;
+      font-weight: 500;
+      box-shadow: 0 4px 24px rgba(0,0,0,0.25);
+      z-index: 9999;
+      pointer-events: none;
+      transition: transform 0.3s cubic-bezier(0.34,1.56,0.64,1), opacity 0.3s;
+      opacity: 0;
+    }
+    #toast.show {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+
+    /* ── RESPONSIVE ── */
+    @media (max-width: 600px) {
+      header { padding: 0 14px; gap: 10px; }
+      .header-title { display: none; }
+      main { padding: 78px 12px 50px; }
+      .card-body { padding: 16px 16px 20px; }
+      .card-divider { margin: 0 16px; }
+      .mod-note { width: 100%; margin-left: 0; }
+    }
+  /* ── LIGHTBOX ── */
+  #lightbox {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.92);
+    z-index: 9000;
+    align-items: center;
+    justify-content: center;
+    cursor: zoom-out;
+  }
+  #lightbox.open { display: flex; }
+  #lightbox img {
+    max-width: 92vw;
+    max-height: 88vh;
+    border-radius: 12px;
+    object-fit: contain;
+    box-shadow: 0 8px 60px rgba(0,0,0,0.6);
+    cursor: default;
+  }
+  #lightbox-close {
+    position: fixed;
+    top: 20px; right: 24px;
+    font-size: 32px;
+    color: #fff;
+    cursor: pointer;
+    line-height: 1;
+    opacity: 0.8;
+    transition: opacity 0.2s;
+    user-select: none;
+  }
+  #lightbox-close:hover { opacity: 1; }
+  </style>
+</head>
+<body>
+
+<!-- LIGHTBOX -->
+<div id="lightbox" onclick="closeLightbox()">
+  <span id="lightbox-close" onclick="closeLightbox()">✕</span>
+  <img id="lightbox-img" src="" alt="Preview" onclick="event.stopPropagation()"/>
+</div>
+
+<!-- HEADER -->
+<header>
+  <div class="logo">
+    <span>Uspot</span>
+    <div class="logo-dot"></div>
+  </div>
+  <div class="header-title">Центр модерации</div>
+  <div class="header-spacer"></div>
+  <div id="conn-badge">
+    <div class="dot"></div>
+    <span id="conn-text">Подключение…</span>
+  </div>
+  <button class="refresh-btn" id="refresh-btn" onclick="loadAll()" title="Обновить данные">
+    <svg id="refresh-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="23 4 23 10 17 10"></polyline>
+      <polyline points="1 20 1 14 7 14"></polyline>
+      <path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"></path>
+    </svg>
+    Обновить
+  </button>
+</header>
+
+<!-- MAIN -->
+<main>
+  <!-- TABS -->
+  <div class="tabs">
+    <button class="tab-btn active" id="tab-portfolio" onclick="switchTab('portfolio')">
+      📸 Портфолио <span class="badge" id="badge-portfolio">0</span>
+    </button>
+    <button class="tab-btn" id="tab-reviews" onclick="switchTab('reviews')">
+      ⭐ Отзывы <span class="badge" id="badge-reviews">0</span>
+    </button>
+  </div>
+
+  <!-- PORTFOLIO PANEL -->
+  <div class="tab-panel active" id="panel-portfolio">
+    <div id="portfolio-loading" class="state-box">
+      <div class="spinner"></div>
+      <p>Загружаем данные…</p>
+    </div>
+    <div id="portfolio-error" class="error-box" style="display:none;">
+      <div class="error-box-icon">⚠️</div>
+      <div>
+        <h4>Таблица portfolio не найдена или нет доступа</h4>
+        <p id="portfolio-error-msg">Запустите SQL ниже, чтобы создать таблицу.</p>
+      </div>
+    </div>
+    <div id="portfolio-empty" class="state-box" style="display:none;">
+      <div class="empty-icon">🎉</div>
+      <div class="empty-title">Нет элементов на модерации</div>
+      <div class="empty-sub">Все портфолио проверены. Отдыхайте!</div>
+    </div>
+    <div id="portfolio-list" style="display:none"></div>
+  </div>
+
+  <!-- REVIEWS PANEL -->
+  <div class="tab-panel" id="panel-reviews">
+    <div id="reviews-loading" class="state-box">
+      <div class="spinner"></div>
+      <p>Загружаем данные…</p>
+    </div>
+    <div id="reviews-error" class="error-box" style="display:none;">
+      <div class="error-box-icon">⚠️</div>
+      <div>
+        <h4>Таблица reviews не найдена или нет доступа</h4>
+        <p id="reviews-error-msg">Проверьте настройки RLS или запустите SQL ниже.</p>
+      </div>
+    </div>
+    <div id="reviews-empty" class="state-box" style="display:none;">
+      <div class="empty-icon">🎉</div>
+      <div class="empty-title">Нет отзывов на модерации</div>
+      <div class="empty-sub">Все отзывы обработаны. Так держать!</div>
+    </div>
+    <div id="reviews-list" style="display:none"></div>
+  </div>
+
+  <!-- SQL SETUP -->
+  <details class="sql-section">
+    <summary class="sql-toggle">
+      ⚙️ SQL для настройки таблиц
+      <svg class="sql-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+    </summary>
+    <div class="sql-body">
+
+      <p style="color:#7C3AED;font-weight:600;font-size:13px;margin-bottom:6px;">🔧 Шаг 1 — Запускайте хоть каждый раз (безопасно):</p>
+      <p>Добавляет колонки и обновляет RLS-политики. Не ломается при повторном запуске.</p>
+      <pre class="sql-code" id="setup-sql">-- ── Колонки для masters (если ещё нет) ──────────────────────
+ALTER TABLE masters ADD COLUMN IF NOT EXISTS rating numeric DEFAULT 5.0;
+ALTER TABLE masters ADD COLUMN IF NOT EXISTS review_count integer DEFAULT 0;
+
+-- ── Колонки для reviews (если ещё нет) ─────────────────────
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS text text;
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS status text DEFAULT 'pending';
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS photo_urls jsonb DEFAULT '[]';
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS client_name text;
+ALTER TABLE reviews ADD COLUMN IF NOT EXISTS client_telegram_id text;
+-- Backfill: старые отзывы без статуса → pending (попадут в очередь модерации)
+UPDATE reviews SET status = 'pending' WHERE status IS NULL;
+
+-- ── Колонки для bookings (если ещё нет) ─────────────────────
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS client_notes text;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS client_photo_urls jsonb DEFAULT '[]';
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS final_price numeric;
+ALTER TABLE bookings ADD COLUMN IF NOT EXISTS master_note text;
+
+-- ── Аватары (если ещё нет) ───────────────────────────────────
+ALTER TABLE masters ADD COLUMN IF NOT EXISTS photo_url text;
+ALTER TABLE clients ADD COLUMN IF NOT EXISTS photo_url text;
+
+-- ── Даты акций (если ещё нет) ────────────────────────────────
+ALTER TABLE promos ADD COLUMN IF NOT EXISTS valid_from date;
+
+-- ── RLS: разрешить анон-ключу читать/писать всё (прототип) ───
+DROP POLICY IF EXISTS "Anon schedule"  ON master_schedule;
+CREATE POLICY "Anon schedule"  ON master_schedule FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Anon bookings" ON bookings;
+CREATE POLICY "Anon bookings" ON bookings  FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Anon reviews"  ON reviews;
+CREATE POLICY "Anon reviews"  ON reviews   FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Anon portfolio" ON portfolio;
+CREATE POLICY "Anon portfolio" ON portfolio FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Anon clients"  ON clients;
+CREATE POLICY "Anon clients"  ON clients   FOR ALL USING (true) WITH CHECK (true);
+
+-- ── Таблица client_ratings (оценки клиентов от мастеров) ──────
+CREATE TABLE IF NOT EXISTS client_ratings (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  master_id uuid,
+  client_telegram_id text NOT NULL,
+  booking_id uuid,
+  rating integer NOT NULL CHECK (rating >= 1 AND rating <= 5),
+  created_at timestamptz DEFAULT now()
+);
+ALTER TABLE client_ratings ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Anon client_ratings" ON client_ratings;
+CREATE POLICY "Anon client_ratings" ON client_ratings FOR ALL USING (true) WITH CHECK (true);
+
+-- ── Таблица master_blacklist ──────────────────────────────────
+CREATE TABLE IF NOT EXISTS master_blacklist (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  master_id uuid NOT NULL,
+  client_telegram_id text NOT NULL,
+  client_name text,
+  reason text,
+  created_at timestamptz DEFAULT now(),
+  UNIQUE(master_id, client_telegram_id)
+);
+ALTER TABLE master_blacklist ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Anon master_blacklist" ON master_blacklist;
+CREATE POLICY "Anon master_blacklist" ON master_blacklist FOR ALL USING (true) WITH CHECK (true);
+
+-- После запуска SQL обновите кеш схемы:
+-- NOTIFY pgrst, 'reload schema';</pre>
+      <button class="copy-btn" onclick="copySql('setup-sql')">📋 Скопировать SQL шага 1</button>
+
+      <p style="color:#EF4444;font-weight:600;font-size:13px;margin:20px 0 6px;">📸 Шаг 1б — Только если фото не загружаются (Storage RLS):</p>
+      <p>Запустите отдельным запросом — не вместе с Шагом 1.</p>
+      <pre class="sql-code" id="setup-sql-storage">-- Убедитесь что бакет "uspot-media" существует и Public
+-- (Storage → New bucket → uspot-media → включить Public)
+
+DROP POLICY IF EXISTS "Anon select uspot-media" ON storage.objects;
+CREATE POLICY "Anon select uspot-media" ON storage.objects
+  FOR SELECT USING (bucket_id = 'uspot-media');
+
+DROP POLICY IF EXISTS "Anon insert uspot-media" ON storage.objects;
+CREATE POLICY "Anon insert uspot-media" ON storage.objects
+  FOR INSERT WITH CHECK (bucket_id = 'uspot-media');
+
+DROP POLICY IF EXISTS "Anon update uspot-media" ON storage.objects;
+CREATE POLICY "Anon update uspot-media" ON storage.objects
+  FOR UPDATE USING (bucket_id = 'uspot-media');
+
+DROP POLICY IF EXISTS "Anon delete uspot-media" ON storage.objects;
+CREATE POLICY "Anon delete uspot-media" ON storage.objects
+  FOR DELETE USING (bucket_id = 'uspot-media');</pre>
+      <button class="copy-btn" onclick="copySql('setup-sql-storage')">📋 Скопировать SQL для Storage</button>
+
+      <p style="color:#6b7280;font-weight:600;font-size:13px;margin:20px 0 6px;">🆕 Шаг 2 — Только при первой установке (пропустите если уже запускали):</p>
+      <pre class="sql-code" id="setup-sql-init">-- ── Таблица portfolio ────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS portfolio (
+  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,
+  master_id uuid REFERENCES masters(id) ON DELETE CASCADE,
+  image_urls jsonb DEFAULT '[]',
+  caption text,
+  tag text,
+  status text DEFAULT 'pending',
+  created_at timestamptz DEFAULT now()
+);
+ALTER TABLE portfolio ENABLE ROW LEVEL SECURITY;
+
+-- ── Уникальный индекс для расписания (один раз!) ─────────────
+DO $$ BEGIN
+  ALTER TABLE master_schedule ADD CONSTRAINT master_schedule_master_day_unique
+    UNIQUE (master_id, day_of_week);
+EXCEPTION WHEN duplicate_table THEN NULL;
+         WHEN others THEN NULL;
+END $$;
+
+-- Storage bucket:
+-- Dashboard → Storage → New bucket → "uspot-media" → Public</pre>
+      <button class="copy-btn" onclick="copySql('setup-sql-init')">📋 Скопировать SQL шага 2</button>
+
+    </div>
+  </details>
+</main>
+
+<!-- TOAST -->
+<div id="toast"></div>
+
+<script>
+// ── CONFIG ──────────────────────────────────────────────────────────────────
+const SUPABASE_URL = 'https://heiyayufhuvlxhirgvyc.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_mVfdI66v5FAjZjoYV8SWKw_hSuYywxO';
+
+const { createClient } = supabase;
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// ── STATE ───────────────────────────────────────────────────────────────────
+let portfolioItems = [];
+let reviewItems = [];
+let activeTab = 'portfolio';
+
+// ── INIT ────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  loadAll();
+});
+
+let _loadError = false;
+
+async function loadAll() {
+  _loadError = false;
+  animateRefresh(true);
+  await Promise.all([loadPortfolio(), loadReviews()]);
+  animateRefresh(false);
+  if (!_loadError) updateConnection(true);
+}
+
+function animateRefresh(on) {
+  const btn = document.getElementById('refresh-btn');
+  const icon = document.getElementById('refresh-icon');
+  if (on) {
+    btn.classList.add('spinning');
+    icon.style.transition = 'transform 0.6s linear';
+    icon.style.transform = 'rotate(360deg)';
+  } else {
+    btn.classList.remove('spinning');
+    icon.style.transition = '';
+    icon.style.transform = '';
+  }
+}
+
+function updateConnection(ok) {
+  const badge = document.getElementById('conn-badge');
+  const text = document.getElementById('conn-text');
+  badge.className = ok ? 'ok' : 'err';
+  text.textContent = ok ? 'Подключено' : 'Ошибка';
+}
+
+// ── TAB SWITCH ───────────────────────────────────────────────────────────────
+function switchTab(name) {
+  activeTab = name;
+  ['portfolio', 'reviews'].forEach(t => {
+    document.getElementById('tab-' + t).classList.toggle('active', t === name);
+    document.getElementById('panel-' + t).classList.toggle('active', t === name);
+  });
+}
+
+// ── MASTER ENRICHMENT ────────────────────────────────────────────────────────
+// Supabase FK joins (select '*, table(col)') silently error when no FK is
+// declared in the schema. We fetch master data in a separate query instead.
+async function enrichWithMasters(items) {
+  const ids = [...new Set((items || []).map(i => i.master_id).filter(Boolean))];
+  if (ids.length === 0) return items;
+  const { data: masters } = await sb
+    .from('masters')
+    .select('id, name, emoji, bg_color')
+    .in('id', ids);
+  const map = {};
+  (masters || []).forEach(m => { map[m.id] = m; });
+  return (items || []).map(i => ({
+    ...i,
+    masters: map[i.master_id] || null
+  }));
+}
+
+// ── LOAD PORTFOLIO ───────────────────────────────────────────────────────────
+async function loadPortfolio() {
+  showState('portfolio', 'loading');
+  try {
+    const { data, error } = await sb
+      .from('portfolio')
+      .select('*')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+
+    if (data && data.length > 0) {
+      portfolioItems = await enrichWithMasters(data);
+      document.getElementById('badge-portfolio').textContent = portfolioItems.length;
+      showState('portfolio', 'list');
+      renderPortfolio();
+      return;
+    }
+
+    // Diagnostic: check if there are specifically PENDING rows that we can't see
+    // (fetch more rows to check statuses — if pending rows ARE visible here but
+    //  not via the filtered query, that's a genuine RLS issue)
+    const { data: anyData, error: anyErr } = await sb
+      .from('portfolio')
+      .select('id, status')
+      .limit(20);
+
+    const pendingVisible = !anyErr && anyData && anyData.some(r => r.status === 'pending');
+    if (pendingVisible) {
+      // Pending rows ARE readable unfiltered but NOT via .eq('status','pending') — real RLS bug
+      showState('portfolio', 'error');
+      document.getElementById('portfolio-error-msg').innerHTML =
+        `Записи со статусом pending есть, но фильтрация по статусу не работает.<br>` +
+        `Запустите SQL ниже: строки DROP/CREATE POLICY "Anon portfolio".`;
+      document.querySelector('#panel-portfolio .error-box h4').textContent = '🔒 RLS блокирует доступ к портфолио';
+      _loadError = true; updateConnection(false);
+    } else {
+      // No pending portfolio items — genuinely empty queue
+      portfolioItems = [];
+      document.getElementById('badge-portfolio').textContent = '0';
+      showState('portfolio', 'empty');
+    }
+  } catch (err) {
+    console.error('Portfolio error:', err);
+    _loadError = true; updateConnection(false);
+    document.getElementById('portfolio-error-msg').textContent =
+      err.message || 'Неизвестная ошибка. Проверьте SQL ниже.';
+    showState('portfolio', 'error');
+  }
+}
+
+// ── LOAD REVIEWS ─────────────────────────────────────────────────────────────
+async function loadReviews() {
+  showState('reviews', 'loading');
+  try {
+    // First try: fetch pending reviews
+    const { data, error } = await sb
+      .from('reviews')
+      .select('*')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true });
+
+    if (error) throw error;
+
+    // Got results — render them
+    if (data && data.length > 0) {
+      reviewItems = await enrichWithMasters(data);
+      document.getElementById('badge-reviews').textContent = reviewItems.length;
+      showState('reviews', 'list');
+      renderReviews();
+      return;
+    }
+
+    // 0 results — could be truly empty OR could be RLS blocking pending reads.
+    // Run a diagnostic: try fetching ANY review (any status) to detect RLS.
+    const { data: anyData, error: anyErr } = await sb
+      .from('reviews')
+      .select('id, status')
+      .limit(20);
+
+    const pendingVisible = !anyErr && anyData && anyData.some(r => r.status === 'pending');
+    if (pendingVisible) {
+      // Pending rows ARE readable unfiltered but not via filter — real RLS issue
+      console.warn('Reviews: pending rows visible unfiltered but filtered query returned 0');
+      showState('reviews', 'error');
+      document.getElementById('reviews-error-msg').innerHTML =
+        `Отзывы со статусом pending есть, но фильтрация не работает.<br>` +
+        `Запустите SQL ниже: строки DROP/CREATE POLICY "Anon reviews".`;
+      document.querySelector('#panel-reviews .error-box h4').textContent = '🔒 RLS блокирует доступ к отзывам';
+      _loadError = true; updateConnection(false);
+    } else {
+      // No pending reviews in DB — check if the INSERT is actually saving them
+      const total = anyData ? anyData.length : 0;
+      console.log('Reviews in DB (any status):', total, anyData?.map(r=>r.status));
+      reviewItems = [];
+      document.getElementById('badge-reviews').textContent = '0';
+      showState('reviews', 'empty');
+    }
+  } catch (err) {
+    console.error('Reviews error:', err);
+    _loadError = true; updateConnection(false);
+    document.getElementById('reviews-error-msg').textContent =
+      err.message || 'Неизвестная ошибка. Запустите SQL ниже.';
+    showState('reviews', 'error');
+  }
+}
+
+// ── SHOW STATE ───────────────────────────────────────────────────────────────
+function showState(type, state) {
+  const states = ['loading', 'error', 'empty', 'list'];
+  states.forEach(s => {
+    const el = document.getElementById(type + '-' + s);
+    if (!el) return;
+    el.style.display = (s === state) ? (s === 'list' ? 'block' : 'flex') : 'none';
+  });
+}
+
+// ── RENDER PORTFOLIO ─────────────────────────────────────────────────────────
+function renderPortfolio() {
+  const list = document.getElementById('portfolio-list');
+  list.innerHTML = '';
+  portfolioItems.forEach(item => {
+    list.appendChild(buildPortfolioCard(item));
+  });
+}
+
+function buildPortfolioCard(item) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.id = 'pcard-' + item.id;
+
+  const master = item.masters || {};
+  const bg = master.bg_color || '#ede9fe';
+  const emoji = master.emoji || '💆';
+  const name = master.name || 'Мастер';
+  const tag = item.tag || '';
+  const date = formatDate(item.created_at);
+  const images = Array.isArray(item.image_urls) ? [...item.image_urls] : [];
+  const caption = item.caption || '';
+
+  // Track remaining photos client-side
+  const state = { photos: [...images] };
+
+  card.innerHTML = `
+    <div class="card-body">
+      <div class="master-row">
+        <div class="master-avatar" style="background:${bg}">${emoji}</div>
+        <div class="master-name">${esc(name)}</div>
+        ${tag ? `<span class="tag-chip">${esc(tag)}</span>` : ''}
+        <span class="master-date">${date}</span>
+      </div>
+
+      <div class="photos-label">Фотографии</div>
+      <div class="photo-strip" id="pstrip-${item.id}">
+        ${images.length === 0 ? '<span class="no-photos">Нет фотографий</span>' : ''}
+      </div>
+
+      <div class="field-label">Подпись</div>
+      <textarea class="editable-text" id="pcaption-${item.id}" placeholder="Подпись отсутствует…">${esc(caption)}</textarea>
+
+      <div class="card-actions">
+        <button class="btn-approve" onclick="approvePortfolio('${item.id}')">✅ Опубликовать</button>
+        <button class="btn-decline" onclick="declinePortfolio('${item.id}')">❌ Отклонить</button>
+      </div>
+    </div>
+  `;
+
+  // Render photos with remove buttons
+  const strip = card.querySelector('#pstrip-' + item.id);
+  if (images.length > 0) {
+    strip.innerHTML = '';
+    renderPhotoStrip(strip, state.photos, item.id, 'portfolio');
+  }
+
+  // Store state on card element
+  card._state = state;
+  return card;
+}
+
+// ── RENDER REVIEWS ───────────────────────────────────────────────────────────
+function renderReviews() {
+  const list = document.getElementById('reviews-list');
+  list.innerHTML = '';
+  reviewItems.forEach(item => {
+    list.appendChild(buildReviewCard(item));
+  });
+}
+
+function buildReviewCard(item) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.id = 'rcard-' + item.id;
+
+  const master = item.masters || {};
+  const bg = master.bg_color || '#ede9fe';
+  const emoji = master.emoji || '💆';
+  const name = master.name || 'Мастер';
+  const rating = item.rating || 0;
+  const date = formatDate(item.created_at);
+  const images = Array.isArray(item.photo_urls) ? [...item.photo_urls] : [];
+  const text = item.text || '';
+  const clientName = item.client_name || 'Клиент';
+  const tgId = item.client_telegram_id || '';
+
+  const state = { photos: [...images] };
+
+  card.innerHTML = `
+    <div class="card-body">
+      <div class="master-row">
+        <div class="master-avatar" style="background:${bg}">${emoji}</div>
+        <div class="master-name">${esc(name)}</div>
+        <div class="stars">${renderStars(rating)}</div>
+        <span class="master-date">${date}</span>
+      </div>
+
+      <div class="client-row">
+        <strong>${esc(clientName)}</strong>
+        ${tgId ? `<span class="tg-id">@${esc(tgId)}</span>` : ''}
+      </div>
+
+      <div class="field-label">Текст отзыва</div>
+      <textarea class="editable-text" id="rtext-${item.id}" placeholder="Текст отзыва отсутствует…">${esc(text)}</textarea>
+
+      <div class="photos-label">Фотографии</div>
+      <div class="photo-strip" id="rstrip-${item.id}">
+      </div>
+
+      <div class="card-actions">
+        <button class="btn-approve" onclick="approveReview('${item.id}')">✅ Опубликовать</button>
+        <button class="btn-decline" onclick="declineReview('${item.id}')">❌ Отклонить</button>
+        <span class="mod-note">Оценки 1–3★ → модерация вручную</span>
+      </div>
+    </div>
+  `;
+
+  const strip = card.querySelector('#rstrip-' + item.id);
+  if (images.length === 0) {
+    strip.innerHTML = '<span class="no-photos">Нет фотографий</span>';
+  } else {
+    renderPhotoStrip(strip, state.photos, item.id, 'reviews');
+  }
+
+  card._state = state;
+  return card;
+}
+
+// ── PHOTO STRIP ──────────────────────────────────────────────────────────────
+function renderPhotoStrip(container, photosArr, itemId, type) {
+  container.innerHTML = '';
+  if (photosArr.length === 0) {
+    container.innerHTML = '<span class="no-photos">Все фото удалены</span>';
+    return;
+  }
+  photosArr.forEach((url, idx) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'photo-wrap';
+
+    const img = document.createElement('img');
+    img.src = url;
+    img.alt = 'Фото ' + (idx + 1);
+    img.loading = 'lazy';
+    img.title = 'Нажмите для просмотра';
+    img.style.cursor = 'zoom-in';
+    img.onclick = () => openLightbox(url);
+    img.onerror = () => {
+      img.style.display = 'none';
+      wrap.style.display = 'none';
+    };
+
+    const btn = document.createElement('div');
+    btn.className = 'photo-remove';
+    btn.title = 'Убрать фото из публикации';
+    btn.innerHTML = '×';
+    btn.onclick = () => removePhoto(photosArr, url, container, itemId, type);
+
+    wrap.appendChild(img);
+    wrap.appendChild(btn);
+    container.appendChild(wrap);
+  });
+}
+
+function removePhoto(photosArr, url, container, itemId, type) {
+  const idx = photosArr.indexOf(url);
+  if (idx !== -1) photosArr.splice(idx, 1);
+  renderPhotoStrip(container, photosArr, itemId, type);
+}
+
+// ── APPROVE / DECLINE — PORTFOLIO ────────────────────────────────────────────
+async function approvePortfolio(id) {
+  const card = document.getElementById('pcard-' + id);
+  const caption = document.getElementById('pcaption-' + id).value.trim();
+  const remainingPhotos = card._state ? card._state.photos : [];
+
+  setCardBusy(card, true);
+  try {
+    const { error } = await sb.from('portfolio').update({
+      status: 'approved',
+      caption: caption,
+      image_urls: remainingPhotos
+    }).eq('id', id);
+
+    if (error) throw error;
+    dismissCard(card, 'portfolio', id, 'Портфолио опубликовано ✅');
+  } catch (err) {
+    console.error(err);
+    toast('Ошибка: ' + (err.message || 'не удалось сохранить'), 'err');
+    setCardBusy(card, false);
+  }
+}
+
+async function declinePortfolio(id) {
+  const card = document.getElementById('pcard-' + id);
+  setCardBusy(card, true);
+  try {
+    const { error } = await sb.from('portfolio').update({ status: 'declined' }).eq('id', id);
+    if (error) throw error;
+    dismissCard(card, 'portfolio', id, 'Портфолио отклонено ❌');
+  } catch (err) {
+    console.error(err);
+    toast('Ошибка: ' + (err.message || 'не удалось сохранить'), 'err');
+    setCardBusy(card, false);
+  }
+}
+
+// ── APPROVE / DECLINE — REVIEWS ──────────────────────────────────────────────
+async function approveReview(id) {
+  const card = document.getElementById('rcard-' + id);
+  const text = document.getElementById('rtext-' + id).value.trim();
+  const remainingPhotos = card._state ? card._state.photos : [];
+
+  // Find the review item to get master_id for rating recalculation
+  const reviewItem = reviewItems.find(r => r.id === id);
+  const masterId = reviewItem?.master_id || null;
+
+  setCardBusy(card, true);
+  try {
+    const { error } = await sb.from('reviews').update({
+      status: 'approved',
+      text: text,
+      photo_urls: remainingPhotos
+    }).eq('id', id);
+
+    if (error) throw error;
+
+    // Recalculate master rating from all approved reviews
+    if (masterId) {
+      await recalcMasterRating(masterId);
+    }
+
+    dismissCard(card, 'reviews', id, 'Отзыв опубликован ✅');
+  } catch (err) {
+    console.error(err);
+    toast('Ошибка: ' + (err.message || 'не удалось сохранить'), 'err');
+    setCardBusy(card, false);
+  }
+}
+
+// Recalculates rating + review_count for a master from all their approved reviews
+async function recalcMasterRating(masterId) {
+  try {
+    const { data, error } = await sb
+      .from('reviews')
+      .select('rating')
+      .eq('master_id', masterId)
+      .eq('status', 'approved');
+
+    if (error || !data || data.length === 0) return;
+
+    const count = data.length;
+    const avg = data.reduce((sum, r) => sum + (r.rating || 0), 0) / count;
+    const rounded = Math.round(avg * 10) / 10; // e.g. 4.7
+
+    const { error: ue } = await sb.from('masters').update({
+      rating: rounded,
+      review_count: count,
+    }).eq('id', masterId);
+
+    if (ue) console.warn('Rating update failed:', ue.message);
+    else console.log(`Master ${masterId}: rating=${rounded}, reviews=${count}`);
+  } catch(e) {
+    console.warn('recalcMasterRating error:', e.message);
+  }
+}
+
+async function declineReview(id) {
+  const card = document.getElementById('rcard-' + id);
+  setCardBusy(card, true);
+  try {
+    const { error } = await sb.from('reviews').update({ status: 'declined' }).eq('id', id);
+    if (error) throw error;
+    dismissCard(card, 'reviews', id, 'Отзыв отклонён ❌');
+  } catch (err) {
+    console.error(err);
+    toast('Ошибка: ' + (err.message || 'не удалось сохранить'), 'err');
+    setCardBusy(card, false);
+  }
+}
+
+// ── HELPERS ──────────────────────────────────────────────────────────────────
+function setCardBusy(card, busy) {
+  const btns = card.querySelectorAll('button');
+  btns.forEach(b => b.disabled = busy);
+  if (busy) card.style.opacity = '0.7';
+  else card.style.opacity = '';
+}
+
+function dismissCard(card, type, id, message) {
+  // Remove from local array
+  if (type === 'portfolio') {
+    portfolioItems = portfolioItems.filter(i => i.id !== id);
+    document.getElementById('badge-portfolio').textContent = portfolioItems.length;
+    if (portfolioItems.length === 0) {
+      setTimeout(() => showState('portfolio', 'empty'), 450);
+    }
+  } else {
+    reviewItems = reviewItems.filter(i => i.id !== id);
+    document.getElementById('badge-reviews').textContent = reviewItems.length;
+    if (reviewItems.length === 0) {
+      setTimeout(() => showState('reviews', 'empty'), 450);
+    }
+  }
+  // Animate out
+  card.classList.add('fade-out');
+  setTimeout(() => card.remove(), 400);
+  toast(message);
+}
+
+function renderStars(n) {
+  let out = '';
+  for (let i = 1; i <= 5; i++) {
+    out += `<span style="color:${i <= n ? '#F59E0B' : '#e5e7eb'}">${i <= n ? '★' : '☆'}</span>`;
+  }
+  return out;
+}
+
+function formatDate(ts) {
+  if (!ts) return '';
+  try {
+    const d = new Date(ts);
+    return d.toLocaleDateString('ru-RU', { day: '2-digit', month: 'short', year: 'numeric' });
+  } catch { return ts; }
+}
+
+function esc(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// ── TOAST ────────────────────────────────────────────────────────────────────
+let toastTimer;
+function toast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.background = type === 'err' ? '#7f1d1d' : '#1e1b4b';
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3200);
+}
+
+// ── LIGHTBOX ─────────────────────────────────────────────────────────────────
+function openLightbox(url) {
+  document.getElementById('lightbox-img').src = url;
+  document.getElementById('lightbox').classList.add('open');
+  document.addEventListener('keydown', _lbKeyHandler);
+}
+function closeLightbox() {
+  document.getElementById('lightbox').classList.remove('open');
+  document.getElementById('lightbox-img').src = '';
+  document.removeEventListener('keydown', _lbKeyHandler);
+}
+function _lbKeyHandler(e) { if(e.key === 'Escape') closeLightbox(); }
+
+// ── COPY SQL ─────────────────────────────────────────────────────────────────
+function copySql(elId) {
+  const sql = document.getElementById(elId || 'setup-sql').textContent;
+  navigator.clipboard.writeText(sql).then(() => {
+    toast('SQL скопирован в буфер обмена 📋');
+  }).catch(() => {
+    toast('Не удалось скопировать — выделите вручную', 'err');
+  });
+}
+</script>
+</body>
+</html>
