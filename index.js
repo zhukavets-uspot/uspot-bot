@@ -791,11 +791,11 @@ app.post("/notify_reschedule", async (req, res) => {
 // Body: { message, user_name, user_telegram_id }
 // Does NOT depend on Realtime or the feedback table existing.
 app.post("/feedback", async (req, res) => {
-  const { message, user_name, user_telegram_id } = req.body;
+  const { message, user_name, user_telegram_id, user_role } = req.body;
   if (!message) return res.status(400).json({ error: "Missing message" });
 
   try {
-    const result = await notifyFeedback({ message, user_name, user_telegram_id });
+    const result = await notifyFeedback({ message, user_name, user_telegram_id, user_role });
     res.json({ ok: true, ...result });
   } catch (e) {
     console.error("/feedback error:", e.message);

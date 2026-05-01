@@ -351,8 +351,14 @@ db.channel("uspot-founders-cancellations")
 // FEEDBACK — receive from Mini App, let founders reply inline
 // ════════════════════════════════════════════════════════════
 
-// founderId → { clientTelegramId, clientName } for pending replies
+// founderId → { clientTelegramId, clientName, originalMessage } for pending replies
 const pendingReplies = new Map();
+
+// latest message per user for quote-in-reply
+const latestFeedback = new Map(); // user_telegram_id → { message, user_role }
+
+const roleLabel = (role) =>
+  role === "master" ? "Вопрос / Фидбек от Мастера 👩‍🎨" : "Вопрос от Клиента 👤";
 
 // Realtime: new feedback row → broadcast to all founders with Reply button
 db.channel("uspot-founders-feedback")
@@ -363,11 +369,12 @@ db.channel("uspot-founders-feedback")
   }, async (payload) => {
     const f = payload.new;
     console.log(`[Founders] Feedback from ${f.user_name} (${f.user_telegram_id})`);
+    latestFeedback.set(String(f.user_telegram_id), { message: f.message, user_role: f.user_role || "client" });
 
     for (const chatId of registeredFounders) {
       try {
         await bot.sendMessage(String(chatId),
-          `💬 <b>Обратная связь</b>\n\n` +
+          `💬 <b>${roleLabel(f.user_role)}</b>\n\n` +
           `👤 <b>${f.user_name}</b>\n` +
           `🆔 ${f.user_telegram_id}\n\n` +
           `"${f.message}"`,
@@ -403,12 +410,14 @@ bot.on("callback_query", async (query) => {
   const data = query.data || "";
   if (data.startsWith("reply_")) {
     const [clientId, encodedName] = data.slice(6).split("_");
-    const clientName = encodedName ? decodeURIComponent(encodedName) : "клиенту";
-    pendingReplies.set(founderId, { clientTelegramId: clientId, clientName });
+    const clientName = encodedName ? decodeURIComponent(encodedName) : "пользователю";
+    const fb = latestFeedback.get(clientId) || {};
+    pendingReplies.set(founderId, { clientTelegramId: clientId, clientName, originalMessage: fb.message || null });
     await bot.answerCallbackQuery(query.id).catch(() => {});
+    const quote = fb.message ? `\n\n<i>Вопрос: «${fb.message}»</i>` : "";
     await send(founderId,
-      `✉️ Введите текст ответа для <b>${clientName}</b>:\n\n` +
-      `<i>Следующее сообщение будет отправлено клиенту</i>`
+      `✉️ Введите текст ответа для <b>${clientName}</b>:${quote}\n\n` +
+      `<i>Следующее сообщение будет отправлено пользователю</i>`
     );
   }
 });
@@ -432,8 +441,11 @@ bot.on("message", async (msg) => {
       // Use the main bot (which the client has started) to deliver the reply.
       // Falls back to founders bot only if mainBot not injected yet.
       const sender = mainBot || bot;
+      const questionBlock = pending.originalMessage
+        ? `\n\n<i>Вы задавали вопрос команде Uspot:</i>\n«${pending.originalMessage}»\n\n`
+        : "\n\n";
       await sender.sendMessage(pending.clientTelegramId,
-        `💜 <b>Ответ от команды Uspot:</b>\n\n${msg.text}`,
+        `💜 <b>Ответ от команды Uspot</b>${questionBlock}<b>Вот ответ команды Uspot:</b>\n${msg.text}`,
         { parse_mode: "HTML" }
       );
       await send(founderId, `✅ Ответ отправлен <b>${pending.clientName}</b>`);
@@ -452,13 +464,16 @@ console.log("[Founders] Uspot Founders bot started ✅");
 // Direct send to all founders WITH the Reply button.
 // Bypasses Realtime entirely — no table/publication needed.
 // ════════════════════════════════════════════════════════════
-const notifyFeedback = async ({ message, user_name, user_telegram_id }) => {
+const notifyFeedback = async ({ message, user_name, user_telegram_id, user_role }) => {
   // Save to DB for audit trail (non-fatal if it fails)
   try {
-    await db.from("feedback").insert({ message, user_name, user_telegram_id });
+    await db.from("feedback").insert({ message, user_name, user_telegram_id, user_role });
   } catch (e) {
     console.warn("[Founders] feedback DB save failed (non-fatal):", e.message);
   }
+
+  // Store for quote-in-reply
+  latestFeedback.set(String(user_telegram_id), { message, user_role: user_role || "client" });
 
   if (registeredFounders.size === 0) {
     console.warn("[Founders] notifyFeedback: no registered founders to notify");
@@ -469,7 +484,7 @@ const notifyFeedback = async ({ message, user_name, user_telegram_id }) => {
   for (const chatId of registeredFounders) {
     try {
       await bot.sendMessage(String(chatId),
-        `💬 <b>Обратная связь</b>\n\n` +
+        `💬 <b>${roleLabel(user_role)}</b>\n\n` +
         `👤 <b>${user_name || "Пользователь"}</b>\n` +
         `🆔 ${user_telegram_id}\n\n` +
         `"${message}"`,
