@@ -649,12 +649,18 @@ const runReminders = async () => {
   }
 
   // ── Review request ───────────────────────────────────────────
-  // Confirmed bookings from today (Minsk) that ended 3–4h ago
+  // Bookings from today OR yesterday (Minsk) that started 3–4h ago.
+  // We check BOTH confirmed AND completed status because:
+  //   • "completed" → master marked it done (normal flow)
+  //   • "confirmed"  → master never marked done (still valid for review)
+  // We also include yesterday to catch late-evening bookings (e.g. 22:00)
+  // whose 3-4h window falls after midnight Minsk time.
+  const yesterdayStr = minskDateStr(-1);
   const { data: pastBookings } = await db
     .from("bookings")
-    .select("*")
-    .eq("status", "confirmed")
-    .eq("booked_date", todayStr);
+    .select("*, masters(name)")
+    .in("status", ["confirmed", "completed"])
+    .in("booked_date", [todayStr, yesterdayStr]);
 
   for (const b of pastBookings || []) {
     if (!b.client_telegram_id) continue;
@@ -664,18 +670,24 @@ const runReminders = async () => {
     const bookingUtc = parseMinsKDt(b.booked_date, b.booked_time || "00:00:00");
     const hoursAgo   = (now - bookingUtc) / 3600000;
 
-    // Window: 3–4h after booking (tight 1-hour window → fires once)
+    // Window: 3–4h after booking start time (tight 1-hour window → fires once)
     if (hoursAgo < 3 || hoursAgo > 4) continue;
+
+    const master = Array.isArray(b.masters) ? b.masters[0] : b.masters;
+    const masterName = master?.name || b.master_name || null;
+    const reviewLink = b.master_id
+      ? `https://t.me/UspotTG_bot/Uspot_BY?startapp=m${b.master_id}`
+      : `https://t.me/UspotTG_bot/Uspot_BY`;
 
     await send(b.client_telegram_id,
       `💜 <b>Как прошёл визит?</b>\n\n` +
-      `Надеемся, всё понравилось! Оставьте короткий отзыв — ` +
-      `это очень важно для вашего мастера 🙏\n\n` +
-      `👉 <a href="https://t.me/UspotTG_bot/Uspot_BY">Открыть Uspot</a>`
+      (masterName ? `Надеемся, сеанс у <b>${masterName}</b> понравился! ` : `Надеемся, всё понравилось! `) +
+      `Оставьте короткий отзыв — это очень важно для вашего мастера 🙏\n\n` +
+      `👉 <a href="${reviewLink}">Открыть Uspot и оставить отзыв</a>`
     );
     await refreshMenu(b.client_telegram_id);
     sentReminders.add(key);
-    console.log(`✉️  Review request sent: booking ${b.id}`);
+    console.log(`✉️  Review request sent: booking ${b.id} (status: ${b.status})`);
   }
 
   console.log("⏰ Reminder check done");
