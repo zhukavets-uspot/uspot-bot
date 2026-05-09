@@ -717,7 +717,9 @@ const pushToGcal = async (booking, masterTgId, masterName) => {
   const dur = booking.duration_min || 60;
   const startIso = `${booking.booked_date}T${(booking.booked_time || "09:00:00").slice(0,5)}:00`;
   const startMs  = new Date(`${startIso}+03:00`).getTime();
-  const endIso   = new Date(startMs + dur * 60000).toISOString();
+  // Correct end: add duration to startMs (UTC), then shift +3h to get Minsk local string
+  const endMinsKMs = startMs + dur * 60000 + 3 * 60 * 60 * 1000;
+  const endIso     = new Date(endMinsKMs).toISOString().slice(0, 19); // "YYYY-MM-DDTHH:MM:SS" in Minsk local
 
   const event = {
     summary: `💇 ${booking.service_name || "Услуга"} — ${booking.client_name || "Клиент"}`,
@@ -728,7 +730,7 @@ const pushToGcal = async (booking, masterTgId, masterName) => {
       (booking.client_notes ? `Пожелания: ${booking.client_notes}\n` : "") +
       `\nUspot Booking ID: ${booking.id}`,
     start: { dateTime: `${startIso}+03:00`, timeZone: "Europe/Minsk" },
-    end:   { dateTime: new Date(startMs + dur * 60000).toISOString().replace("Z", "+03:00"), timeZone: "Europe/Minsk" },
+    end:   { dateTime: `${endIso}+03:00`,  timeZone: "Europe/Minsk" },
     colorId: "3", // green
     extendedProperties: {
       private: { uspot_booking_id: booking.id }
