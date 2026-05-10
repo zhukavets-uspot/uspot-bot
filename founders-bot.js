@@ -29,7 +29,11 @@ const SUPABASE_KEY        = process.env.SUPABASE_SERVICE_KEY;
 // ── Early exit if token not configured ───────────────────────
 if (!FOUNDERS_BOT_TOKEN) {
   console.log("ℹ️  FOUNDERS_BOT_TOKEN not set — Founders bot disabled. Set it in Railway env vars to enable.");
-  module.exports = {};
+  module.exports = {
+    notifyFeedback: async () => ({ sent: 0 }),
+    notifyModeration: async () => ({ sent: 0 }),
+    setMainBot: () => {},
+  };
   return;
 }
 
@@ -76,6 +80,12 @@ const dateRu = (iso) => {
 };
 const t5 = (t) => (t || "").substring(0, 5);
 const STATUS = { pending: "🟡", confirmed: "🟢", completed: "✅", cancelled: "❌" };
+
+const minskToday = (offsetDays = 0) => {
+  const MINSK_OFFSET_MS = 3 * 60 * 60 * 1000;
+  const minskNow = new Date(Date.now() + MINSK_OFFSET_MS + offsetDays * 86400000);
+  return minskNow.toISOString().split("T")[0];
+};
 
 // ── Load registered founders from Supabase on startup ────────
 const loadFounders = async () => {
@@ -156,7 +166,7 @@ bot.onText(/\/today/, async (msg) => {
   const chatId = String(msg.chat.id);
   if (!registeredFounders.has(chatId)) return;
 
-  const todayStr = new Date().toISOString().split("T")[0];
+  const todayStr = minskToday();
 
   const { data, error } = await db
     .from("bookings")
@@ -235,9 +245,8 @@ bot.onText(/\/stats/, async (msg) => {
   const chatId = String(msg.chat.id);
   if (!registeredFounders.has(chatId)) return;
 
-  const now      = new Date();
-  const todayStr = now.toISOString().split("T")[0];
-  const weekAgo  = new Date(now.getTime() - 7 * 24 * 3600 * 1000).toISOString().split("T")[0];
+  const todayStr = minskToday();
+  const weekAgo  = minskToday(-7);
 
   const { data, error } = await db
     .from("bookings")
@@ -510,4 +519,56 @@ const notifyFeedback = async ({ message, user_name, user_telegram_id, user_role 
   return { sent };
 };
 
-module.exports = { notifyFeedback, setMainBot };
+// ════════════════════════════════════════════════════════════
+// MODERATION — notify founders when portfolio/review needs review
+// ════════════════════════════════════════════════════════════
+const notifyModeration = async ({ type, masterName, clientName, stars, preview, dashboardUrl }) => {
+  if (registeredFounders.size === 0) {
+    console.warn("[Founders] notifyModeration: no registered founders to notify");
+    return { sent: 0 };
+  }
+
+  const isReview    = type === "review";
+  const isPortfolio = type === "portfolio";
+
+  let text = "";
+  if (isReview) {
+    const starsStr = stars ? `${"⭐".repeat(Math.min(stars, 5))} (${stars}/5)` : "";
+    text =
+      `⭐ <b>Новый отзыв на модерации</b>\n\n` +
+      `👩‍🎨 ${masterName || "Мастер"}\n` +
+      `👤 ${clientName || "Клиент"}\n` +
+      (starsStr ? `${starsStr}\n` : "") +
+      (preview ? `💬 «${preview.slice(0, 120)}${preview.length > 120 ? "…" : ""}»\n` : "") +
+      `\nОткройте дашборд для модерации 👇`;
+  } else if (isPortfolio) {
+    text =
+      `📸 <b>Новое портфолио на модерации</b>\n\n` +
+      `👩‍🎨 ${masterName || "Мастер"}\n` +
+      `\nОткройте дашборд для модерации 👇`;
+  } else {
+    text = `🔔 <b>Новый элемент на модерации</b> (${type})\n\nОткройте дашборд 👇`;
+  }
+
+  const keyboard = dashboardUrl
+    ? [[{ text: "🛡 Открыть модерацию", url: dashboardUrl }]]
+    : [];
+
+  let sent = 0;
+  for (const chatId of registeredFounders) {
+    try {
+      await bot.sendMessage(String(chatId), text, {
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+        reply_markup: { inline_keyboard: keyboard },
+      });
+      sent++;
+    } catch (e) {
+      console.error(`[Founders] notifyModeration to ${chatId} failed:`, e.message);
+    }
+  }
+  console.log(`[Founders] notifyModeration (${type}): sent to ${sent}/${registeredFounders.size} founder(s)`);
+  return { sent };
+};
+
+module.exports = { notifyFeedback, notifyModeration, setMainBot };

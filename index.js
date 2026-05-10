@@ -29,7 +29,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL || "https://heiyayufhuvlxhirgvyc.s
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const PORT         = process.env.PORT || 3000;
 const MINI_APP_URL = process.env.MINI_APP_URL || "https://uspot.netlify.app";
-const MODERATION_URL = process.env.MODERATION_URL || `${MINI_APP_URL}/uspot-moderation.html`;
+const MODERATION_URL = process.env.MODERATION_URL || "https://uspot-bot-production.up.railway.app/moderation";
 
 // Google Calendar OAuth (set in Railway env vars)
 const GCAL_CLIENT_ID     = process.env.GCAL_CLIENT_ID     || "";
@@ -336,11 +336,13 @@ db.channel("uspot-booking-updates")
     else if (b.status === "cancelled" && old.status !== "cancelled") {
       const reason = b.cancel_reason || "";
 
-      if (reason.startsWith("client:") || reason === "client_reschedule") {
+      if (reason.startsWith("client:") || reason === "client_reschedule" || reason === "client") {
         // Client cancelled — notify master
         if (masterTgId) {
           const reasonText = reason === "client_reschedule"
             ? "Клиент переносит запись на другое время"
+            : reason === "client"
+            ? "Причина не указана"
             : reason.slice(7);
           const isReschedule = reason === "client_reschedule";
           await send(masterTgId,
@@ -545,6 +547,13 @@ const minskDateStr = (offsetDays = 0) => {
 };
 
 const sentReminders = new Set();
+
+// Prune reminder keys older than 3 days (keys encode booking IDs, not dates,
+// so we clear the whole set once a day — worst case one duplicate send per month).
+setInterval(() => {
+  sentReminders.clear();
+  console.log("🧹 sentReminders cache cleared");
+}, 24 * 60 * 60 * 1000);
 
 const runReminders = async () => {
   console.log("⏰ Running reminder check…");
@@ -779,9 +788,15 @@ const deleteFromGcal = async (bookingId) => {
 // ════════════════════════════════════════════════════════════
 // EXPRESS HTTP SERVER
 // ════════════════════════════════════════════════════════════
+const path = require("path");
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Serve moderation dashboard from this repo so it's always reachable
+app.get("/moderation", (_req, res) => {
+  res.sendFile(path.join(__dirname, "uspot-moderation.html"));
+});
 
 // ── POST /notify ──────────────────────────────────────────
 app.post("/notify", async (req, res) => {
