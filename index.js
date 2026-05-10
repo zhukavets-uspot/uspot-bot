@@ -117,27 +117,22 @@ bot.onText(/\/start$/, async (msg) => {
   const name   = msg.from?.first_name || "друг";
   console.log(`👋 /start from ${chatId} (${name})`);
   try {
-    // Persistent reply keyboard (stays in text-bar)
     await bot.sendMessage(chatId,
       `👋 Привет, ${name}! Добро пожаловать в <b>Uspot</b> — сервис записи к мастерам красоты Минска.\n\n` +
-      `Нажмите кнопку ниже, чтобы записаться к мастеру или войти в кабинет мастера 👇`,
+      `Выберите, как хотите продолжить 👇`,
       {
         parse_mode: "HTML",
         reply_markup: {
-          keyboard: [[
-            { text: "📅 Записаться к Мастеру Uspot",   web_app: { url: MINI_APP_URL } },
-            { text: "💅 Вход в Кабинет Мастера Uspot",  web_app: { url: MINI_APP_URL + "?startapp=master" } }
-          ]],
-          resize_keyboard: true,
-          persistent: true,
-        }
+          inline_keyboard: [
+            [{ text: "📅 Book a service",    web_app: { url: MINI_APP_URL } }],
+            [{ text: "💼 Open as a Master",  web_app: { url: MINI_APP_URL + "?startapp=master" } }],
+          ],
+        },
       }
     );
   } catch (e) {
     console.error(`⚠️  /start reply failed for ${chatId}:`, e.message);
   }
-  // Inline button message as well (so user sees it clearly)
-  await send(chatId, `👇 <b>Быстрый доступ к Uspot:</b>`);
 });
 
 // ── /test_notify — diagnostic endpoint via bot command ─────────────────
