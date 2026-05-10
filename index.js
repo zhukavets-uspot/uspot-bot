@@ -677,7 +677,7 @@ const getGcalAuthUrl = (masterTgId) => {
   return oauth2.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
-    scope: ["https://www.googleapis.com/auth/calendar"],
+    scope: ["https://www.googleapis.com/auth/calendar.events"],
     state: String(masterTgId),
   });
 };
@@ -797,6 +797,11 @@ app.use(express.json());
 // Serve moderation dashboard from this repo so it's always reachable
 app.get("/moderation", (_req, res) => {
   res.sendFile(path.join(__dirname, "uspot-moderation.html"));
+});
+
+// Privacy policy — required for Google OAuth verification
+app.get("/privacy", (_req, res) => {
+  res.sendFile(path.join(__dirname, "privacy.html"));
 });
 
 // ── Telegram webhook endpoints ────────────────────────────

@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Privacy Policy — Uspot</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f9f9fb;
+      color: #1a1a2e;
+      line-height: 1.7;
+    }
+    header {
+      background: linear-gradient(135deg, #7C3AED, #06B6D4);
+      padding: 32px 24px;
+      text-align: center;
+      color: #fff;
+    }
+    header h1 { font-size: 28px; font-weight: 700; margin-bottom: 6px; }
+    header p  { font-size: 14px; opacity: 0.85; }
+    main {
+      max-width: 760px;
+      margin: 40px auto;
+      padding: 0 24px 80px;
+    }
+    h2 {
+      font-size: 18px;
+      font-weight: 700;
+      color: #7C3AED;
+      margin: 36px 0 10px;
+    }
+    p { margin-bottom: 14px; font-size: 15px; color: #374151; }
+    ul { margin: 0 0 14px 20px; }
+    ul li { font-size: 15px; color: #374151; margin-bottom: 6px; }
+    a { color: #7C3AED; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .updated {
+      display: inline-block;
+      margin-top: 8px;
+      font-size: 13px;
+      color: rgba(255,255,255,0.75);
+    }
+    .card {
+      background: #fff;
+      border-radius: 14px;
+      padding: 28px 32px;
+      box-shadow: 0 2px 12px rgba(124,58,237,0.07);
+      margin-bottom: 12px;
+    }
+    footer {
+      text-align: center;
+      padding: 24px;
+      font-size: 13px;
+      color: #9ca3af;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Uspot Privacy Policy</h1>
+  <p>Beauty booking service — Minsk, Belarus</p>
+  <span class="updated">Last updated: May 10, 2026</span>
+</header>
+
+<main>
+
+  <div class="card">
+
+    <h2>1. Who We Are</h2>
+    <p>
+      Uspot ("we", "our", "the Service") is a beauty booking platform that connects clients with
+      beauty masters in Minsk, Belarus. The Service operates through a Telegram Mini App and a
+      companion Telegram bot.
+    </p>
+    <p>
+      Contact: <a href="mailto:ilya@mentiora.ai">ilya@mentiora.ai</a>
+    </p>
+
+    <h2>2. What Data We Collect</h2>
+    <p>We collect only the data necessary to provide the booking service:</p>
+    <ul>
+      <li><strong>Telegram account data</strong> — your Telegram user ID and first name, received when you open the Mini App or start the bot. We do not collect your phone number or Telegram username.</li>
+      <li><strong>Booking information</strong> — the service you booked, the master, date, time, and price.</li>
+      <li><strong>Optional client notes</strong> — any notes or photo you attach to a booking request.</li>
+      <li><strong>Reviews and ratings</strong> — text and photos you submit after a completed session.</li>
+      <li><strong>Portfolio uploads</strong> — photos uploaded by beauty masters to their profiles.</li>
+      <li><strong>Feedback messages</strong> — messages sent via the in-app feedback form.</li>
+      <li><strong>Google Calendar tokens</strong> — OAuth tokens for beauty masters who voluntarily connect their Google Calendar (see Section 5).</li>
+    </ul>
+
+    <h2>3. How We Use Your Data</h2>
+    <ul>
+      <li>Send you Telegram notifications about your bookings (confirmation, reminders 24 h and 1 h before, status updates).</li>
+      <li>Allow beauty masters to manage their schedule and confirm or decline bookings.</li>
+      <li>Display your reviews and ratings on master profile pages (after moderation approval).</li>
+      <li>Respond to feedback messages you send to our team.</li>
+      <li>Generate anonymised analytics for internal business reporting (booking counts, revenue).</li>
+    </ul>
+    <p>We do <strong>not</strong> sell, rent, or share your personal data with third parties for marketing purposes.</p>
+
+    <h2>4. Data Storage and Security</h2>
+    <p>
+      All booking and user data is stored in <strong>Supabase</strong> (supabase.com), a cloud
+      database hosted in the EU region. Supabase applies encryption at rest and in transit
+      (TLS 1.2+).
+    </p>
+    <p>
+      The Telegram bot and API server run on <strong>Railway</strong> (railway.app),
+      a cloud platform with encrypted connections.
+    </p>
+    <p>
+      We retain your data for as long as your bookings exist in the system. You may request
+      deletion at any time by contacting us at <a href="mailto:ilya@mentiora.ai">ilya@mentiora.ai</a>.
+    </p>
+
+    <h2>5. Google Calendar Integration</h2>
+    <p>
+      Beauty masters (not clients) may optionally connect their Google account to automatically
+      sync confirmed bookings into a dedicated <strong>"Uspot Bookings"</strong> calendar.
+      This integration is entirely voluntary.
+    </p>
+    <p>When a master connects Google Calendar, we request the following permission:</p>
+    <ul>
+      <li>
+        <strong>calendar.events</strong> — create, update, and delete events in the master's
+        Google Calendar. We use this scope exclusively to:
+        <ul>
+          <li>Create a calendar event when a booking is confirmed.</li>
+          <li>Delete the calendar event if the booking is cancelled.</li>
+        </ul>
+      </li>
+    </ul>
+    <p>
+      We do <strong>not</strong> read the content of any existing calendar events. We do not
+      access any other Google services. We do not share Google Calendar data with any third party.
+    </p>
+    <p>
+      OAuth tokens are stored securely in our database and used only to perform the actions
+      described above. Masters can revoke access at any time via
+      <a href="https://myaccount.google.com/permissions" target="_blank" rel="noopener">
+        Google Account → Third-party apps
+      </a> or by contacting us.
+    </p>
+    <p>
+      Our use of Google Calendar API data complies with the
+      <a href="https://developers.google.com/terms/api-services-user-data-policy" target="_blank" rel="noopener">
+        Google API Services User Data Policy
+      </a>, including the Limited Use requirements.
+    </p>
+
+    <h2>6. Your Rights</h2>
+    <p>You have the right to:</p>
+    <ul>
+      <li><strong>Access</strong> — request a copy of the personal data we hold about you.</li>
+      <li><strong>Correction</strong> — ask us to correct inaccurate data.</li>
+      <li><strong>Deletion</strong> — ask us to delete your data.</li>
+      <li><strong>Withdrawal of consent</strong> — revoke Google Calendar access or opt out of Telegram notifications at any time.</li>
+    </ul>
+    <p>
+      To exercise any of these rights, contact us at
+      <a href="mailto:ilya@mentiora.ai">ilya@mentiora.ai</a>.
+      We will respond within 30 days.
+    </p>
+
+    <h2>7. Cookies and Tracking</h2>
+    <p>
+      The Uspot Mini App and moderation dashboard do not use advertising cookies or tracking
+      pixels. The only external requests are to Supabase (database), Google Fonts (typography),
+      and the Telegram WebApp API — all strictly necessary for the Service to function.
+    </p>
+
+    <h2>8. Children's Privacy</h2>
+    <p>
+      The Service is not directed at children under the age of 16. We do not knowingly collect
+      personal data from children. If you believe a child has provided us with personal data,
+      please contact us and we will delete it promptly.
+    </p>
+
+    <h2>9. Changes to This Policy</h2>
+    <p>
+      We may update this Privacy Policy from time to time. The "Last updated" date at the top
+      of this page will reflect any changes. Continued use of the Service after changes
+      constitutes acceptance of the updated policy.
+    </p>
+
+    <h2>10. Contact</h2>
+    <p>
+      Uspot · Minsk, Belarus<br/>
+      Email: <a href="mailto:ilya@mentiora.ai">ilya@mentiora.ai</a><br/>
+      Telegram: <a href="https://t.me/UspotTG_bot">@UspotTG_bot</a>
+    </p>
+
+  </div>
+
+</main>
+
+<footer>© 2026 Uspot. All rights reserved.</footer>
+
+</body>
+</html>
