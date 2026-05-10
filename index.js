@@ -123,10 +123,12 @@ bot.onText(/\/start$/, async (msg) => {
       {
         parse_mode: "HTML",
         reply_markup: {
-          inline_keyboard: [
-            [{ text: "📅 Book a service",    web_app: { url: MINI_APP_URL } }],
-            [{ text: "💼 Open as a Master",  web_app: { url: MINI_APP_URL + "?startapp=master" } }],
+          keyboard: [
+            [{ text: "📅 Book a service",   web_app: { url: MINI_APP_URL } }],
+            [{ text: "💼 Open as a Master", web_app: { url: MINI_APP_URL + "?startapp=master" } }],
           ],
+          resize_keyboard: true,
+          persistent: true,
         },
       }
     );
@@ -1101,6 +1103,14 @@ const server = app.listen(PORT, async () => {
   console.log(`📅 Google Calendar: ${google && GCAL_CLIENT_ID ? "ENABLED" : "disabled (set GCAL_* env vars)"}`);
 
   await registerWebhook(bot, `${BOT_WEBHOOK_BASE}/webhook/main`, "Main bot");
+
+  // Register /start in the bot command menu (shows up when user taps /)
+  try {
+    await bot.setMyCommands([{ command: "start", description: "Open Uspot" }]);
+    console.log("✅ Bot commands registered");
+  } catch (e) {
+    console.warn("⚠️  setMyCommands failed:", e.message);
+  }
 
   if (setFoundersWebhook) {
     const foundersBot = { deleteWebHook: deleteFoundersWebhook, setWebHook: setFoundersWebhook };
