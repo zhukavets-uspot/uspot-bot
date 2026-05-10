@@ -794,6 +794,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Home page — required for Google OAuth branding verification
+app.get("/", (_req, res) => {
+  res.sendFile(path.join(__dirname, "home.html"));
+});
+
 // Serve moderation dashboard from this repo so it's always reachable
 app.get("/moderation", (_req, res) => {
   res.sendFile(path.join(__dirname, "uspot-moderation.html"));
