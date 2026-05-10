@@ -59,22 +59,14 @@ const dateRu = (iso) => {
 };
 const timeShort = (t) => (t || "").substring(0, 5);
 
-// ── Standard inline keyboard appended to EVERY notification ──────────────
-// Bug #3: "Записаться к Мастеру Uspot" button must appear on every message
-const BOOK_KEYBOARD = [
-  [{ text: "📅 Записаться к Мастеру Uspot",   web_app: { url: MINI_APP_URL } }],
-  [{ text: "💅 Вход в Кабинет Мастера Uspot",  web_app: { url: MINI_APP_URL + "?startapp=master" } }],
-];
-
-// ── Send a plain message WITH the booking button ─────────────────────────
-const send = async (chatId, text, extraRows = []) => {
+// ── Send a notification — contextual inline buttons only (no default keyboard) ──
+const send = async (chatId, text, inlineRows = []) => {
   if (!chatId) return;
-  const keyboard = [...extraRows, ...BOOK_KEYBOARD];
   try {
     await bot.sendMessage(String(chatId), text, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
-      reply_markup: { inline_keyboard: keyboard },
+      reply_markup: inlineRows.length ? { inline_keyboard: inlineRows } : undefined,
     });
     console.log(`✉️  Sent to ${chatId}: ${text.substring(0, 60)}…`);
   } catch (e) {
@@ -82,7 +74,7 @@ const send = async (chatId, text, extraRows = []) => {
   }
 };
 
-// ── Send with a custom action keyboard + booking button ─────────────────
+// ── Alias kept for call-sites that pass action rows explicitly ───────────
 const sendWithKeyboard = async (chatId, text, actionRows = []) => {
   return send(chatId, text, actionRows);
 };
@@ -116,19 +108,28 @@ bot.onText(/\/start$/, async (msg) => {
   const chatId = msg.chat.id;
   const name   = msg.from?.first_name || "друг";
   console.log(`👋 /start from ${chatId} (${name})`);
+
+  // Set the native Menu button for this chat — stays in the bottom bar permanently
+  try {
+    await bot.setChatMenuButton({
+      chat_id: chatId,
+      menu_button: { type: "web_app", text: "Uspot", web_app: { url: MINI_APP_URL } },
+    });
+  } catch (e) {
+    console.warn("⚠️  setChatMenuButton failed:", e.message);
+  }
+
   try {
     await bot.sendMessage(chatId,
       `👋 Привет, ${name}! Добро пожаловать в <b>Uspot</b> — сервис записи к мастерам красоты Минска.\n\n` +
-      `Выберите, как хотите продолжить 👇`,
+      `Выберите, как хотите открыть приложение 👇`,
       {
         parse_mode: "HTML",
         reply_markup: {
-          keyboard: [
-            [{ text: "📅 Book a service",   web_app: { url: MINI_APP_URL } }],
-            [{ text: "💼 Open as a Master", web_app: { url: MINI_APP_URL + "?startapp=master" } }],
+          inline_keyboard: [
+            [{ text: "📅 Записаться к мастеру", web_app: { url: MINI_APP_URL } }],
+            [{ text: "💼 Вход для Мастера Uspot", web_app: { url: MINI_APP_URL + "?startapp=master" } }],
           ],
-          resize_keyboard: true,
-          persistent: true,
         },
       }
     );
@@ -410,7 +411,7 @@ bot.on("callback_query", async (query) => {
       await bot.editMessageText(
         `✅ <b>Запись подтверждена</b>\n\nКлиент получит уведомление. Ждём его в Uspot! 💜`,
         { chat_id: chatId, message_id: msgId, parse_mode: "HTML",
-          reply_markup: { inline_keyboard: BOOK_KEYBOARD } }
+          reply_markup: { inline_keyboard: [[{ text: "📅 Открыть кабинет мастера", web_app: { url: MINI_APP_URL + "?startapp=master" } }]] } }
       ).catch(() => {});
     } catch (e) {
       await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка, попробуйте ещё раз" });
@@ -428,7 +429,7 @@ bot.on("callback_query", async (query) => {
       await bot.editMessageText(
         `⏰ <b>Другое время предложено</b>\n\nКлиент получит уведомление и сможет перезаписаться.`,
         { chat_id: chatId, message_id: msgId, parse_mode: "HTML",
-          reply_markup: { inline_keyboard: BOOK_KEYBOARD } }
+          reply_markup: { inline_keyboard: [[{ text: "📅 Открыть кабинет мастера", web_app: { url: MINI_APP_URL + "?startapp=master" } }]] } }
       ).catch(() => {});
     } catch (e) {
       await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка" });
@@ -482,12 +483,16 @@ bot.on("callback_query", async (query) => {
     const reasonCode = rest.slice(underIdx + 1);
     const reasonText = CANCEL_REASONS[reasonCode] || reasonCode;
     try {
+      const { data: bkInfo } = await db.from("bookings").select("master_id").eq("id", bookingId).single();
       await db.from("bookings")
         .update({ status: "cancelled", cancel_reason: `client:${reasonText}` })
         .eq("id", bookingId);
       await bot.answerCallbackQuery(query.id, { text: "✅ Запись отменена" });
       await send(chatId,
-        `✅ <b>Запись отменена</b>\n\nПричина: <i>${reasonText}</i>\n\nНадеемся увидеть вас снова в Uspot! 💜`
+        `✅ <b>Запись отменена</b>\n\nПричина: <i>${reasonText}</i>\n\nНадеемся увидеть вас снова в Uspot! 💜`,
+        bkInfo?.master_id
+          ? [[{ text: "📅 Записаться снова", web_app: { url: `${MINI_APP_URL}?startapp=m${bkInfo.master_id}` } }]]
+          : []
       );
     } catch (e) {
       await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка" });
@@ -519,11 +524,15 @@ bot.on("message", async (msg) => {
   pendingCancelText.delete(chatId);
   const reasonText = msg.text.trim();
   try {
+    const { data: bkInfo } = await db.from("bookings").select("master_id").eq("id", pending.bookingId).single();
     await db.from("bookings")
       .update({ status: "cancelled", cancel_reason: `client:${reasonText}` })
       .eq("id", pending.bookingId);
     await send(chatId,
-      `✅ <b>Запись отменена</b>\n\nПричина: <i>${reasonText}</i>\n\nНадеемся увидеть вас снова в Uspot! 💜`
+      `✅ <b>Запись отменена</b>\n\nПричина: <i>${reasonText}</i>\n\nНадеемся увидеть вас снова в Uspot! 💜`,
+      bkInfo?.master_id
+        ? [[{ text: "📅 Записаться снова", web_app: { url: `${MINI_APP_URL}?startapp=m${bkInfo.master_id}` } }]]
+        : []
     );
   } catch (e) {
     console.error("[Message] cancel text error:", e.message);
@@ -828,7 +837,7 @@ app.post("/notify", async (req, res) => {
       await bot.sendMessage(chatId, message, {
         parse_mode: "HTML",
         disable_web_page_preview: true,
-        reply_markup: { inline_keyboard: [...(keyboard || []), ...BOOK_KEYBOARD] },
+        reply_markup: keyboard?.length ? { inline_keyboard: keyboard } : undefined,
       });
       sent++;
     } catch (e) {
@@ -861,7 +870,6 @@ app.post("/broadcast", async (req, res) => {
       await bot.sendMessage(chatId, message, {
         parse_mode: "HTML",
         disable_web_page_preview: true,
-        reply_markup: { inline_keyboard: BOOK_KEYBOARD },
       });
       sent++;
     } catch (e) {
@@ -1104,12 +1112,22 @@ const server = app.listen(PORT, async () => {
 
   await registerWebhook(bot, `${BOT_WEBHOOK_BASE}/webhook/main`, "Main bot");
 
-  // Register /start in the bot command menu (shows up when user taps /)
+  // Register /start in the bot command menu (tap / to see it)
   try {
-    await bot.setMyCommands([{ command: "start", description: "Open Uspot" }]);
+    await bot.setMyCommands([{ command: "start", description: "Открыть Uspot" }]);
     console.log("✅ Bot commands registered");
   } catch (e) {
     console.warn("⚠️  setMyCommands failed:", e.message);
+  }
+
+  // Set the default Menu button for all chats (the ⊞ button next to the text field)
+  try {
+    await bot.setChatMenuButton({
+      menu_button: { type: "web_app", text: "Uspot", web_app: { url: MINI_APP_URL } },
+    });
+    console.log("✅ Default Menu button set");
+  } catch (e) {
+    console.warn("⚠️  setChatMenuButton (default) failed:", e.message);
   }
 
   if (setFoundersWebhook) {
