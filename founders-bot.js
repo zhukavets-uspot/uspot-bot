@@ -35,6 +35,7 @@ if (!FOUNDERS_BOT_TOKEN) {
     setMainBot: () => {},
     processFoundersUpdate: () => {},
     setFoundersWebhook: async () => {},
+    deleteFoundersWebhook: async () => {},
   };
   return;
 }
@@ -573,7 +574,8 @@ const notifyModeration = async ({ type, masterName, clientName, stars, preview, 
   return { sent };
 };
 
-const processFoundersUpdate = (update) => bot.processUpdate(update);
-const setFoundersWebhook    = (url) => bot.setWebHook(url);
+const processFoundersUpdate  = (update) => bot.processUpdate(update);
+const setFoundersWebhook     = (url)    => bot.setWebHook(url);
+const deleteFoundersWebhook  = ()       => bot.deleteWebHook();
 
-module.exports = { notifyFeedback, notifyModeration, setMainBot, processFoundersUpdate, setFoundersWebhook };
+module.exports = { notifyFeedback, notifyModeration, setMainBot, processFoundersUpdate, setFoundersWebhook, deleteFoundersWebhook };

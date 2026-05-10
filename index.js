@@ -21,7 +21,7 @@ const express        = require("express");
 const cors           = require("cors");
 
 // Founders bot runs in the same process
-const { notifyFeedback, notifyModeration, setMainBot, processFoundersUpdate, setFoundersWebhook } = require("./founders-bot");
+const { notifyFeedback, notifyModeration, setMainBot, processFoundersUpdate, setFoundersWebhook, deleteFoundersWebhook } = require("./founders-bot");
 
 // ── Config ───────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
@@ -1072,24 +1072,34 @@ app.get("/gcal/status", async (req, res) => {
   res.json({ ok: true, connected: !!data, updated_at: data?.updated_at });
 });
 
+// Delete any active polling/webhook then register new webhook, retrying on 409
+const registerWebhook = async (botInstance, url, label, attempts = 5) => {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await botInstance.deleteWebHook();
+      await botInstance.setWebHook(url);
+      console.log(`✅ ${label} webhook set: ${url}`);
+      return;
+    } catch (e) {
+      if (i < attempts - 1) {
+        console.warn(`⚠️  ${label} webhook attempt ${i + 1} failed (${e.message}), retrying in ${(i + 1) * 2}s…`);
+        await new Promise(r => setTimeout(r, (i + 1) * 2000));
+      } else {
+        console.error(`❌ ${label} webhook setup failed after ${attempts} attempts: ${e.message}`);
+      }
+    }
+  }
+};
+
 const server = app.listen(PORT, async () => {
   console.log(`🤖 Uspot bot HTTP server running on port ${PORT}`);
   console.log(`📅 Google Calendar: ${google && GCAL_CLIENT_ID ? "ENABLED" : "disabled (set GCAL_* env vars)"}`);
 
-  try {
-    await bot.setWebHook(`${BOT_WEBHOOK_BASE}/webhook/main`);
-    console.log(`✅ Main bot webhook set: ${BOT_WEBHOOK_BASE}/webhook/main`);
-  } catch (e) {
-    console.error("❌ Main bot webhook setup failed:", e.message);
-  }
+  await registerWebhook(bot, `${BOT_WEBHOOK_BASE}/webhook/main`, "Main bot");
 
   if (setFoundersWebhook) {
-    try {
-      await setFoundersWebhook(`${BOT_WEBHOOK_BASE}/webhook/founders`);
-      console.log(`✅ Founders bot webhook set`);
-    } catch (e) {
-      console.error("❌ Founders bot webhook setup failed:", e.message);
-    }
+    const foundersBot = { deleteWebHook: deleteFoundersWebhook, setWebHook: setFoundersWebhook };
+    await registerWebhook(foundersBot, `${BOT_WEBHOOK_BASE}/webhook/founders`, "Founders bot");
   }
 });
 
