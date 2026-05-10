@@ -33,6 +33,8 @@ if (!FOUNDERS_BOT_TOKEN) {
     notifyFeedback: async () => ({ sent: 0 }),
     notifyModeration: async () => ({ sent: 0 }),
     setMainBot: () => {},
+    processFoundersUpdate: () => {},
+    setFoundersWebhook: async () => {},
   };
   return;
 }
@@ -48,7 +50,7 @@ const ALLOWED_IDS = new Set(
 );
 const isAllowed = (chatId) => ALLOWED_IDS.size === 0 || ALLOWED_IDS.has(String(chatId));
 
-const bot = new TelegramBot(FOUNDERS_BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(FOUNDERS_BOT_TOKEN, { polling: false });
 const db  = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ── Registered founders (in-memory, repopulated from Supabase on start) ─
@@ -571,4 +573,7 @@ const notifyModeration = async ({ type, masterName, clientName, stars, preview, 
   return { sent };
 };
 
-module.exports = { notifyFeedback, notifyModeration, setMainBot };
+const processFoundersUpdate = (update) => bot.processUpdate(update);
+const setFoundersWebhook    = (url) => bot.setWebHook(url);
+
+module.exports = { notifyFeedback, notifyModeration, setMainBot, processFoundersUpdate, setFoundersWebhook };

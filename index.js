@@ -21,7 +21,7 @@ const express        = require("express");
 const cors           = require("cors");
 
 // Founders bot runs in the same process
-const { notifyFeedback, notifyModeration, setMainBot } = require("./founders-bot");
+const { notifyFeedback, notifyModeration, setMainBot, processFoundersUpdate, setFoundersWebhook } = require("./founders-bot");
 
 // ── Config ───────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
@@ -41,8 +41,9 @@ if (!BOT_TOKEN || !SUPABASE_KEY) {
   process.exit(1);
 }
 
-// polling: true so the bot can receive /start and callbacks
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const BOT_WEBHOOK_BASE = process.env.BOT_WEBHOOK_BASE_URL || "https://uspot-bot-production.up.railway.app";
+
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 setMainBot(bot);
 const db  = createClient(SUPABASE_URL, SUPABASE_KEY);
 
@@ -798,6 +799,17 @@ app.get("/moderation", (_req, res) => {
   res.sendFile(path.join(__dirname, "uspot-moderation.html"));
 });
 
+// ── Telegram webhook endpoints ────────────────────────────
+app.post("/webhook/main", (req, res) => {
+  bot.processUpdate(req.body);
+  res.sendStatus(200);
+});
+
+app.post("/webhook/founders", (req, res) => {
+  if (processFoundersUpdate) processFoundersUpdate(req.body);
+  res.sendStatus(200);
+});
+
 // ── POST /notify ──────────────────────────────────────────
 app.post("/notify", async (req, res) => {
   const { to, message, keyboard } = req.body;
@@ -1060,14 +1072,29 @@ app.get("/gcal/status", async (req, res) => {
   res.json({ ok: true, connected: !!data, updated_at: data?.updated_at });
 });
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, async () => {
   console.log(`🤖 Uspot bot HTTP server running on port ${PORT}`);
   console.log(`📅 Google Calendar: ${google && GCAL_CLIENT_ID ? "ENABLED" : "disabled (set GCAL_* env vars)"}`);
+
+  try {
+    await bot.setWebHook(`${BOT_WEBHOOK_BASE}/webhook/main`);
+    console.log(`✅ Main bot webhook set: ${BOT_WEBHOOK_BASE}/webhook/main`);
+  } catch (e) {
+    console.error("❌ Main bot webhook setup failed:", e.message);
+  }
+
+  if (setFoundersWebhook) {
+    try {
+      await setFoundersWebhook(`${BOT_WEBHOOK_BASE}/webhook/founders`);
+      console.log(`✅ Founders bot webhook set`);
+    } catch (e) {
+      console.error("❌ Founders bot webhook setup failed:", e.message);
+    }
+  }
 });
 
 const shutdown = async (signal) => {
   console.log(`\n[${signal}] Shutting down…`);
-  try { await bot.stopPolling(); } catch (_) {}
   server.close(() => { console.log("Bye!"); process.exit(0); });
   setTimeout(() => process.exit(0), 5000).unref();
 };
