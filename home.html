@@ -63,6 +63,22 @@
       color: #9ca3af;
     }
     footer a { color: #7C3AED; }
+  /* ── cookie banner ── */
+  #cookie-banner {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    background: #1a1a2e; color: #e5e7eb;
+    padding: 14px 20px;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; font-size: 13px; z-index: 9999;
+    border-top: 1px solid rgba(124,58,237,0.3);
+  }
+  #cookie-banner a { color: #a78bfa; }
+  #cookie-banner button {
+    background: linear-gradient(135deg, #7C3AED, #06B6D4);
+    color: #fff; border: none; border-radius: 8px;
+    padding: 8px 18px; font-size: 13px; font-weight: 600;
+    cursor: pointer; white-space: nowrap; flex-shrink: 0;
+  }
   </style>
 </head>
 <body>
@@ -115,7 +131,24 @@
 
 </main>
 
-<footer>© 2026 Uspot. All rights reserved. · <a href="/privacy">Privacy Policy</a></footer>
+<footer>© 2026 Uspot. All rights reserved. · <a href="/privacy">Политика обработки персональных данных</a></footer>
+
+<!-- Cookie / PD banner -->
+<div id="cookie-banner">
+  <span>
+    Uspot использует технические cookie и Telegram для работы сервиса.
+    Продолжая использовать сайт, вы принимаете
+    <a href="/privacy">Политику обработки персональных данных</a>.
+  </span>
+  <button onclick="document.getElementById('cookie-banner').style.display='none';localStorage.setItem('uspot_cookie_ok','1')">
+    Принять
+  </button>
+</div>
+<script>
+  if(localStorage.getItem('uspot_cookie_ok')==='1'){
+    document.getElementById('cookie-banner').style.display='none';
+  }
+</script>
 
 </body>
 </html>
