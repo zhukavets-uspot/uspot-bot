@@ -1087,6 +1087,16 @@ app.get("/gcal/status", async (req, res) => {
   res.json({ ok: true, connected: !!data, updated_at: data?.updated_at });
 });
 
+// DELETE /gcal/disconnect?master_tg_id=XXX — revoke Google Calendar access
+app.delete("/gcal/disconnect", async (req, res) => {
+  const { master_tg_id } = req.query;
+  if (!master_tg_id) return res.status(400).json({ error: "Missing master_tg_id" });
+  const { error } = await db.from("master_gcal_tokens")
+    .delete().eq("master_telegram_id", String(master_tg_id));
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ ok: true, disconnected: true });
+});
+
 // Delete any active polling/webhook then register new webhook, retrying on 409
 const registerWebhook = async (botInstance, url, label, attempts = 5) => {
   for (let i = 0; i < attempts; i++) {
