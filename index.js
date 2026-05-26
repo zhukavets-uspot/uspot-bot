@@ -621,10 +621,11 @@ const runReminders = async () => {
   }
 
   // ── Review request ──────────────────────────────────────────────
-  // Bug #4: link goes to the SPECIFIC BOOKING for review, not just the master
+  // Send 3-4h after booking time, only if visit actually happened
   const { data: pastBookings } = await db.from("bookings")
     .select("*, masters(name)")
     .in("status", ["confirmed", "completed"])
+    .not("client_name", "like", "🔒%")          // skip manual/block-time entries
     .in("booked_date", [todayStr, yesterdayStr]);
 
   for (const b of pastBookings || []) {
@@ -635,10 +636,18 @@ const runReminders = async () => {
     const hoursAgo   = (now - bookingUtc) / 3600000;
     if (hoursAgo < 3 || hoursAgo > 4) continue;
 
+    // Re-check fresh status — skip if booking was cancelled after the query ran
+    const { data: fresh } = await db.from("bookings")
+      .select("status").eq("id", b.id).single();
+    if (!fresh || fresh.status === "cancelled" || fresh.status === "declined" || fresh.status === "pending") {
+      console.log(`⏭️  Review skipped (status=${fresh?.status}): booking ${b.id}`);
+      sentReminders.add(key); // don't retry
+      continue;
+    }
+
     const master = Array.isArray(b.masters) ? b.masters[0] : b.masters;
     const masterName = master?.name || b.master_name || null;
 
-    // Bug #4 fix: deep-link to review_{bookingId}_{masterId} so app opens ReviewScreen directly
     const reviewStartapp = `review_${b.id}_${b.master_id}`;
     const reviewUrl = `${MINI_APP_URL}?startapp=${reviewStartapp}`;
 
