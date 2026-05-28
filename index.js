@@ -709,7 +709,7 @@ const getGcalAuthUrl = (masterTgId) => {
   return oauth2.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
-    scope: ["https://www.googleapis.com/auth/calendar.events"],
+    scope: ["https://www.googleapis.com/auth/calendar"],   // full access: events + calendarList + calendars.insert
     state: String(masterTgId),
   });
 };
@@ -721,13 +721,27 @@ const getMasterOAuth2 = async (masterTgId) => {
     .select("access_token, refresh_token, expiry_date")
     .eq("master_telegram_id", String(masterTgId))
     .single();
-  if (!data?.refresh_token) return null;
+  if (!data?.refresh_token) {
+    console.warn(`GCal: no token for master ${masterTgId} — not connected`);
+    return null;
+  }
   const oauth2 = getOAuth2Client();
   if (!oauth2) return null;
   oauth2.setCredentials({
     access_token:  data.access_token,
     refresh_token: data.refresh_token,
     expiry_date:   data.expiry_date,
+  });
+  // Persist refreshed tokens back to DB so they survive Railway restarts
+  oauth2.on("tokens", async (newTokens) => {
+    console.log(`🔄 GCal token refreshed for master ${masterTgId}`);
+    await db.from("master_gcal_tokens").upsert({
+      master_telegram_id: String(masterTgId),
+      access_token:  newTokens.access_token,
+      refresh_token: newTokens.refresh_token || data.refresh_token,
+      expiry_date:   newTokens.expiry_date,
+      updated_at:    new Date().toISOString(),
+    }, { onConflict: "master_telegram_id" });
   });
   return oauth2;
 };
@@ -747,14 +761,22 @@ const ensureUspotCalendar = async (auth) => {
 // Push a booking to master's Google Calendar
 // isPending=true → grey "tentative" event; false → green "confirmed"
 const pushToGcal = async (booking, masterTgId, masterName, isPending = false) => {
-  if (!google || !GCAL_CLIENT_ID) return;
+  if (!google || !GCAL_CLIENT_ID) { console.log("GCal: googleapis or client_id missing"); return; }
   const auth = await getMasterOAuth2(masterTgId);
   if (!auth) {
-    console.log(`GCal: master ${masterTgId} has not connected Google Calendar`);
+    console.log(`GCal: master ${masterTgId} has not connected Google Calendar — skipping`);
     return;
   }
+  console.log(`GCal: pushing booking ${booking.id} for master ${masterTgId} (${isPending?"pending":"confirmed"})`);
   const calendar = google.calendar({ version: "v3", auth });
-  const calId = await ensureUspotCalendar(auth);
+  let calId;
+  try {
+    calId = await ensureUspotCalendar(auth);
+    console.log(`GCal: using calendar ${calId}`);
+  } catch (e) {
+    console.error(`GCal: ensureUspotCalendar failed — ${e.message}`);
+    throw e;
+  }
 
   // Build event times (Minsk UTC+3)
   const dur = booking.duration_min || 60;
