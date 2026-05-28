@@ -251,10 +251,10 @@ db.channel("uspot-new-bookings")
       );
     }
 
-    // Bug #5: push to Google Calendar if master has connected it
-    if (b.status === "confirmed" && masterTgId) {
-      pushToGcal(b, masterTgId, masterName).catch(e =>
-        console.error("GCal push failed:", e.message)
+    // Push ALL new bookings to GCal: pending → grey "tentative", confirmed → green
+    if (masterTgId) {
+      pushToGcal(b, masterTgId, masterName, b.status === "pending").catch(e =>
+        console.error("GCal push (new booking):", e.message)
       );
     }
   })
@@ -308,11 +308,17 @@ db.channel("uspot-booking-updates")
           ]]
         );
       }
-      // Bug #5: push confirmed booking to GCal
+      // Update GCal event from tentative (grey) → confirmed (green)
+      // If event already exists from when booking was pending, update it.
+      // If it doesn't exist yet (master confirmed immediately), create it.
       if (masterTgId) {
-        pushToGcal(b, masterTgId, masterName).catch(e =>
-          console.error("GCal push (confirm):", e.message)
-        );
+        confirmGcalEvent(b.id, masterTgId).catch(async (e) => {
+          console.error("GCal confirm update failed, trying insert:", e.message);
+          // Fallback: insert if no event_id yet
+          pushToGcal(b, masterTgId, masterName, false).catch(e2 =>
+            console.error("GCal push (confirm fallback):", e2.message)
+          );
+        });
       }
     }
 
@@ -728,7 +734,8 @@ const ensureUspotCalendar = async (auth) => {
 };
 
 // Push a booking to master's Google Calendar
-const pushToGcal = async (booking, masterTgId, masterName) => {
+// isPending=true → grey "tentative" event; false → green "confirmed"
+const pushToGcal = async (booking, masterTgId, masterName, isPending = false) => {
   if (!google || !GCAL_CLIENT_ID) return;
   const auth = await getMasterOAuth2(masterTgId);
   if (!auth) {
@@ -742,21 +749,24 @@ const pushToGcal = async (booking, masterTgId, masterName) => {
   const dur = booking.duration_min || 60;
   const startIso = `${booking.booked_date}T${(booking.booked_time || "09:00:00").slice(0,5)}:00`;
   const startMs  = new Date(`${startIso}+03:00`).getTime();
-  // Correct end: add duration to startMs (UTC), then shift +3h to get Minsk local string
   const endMinsKMs = startMs + dur * 60000 + 3 * 60 * 60 * 1000;
-  const endIso     = new Date(endMinsKMs).toISOString().slice(0, 19); // "YYYY-MM-DDTHH:MM:SS" in Minsk local
+  const endIso     = new Date(endMinsKMs).toISOString().slice(0, 19);
 
   const event = {
-    summary: `💇 ${booking.service_name || "Услуга"} — ${booking.client_name || "Клиент"}`,
+    summary: isPending
+      ? `⏳ ${booking.service_name || "Услуга"} — ${booking.client_name || "Клиент"} (ожидает)`
+      : `✅ ${booking.service_name || "Услуга"} — ${booking.client_name || "Клиент"}`,
     description:
       `Клиент: ${booking.client_name || "—"}\n` +
       `Услуга: ${booking.service_name || "—"}\n` +
       `Цена: ${booking.total_price ? booking.total_price + " BYN" : "—"}\n` +
       (booking.client_notes ? `Пожелания: ${booking.client_notes}\n` : "") +
+      `Статус: ${isPending ? "Ожидает подтверждения" : "Подтверждено"}\n` +
       `\nUspot Booking ID: ${booking.id}`,
     start: { dateTime: `${startIso}+03:00`, timeZone: "Europe/Minsk" },
-    end:   { dateTime: `${endIso}+03:00`,  timeZone: "Europe/Minsk" },
-    colorId: "3", // green
+    end:   { dateTime: `${endIso}+03:00`,   timeZone: "Europe/Minsk" },
+    status: isPending ? "tentative" : "confirmed",
+    colorId: isPending ? "8" : "3", // 8=graphite (pending), 3=green (confirmed)
     extendedProperties: {
       private: { uspot_booking_id: booking.id }
     },
@@ -767,13 +777,38 @@ const pushToGcal = async (booking, masterTgId, masterName) => {
       calendarId: calId,
       requestBody: event,
     });
-    // Store event ID so we can update/delete later
     await db.from("bookings")
       .update({ gcal_event_id: created.id, gcal_calendar_id: calId })
       .eq("id", booking.id);
-    console.log(`✅ GCal event created: ${created.id} for booking ${booking.id}`);
+    console.log(`✅ GCal event created (${isPending?"pending":"confirmed"}): ${created.id} for booking ${booking.id}`);
   } catch (e) {
     console.error("GCal insert failed:", e.message);
+  }
+};
+
+// Update GCal event when booking is confirmed (pending → confirmed)
+const confirmGcalEvent = async (bookingId, masterTgId) => {
+  if (!google || !GCAL_CLIENT_ID) return;
+  try {
+    const { data: bk } = await db.from("bookings")
+      .select("gcal_event_id, gcal_calendar_id, service_name, client_name")
+      .eq("id", bookingId).single();
+    if (!bk?.gcal_event_id) return;
+    const auth = await getMasterOAuth2(masterTgId);
+    if (!auth) return;
+    const calendar = google.calendar({ version: "v3", auth });
+    await calendar.events.patch({
+      calendarId: bk.gcal_calendar_id,
+      eventId: bk.gcal_event_id,
+      requestBody: {
+        summary: `✅ ${bk.service_name || "Услуга"} — ${bk.client_name || "Клиент"}`,
+        status: "confirmed",
+        colorId: "3", // green
+      },
+    });
+    console.log(`✅ GCal event updated to confirmed: ${bk.gcal_event_id}`);
+  } catch (e) {
+    console.error("GCal confirm update failed:", e.message);
   }
 };
 
