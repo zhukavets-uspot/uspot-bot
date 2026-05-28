@@ -62,15 +62,26 @@ const timeShort = (t) => (t || "").substring(0, 5);
 // ── Send a notification — contextual inline buttons only (no default keyboard) ──
 const send = async (chatId, text, inlineRows = []) => {
   if (!chatId) return;
+  // Telegram requires numeric IDs; usernames must have @ prefix.
+  // If stored without @, add it so Telegram can resolve the username.
+  let id = String(chatId).trim();
+  if (id && !/^\d+$/.test(id) && !id.startsWith("@") && !id.startsWith("-")) {
+    id = "@" + id;
+  }
   try {
-    await bot.sendMessage(String(chatId), text, {
+    await bot.sendMessage(id, text, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
       reply_markup: inlineRows.length ? { inline_keyboard: inlineRows } : undefined,
     });
-    console.log(`✉️  Sent to ${chatId}: ${text.substring(0, 60)}…`);
+    console.log(`✉️  Sent to ${id}: ${text.substring(0, 60)}…`);
   } catch (e) {
-    console.error(`⚠️  send failed to ${chatId}:`, e.message);
+    // "chat not found" usually means user hasn't started the bot yet — not a code bug
+    if (e.message?.includes("chat not found") || e.message?.includes("user not found")) {
+      console.warn(`⚠️  Cannot reach ${id} — user hasn't started the bot yet (store their numeric ID after first /start)`);
+    } else {
+      console.error(`⚠️  send failed to ${id}:`, e.message);
+    }
   }
 };
 
@@ -782,7 +793,17 @@ const pushToGcal = async (booking, masterTgId, masterName, isPending = false) =>
       .eq("id", booking.id);
     console.log(`✅ GCal event created (${isPending?"pending":"confirmed"}): ${created.id} for booking ${booking.id}`);
   } catch (e) {
-    console.error("GCal insert failed:", e.message);
+    if (e.message?.includes("Insufficient Permission")) {
+      console.error(`❌ GCal permission denied for master ${masterTgId}. Their token was issued without calendar.events scope. They must disconnect and reconnect Google Calendar in the app.`);
+      // Notify master via Telegram so they know to reconnect
+      send(masterTgId,
+        `⚠️ <b>Google Календарь: нет доступа</b>\n\n` +
+        `Ваш токен устарел и больше не имеет нужных прав.\n\n` +
+        `Пожалуйста, зайдите в <b>Профиль → Google Календарь</b> и переподключите его. Это займёт 30 секунд.`
+      );
+    } else {
+      console.error("GCal insert failed:", e.message);
+    }
   }
 };
 
