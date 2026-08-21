@@ -525,7 +525,7 @@ bot.on("callback_query", async (query) => {
     const authUrl = getGcalAuthUrl(masterTgId);
     await send(chatId,
       `📅 <b>Подключение Google Календаря</b>\n\n` +
-      `Нажмите кнопку ниже для авторизации. После этого все новые подтверждённые записи будут автоматически появляться в вашем Google Календаре <b>«Uspot Bookings»</b>.`,
+      `Нажмите кнопку ниже для авторизации. После этого все новые подтверждённые записи будут автоматически появляться в вашем <b>основном Google Календаре</b>.`,
       [[{ text: "🔗 Авторизоваться в Google", url: authUrl }]]
     );
     return;
@@ -709,7 +709,10 @@ const getGcalAuthUrl = (masterTgId) => {
   return oauth2.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
-    scope: ["https://www.googleapis.com/auth/calendar"],   // full access: events + calendarList + calendars.insert
+    // Narrowest scope that covers what we actually do: create/update/delete
+    // events on the master's primary calendar. Must stay in sync with the
+    // scope declared on the OAuth consent screen in Cloud Console.
+    scope: ["https://www.googleapis.com/auth/calendar.events"],
     state: String(masterTgId),
   });
 };
@@ -746,17 +749,9 @@ const getMasterOAuth2 = async (masterTgId) => {
   return oauth2;
 };
 
-// Ensure "Uspot Bookings" calendar exists, return its ID
-const ensureUspotCalendar = async (auth) => {
-  const calendar = google.calendar({ version: "v3", auth });
-  const { data: list } = await calendar.calendarList.list();
-  const existing = (list.items || []).find(c => c.summary === "Uspot Bookings");
-  if (existing) return existing.id;
-  const { data: created } = await calendar.calendars.insert({
-    requestBody: { summary: "Uspot Bookings", timeZone: "Europe/Minsk" },
-  });
-  return created.id;
-};
+// Bookings go straight to the master's primary calendar: creating a dedicated
+// "Uspot Bookings" calendar would need the full `calendar` scope.
+const ensureUspotCalendar = async (_auth) => "primary";
 
 // Push a booking to master's Google Calendar
 // isPending=true → grey "tentative" event; false → green "confirmed"
@@ -1068,13 +1063,13 @@ app.get("/gcal/callback", async (req, res) => {
     // Notify master in Telegram that connection succeeded
     await send(masterTgId,
       `✅ <b>Google Календарь подключён!</b>\n\n` +
-      `Все подтверждённые записи будут автоматически появляться в вашем Google Календаре <b>«Uspot Bookings»</b>.\n\n` +
+      `Все подтверждённые записи будут автоматически появляться в вашем <b>основном Google Календаре</b>.\n\n` +
       `Если запись отменяется — событие удаляется из календаря автоматически. 💜`
     );
 
     res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:40px">
       <h2>✅ Google Календарь подключён!</h2>
-      <p>Вернитесь в Telegram — записи будут автоматически появляться в вашем календаре <b>«Uspot Bookings»</b>.</p>
+      <p>Вернитесь в Telegram — записи будут автоматически появляться в вашем <b>основном Google Календаре</b>.</p>
       <script>setTimeout(()=>window.close(),3000)</script>
     </body></html>`);
   } catch (e) {
@@ -1122,17 +1117,16 @@ app.post("/gcal/webhook", async (req, res) => {
     if (!auth) return;
 
     const calendar = google.calendar({ version: "v3", auth });
-    // Find the calendar for this master
-    const { data: list } = await calendar.calendarList.list();
-    const cal = (list.items || []).find(c => c.summary === "Uspot Bookings");
-    if (!cal) return;
 
-    // Get recently updated events
+    // Get recently updated events from the primary calendar (where we write them).
+    // Looking the calendar up via calendarList would require the full `calendar`
+    // scope, which we deliberately no longer request.
     const timeMin = new Date(Date.now() - 5 * 60 * 1000).toISOString(); // last 5 min
     const { data: events } = await calendar.events.list({
-      calendarId: cal.id,
+      calendarId: "primary",
       updatedMin: timeMin,
       singleEvents: true,
+      showDeleted: true,
     });
 
     for (const event of events?.items || []) {
