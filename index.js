@@ -169,10 +169,42 @@ bot.onText(/\/test_notify/, async (msg) => {
 });
 
 // ════════════════════════════════════════════════════════════
+// REALTIME RESILIENCE
+// Supabase channels die on "heartbeat timeout" / socket close and do NOT
+// recover on their own. When that happened silently on 2026-08-25, every new
+// booking stopped notifying the master AND stopped syncing to Google Calendar
+// until the process was restarted. These helpers resubscribe on failure and a
+// watchdog re-checks state periodically (a dead socket does not always fire
+// the status callback).
+// ════════════════════════════════════════════════════════════
+const rtRetries = {};
+// Bookings this process has already announced to the master. Used by the
+// reconciler below so a repair sweep never double-alerts.
+const handledBookings = new Set();
+const BOOT_AT = new Date().toISOString();
+const rtStatus = (label, resubscribe) => (status, err) => {
+  if (status === "SUBSCRIBED") {
+    rtRetries[label] = 0;
+    console.log(`✅ Realtime: listening for ${label}`);
+    return;
+  }
+  console.error(`❌ Realtime ${label}: ${status}`, err?.message || "");
+  if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+    const n = rtRetries[label] = (rtRetries[label] || 0) + 1;
+    const delay = Math.min(5000 * n, 60000);
+    console.log(`🔁 Realtime ${label}: reconnecting in ${delay / 1000}s (attempt ${n})`);
+    setTimeout(resubscribe, delay);
+  }
+};
+
+// ════════════════════════════════════════════════════════════
 // SUPABASE REALTIME — New booking (INSERT)
 // Bug #1: verify realtime is active, log on subscribe
 // ════════════════════════════════════════════════════════════
-db.channel("uspot-new-bookings")
+let chNewBookings = null;
+const subNewBookings = () => {
+  if (chNewBookings) { try { db.removeChannel(chNewBookings); } catch (e) {} }
+  chNewBookings = db.channel("uspot-new-bookings")
   .on("postgres_changes", {
     event: "INSERT",
     schema: "public",
@@ -180,6 +212,7 @@ db.channel("uspot-new-bookings")
   }, async (payload) => {
     const b = payload.new;
     if (b.client_name?.startsWith("🔒")) return; // skip manual blocks
+    handledBookings.add(b.id);
     console.log("📥 New booking:", b.id, "status:", b.status, "master_id:", b.master_id, "client_tg:", b.client_telegram_id);
 
     const date  = dateRu(b.booked_date);
@@ -269,18 +302,17 @@ db.channel("uspot-new-bookings")
       );
     }
   })
-  .subscribe((status, err) => {
-    if (status === "SUBSCRIBED") {
-      console.log("✅ Realtime: listening for new bookings");
-    } else {
-      console.error("❌ Realtime new-bookings subscribe error:", status, err?.message);
-    }
-  });
+  .subscribe(rtStatus("new bookings", subNewBookings));
+};
+subNewBookings();
 
 // ════════════════════════════════════════════════════════════
 // SUPABASE REALTIME — Booking updates (UPDATE)
 // ════════════════════════════════════════════════════════════
-db.channel("uspot-booking-updates")
+let chBookingUpdates = null;
+const subBookingUpdates = () => {
+  if (chBookingUpdates) { try { db.removeChannel(chBookingUpdates); } catch (e) {} }
+  chBookingUpdates = db.channel("uspot-booking-updates")
   .on("postgres_changes", {
     event: "UPDATE",
     schema: "public",
@@ -393,13 +425,25 @@ db.channel("uspot-booking-updates")
       // Review request is handled by the hourly cron (3-4h window after booking)
     }
   })
-  .subscribe((status, err) => {
-    if (status === "SUBSCRIBED") {
-      console.log("✅ Realtime: listening for booking updates");
-    } else {
-      console.error("❌ Realtime booking-updates subscribe error:", status, err?.message);
+  .subscribe(rtStatus("booking updates", subBookingUpdates));
+};
+subBookingUpdates();
+
+// Watchdog: a silently dropped socket does not always fire the status callback,
+// so re-check both channels every 2 min and force a resubscribe if not joined.
+setInterval(() => {
+  const checks = [
+    ["new bookings",    chNewBookings,     subNewBookings],
+    ["booking updates", chBookingUpdates,  subBookingUpdates],
+  ];
+  for (const [label, ch, resub] of checks) {
+    const state = ch?.state;
+    if (state !== "joined") {
+      console.warn(`🩺 Realtime watchdog: ${label} state="${state}" — resubscribing`);
+      resub();
     }
-  });
+  }
+}, 2 * 60 * 1000);
 
 // ════════════════════════════════════════════════════════════
 // CALLBACK QUERIES — master confirm/suggest, client cancel
@@ -873,6 +917,127 @@ const deleteFromGcal = async (bookingId) => {
     console.warn("GCal delete failed:", e.message);
   }
 };
+
+// ════════════════════════════════════════════════════════════
+// RECONCILIATION — safety net for events Realtime never delivered
+// Realtime is the ONLY trigger for master alerts and calendar sync, so a dead
+// channel loses bookings silently (incident 2026-08-25). Every 10 min we sweep
+// recent bookings and repair what was missed.
+//   • Calendar: `gcal_event_id` in the DB is the marker, so this is idempotent
+//     and keeps working across restarts.
+//   • Master alert: the schema has no "notified" column, so it is guarded by an
+//     in-memory set seeded at boot with everything created BEFORE this process
+//     started — those were the previous process's responsibility and are never
+//     re-announced. Anything created after boot is fair game for repair.
+// ════════════════════════════════════════════════════════════
+const RECONCILE_WINDOW_MIN = 90;
+const RECONCILE_EVERY_MS   = 10 * 60 * 1000;
+const MAX_GCAL_ATTEMPTS    = 3;   // stop retrying a booking that keeps failing
+const gcalAttempts = {};
+let reconcileReady   = false;
+let reconcileRunning = false;
+
+const seedHandledBookings = async (cutoffIso) => {
+  try {
+    const since = new Date(Date.now() - RECONCILE_WINDOW_MIN * 60000).toISOString();
+    const { data } = await db.from("bookings")
+      .select("id").gte("created_at", since).lt("created_at", cutoffIso);
+    (data || []).forEach((r) => handledBookings.add(r.id));
+    console.log(`🩹 Reconcile: seeded ${(data || []).length} pre-existing booking(s) — they will not be re-announced`);
+  } catch (e) {
+    console.error("🩹 Reconcile: seed failed:", e.message);
+  } finally {
+    reconcileReady = true;
+  }
+};
+
+const reconcileBookings = async () => {
+  if (reconcileRunning || !reconcileReady) return;
+  reconcileRunning = true;
+  try {
+    const since = new Date(Date.now() - RECONCILE_WINDOW_MIN * 60000).toISOString();
+    const { data: rows, error } = await db.from("bookings")
+      .select("*").gte("created_at", since).in("status", ["pending", "confirmed"]);
+    if (error) { console.error("🩹 Reconcile: query failed:", error.message); return; }
+    if (!rows?.length) return;
+
+    const { data: toks } = await db.from("master_gcal_tokens").select("master_telegram_id");
+    const connected = new Set((toks || []).map((t) => String(t.master_telegram_id)));
+
+    const masterCache = {};
+    let repaired = 0;
+
+    for (const b of rows) {
+      if (b.client_name?.startsWith("🔒")) continue;   // manual slot blocks, not real bookings
+      if (!b.master_id) continue;
+
+      if (!masterCache[b.master_id]) {
+        const { data: m } = await db.from("masters")
+          .select("name, telegram_user_id").eq("id", b.master_id).single();
+        masterCache[b.master_id] = m || {};
+      }
+      const m  = masterCache[b.master_id];
+      const tg = m.telegram_user_id ? String(m.telegram_user_id) : null;
+
+      // (a) Calendar catch-up
+      if (!b.gcal_event_id && tg && connected.has(tg)) {
+        const tries = gcalAttempts[b.id] || 0;
+        if (tries < MAX_GCAL_ATTEMPTS) {
+          gcalAttempts[b.id] = tries + 1;
+          console.warn(`🩹 Reconcile: booking ${b.id} has no calendar event — pushing (attempt ${tries + 1})`);
+          try {
+            await pushToGcal(b, tg, m.name || "Мастер", b.status === "pending");
+            repaired++;
+          } catch (e) {
+            console.error(`🩹 Reconcile: GCal push failed for ${b.id}:`, e.message);
+          }
+        }
+      }
+
+      // (b) Master alert catch-up — only bookings this process never saw
+      if (!handledBookings.has(b.id)) {
+        handledBookings.add(b.id);
+        if (tg && b.status === "pending") {
+          console.warn(`🩹 Reconcile: booking ${b.id} was never announced — alerting master`);
+          await sendWithKeyboard(tg,
+            `📅 <b>Новая запись!</b>\n\n` +
+            `👤 ${b.client_name || "Клиент"}\n` +
+            `💇 ${b.service_name || "Услуга"}\n` +
+            `📆 ${dateRu(b.booked_date)}, ${timeShort(b.booked_time)}\n` +
+            `💳 ${b.total_price ? b.total_price + " BYN" : "—"}\n\n` +
+            `Подтвердите или предложите другое время:`,
+            [[
+              { text: "✅ Подтвердить",  callback_data: `confirm_${b.id}` },
+              { text: "⏰ Другое время", callback_data: `suggest_${b.id}` },
+            ]]
+          );
+          repaired++;
+        }
+      }
+    }
+    if (repaired) console.log(`🩹 Reconcile: repaired ${repaired} item(s)`);
+  } catch (e) {
+    console.error("🩹 Reconcile: unexpected error:", e.message);
+  } finally {
+    reconcileRunning = false;
+  }
+};
+
+// Boot: seed first (so we never announce what the previous process owned), then sweep.
+setTimeout(async () => {
+  await seedHandledBookings(BOOT_AT);
+  reconcileBookings();
+}, 30 * 1000);
+setInterval(reconcileBookings, RECONCILE_EVERY_MS);
+
+// Keep in-memory guards bounded. Re-seed on clear, otherwise the next sweep
+// would treat everything in the window as unannounced and spam the masters.
+setInterval(async () => {
+  handledBookings.clear();
+  for (const k of Object.keys(gcalAttempts)) delete gcalAttempts[k];
+  await seedHandledBookings(new Date().toISOString());
+  console.log("🧹 Reconcile caches cleared and re-seeded");
+}, 24 * 60 * 60 * 1000);
 
 // ════════════════════════════════════════════════════════════
 // EXPRESS HTTP SERVER
