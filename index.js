@@ -320,6 +320,56 @@ const subBookingUpdates = () => {
   }, async (payload) => {
     const b   = payload.new;
     const old = payload.old;
+
+    // ── Салон переназначил запись на другого мастера ──────────────
+    // Отдельная ветка: статус при этом не меняется, поэтому проверку
+    // ниже она бы не прошла. Клиенту сообщаем честно, кто его примет.
+    if (b.master_id && old.master_id && b.master_id !== old.master_id) {
+      console.log(`🔀 Booking ${b.id}: мастер ${old.master_id} → ${b.master_id}`);
+      try {
+        const [{ data: newM }, { data: oldM }] = await Promise.all([
+          db.from("masters").select("name, telegram_user_id, salon_id").eq("id", b.master_id).single(),
+          db.from("masters").select("name, telegram_user_id").eq("id", old.master_id).single(),
+        ]);
+        const d = dateRu(b.booked_date), t = timeShort(b.booked_time);
+
+        if (b.client_telegram_id) {
+          await sendWithKeyboard(b.client_telegram_id,
+            `🔀 <b>Вашу запись передали другому мастеру</b>\n\n` +
+            `Было: ${oldM?.name || "мастер"}\n` +
+            `Стало: <b>${newM?.name || "мастер"}</b>\n\n` +
+            `💇 ${b.service_name || "Услуга"}\n` +
+            `📆 ${d}, ${t} — время прежнее\n` +
+            `💳 ${b.total_price ? b.total_price + " BYN" : "—"}\n\n` +
+            `Если так не подходит — выберите другое время, мы всё сохраним.`,
+            [[
+              { text: "✅ Подходит",           callback_data: `keep_${b.id}` },
+              { text: "📅 Другое время",       callback_data: `reschedule_${b.id}` },
+            ]]
+          );
+        }
+        if (newM?.telegram_user_id) {
+          await send(newM.telegram_user_id,
+            `📅 <b>Вам передали запись</b>\n\n` +
+            `👤 ${b.client_name || "Клиент"}\n💇 ${b.service_name || "Услуга"}\n📆 ${d}, ${t}`);
+        }
+        if (oldM?.telegram_user_id) {
+          await send(oldM.telegram_user_id,
+            `↪️ <b>Запись передана другому мастеру</b>\n\n` +
+            `👤 ${b.client_name || "Клиент"}\n📆 ${d}, ${t}\n\nОна больше не в вашем расписании.`);
+        }
+        // Календарь: убираем у прежнего мастера, заводим у нового
+        await deleteFromGcal(b.id).catch(() => {});
+        await db.from("bookings").update({ gcal_event_id: null, gcal_calendar_id: null }).eq("id", b.id);
+        if (newM?.telegram_user_id) {
+          pushToGcal({ ...b, gcal_event_id: null }, newM.telegram_user_id, newM.name || "Мастер",
+                     b.status === "pending").catch(e => console.error("GCal reassign:", e.message));
+        }
+      } catch (e) {
+        console.error("Ошибка переназначения:", e.message);
+      }
+    }
+
     if (b.status === old.status) return;
     console.log(`🔄 Booking ${b.id}: ${old.status} → ${b.status}`);
 
@@ -500,6 +550,14 @@ bot.on("callback_query", async (query) => {
   }
 
   // Client: Reschedule (from bot button)
+  if (data.startsWith("keep_")) {
+    const id = data.replace("keep_", "");
+    await bot.answerCallbackQuery(query.id, { text: "Отлично, ждём вас!" });
+    await send(chatId, `✅ Спасибо! Запись сохранена, мастер вас ждёт.`);
+    console.log(`👍 Клиент подтвердил замену мастера, booking ${id}`);
+    return;
+  }
+
   if (data.startsWith("reschedule_")) {
     const bookingId = data.slice(11);
     const { data: bk } = await db.from("bookings").select("master_id").eq("id", bookingId).single();
@@ -1260,65 +1318,123 @@ app.post("/gcal/sync", async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════
+// ОБРАТНАЯ СИНХРОНИЗАЦИЯ: календарь → база
+// ════════════════════════════════════════════════════════════
+// Мастер удаляет событие в Google Календаре — запись должна отмениться,
+// а клиент получить уведомление.
+//
+// Мгновенный push (events.watch) требует, чтобы домен приёмника был
+// подтверждён в проекте Google. Бот живёт на *.up.railway.app — чужой
+// домен, подтвердить нельзя. Поэтому опрашиваем сами: раз в 10 минут
+// смотрим изменения за последние 15 (окна перекрываются, ничего не
+// теряется), а повторная обработка безвредна — уже отменённые пропускаем.
+//
+// Когда появится свой поддомен (api.uspot.by → Railway), push можно
+// включить поверх: обработчик /gcal/webhook уже написан и зовёт эту же
+// функцию, опрос останется страховкой.
+
+const GCAL_PULL_EVERY_MS  = 10 * 60 * 1000;
+const GCAL_PULL_WINDOW_MS = 15 * 60 * 1000;
+
+// Разбирает изменения календаря одного мастера начиная с sinceIso.
+// Возвращает число отменённых записей.
+const syncFromGcal = async (masterTgId, sinceIso) => {
+  const auth = await getMasterOAuth2(masterTgId);
+  if (!auth) return 0;
+  const calendar = google.calendar({ version: "v3", auth });
+
+  let events;
+  try {
+    ({ data: events } = await calendar.events.list({
+      calendarId: "primary",
+      updatedMin: sinceIso,
+      singleEvents: true,
+      showDeleted: true,
+      maxResults: 250,
+    }));
+  } catch (e) {
+    console.error(`GCal pull ${masterTgId}: ${e.message}`);
+    return 0;
+  }
+
+  let cancelled = 0;
+  const todayIso = new Date().toISOString().slice(0, 10);
+
+  for (const event of events?.items || []) {
+    const bookingId = event.extendedProperties?.private?.uspot_booking_id;
+    if (!bookingId) continue;
+    if (event.status !== "cancelled") continue;
+
+    const { data: bk } = await db.from("bookings").select("*").eq("id", bookingId).single();
+    if (!bk) continue;
+    if (bk.status === "cancelled" || bk.status === "declined") continue;
+    // Прошедший визит уже состоялся — удаление события в календаре
+    // не должно задним числом отменять запись и слать клиенту извинения.
+    if (bk.booked_date < todayIso) continue;
+
+    const { error } = await db.from("bookings")
+      .update({ status: "cancelled", cancel_reason: "master:gcal_delete" })
+      .eq("id", bookingId);
+    if (error) continue;
+
+    if (bk.client_telegram_id) {
+      await sendWithKeyboard(bk.client_telegram_id,
+        `❌ <b>Запись отменена мастером</b>\n\n` +
+        `💇 ${bk.service_name || "Услуга"}\n` +
+        `📆 ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n\n` +
+        `Выберите другую дату — записаться снова очень просто! 💜`,
+        [[{ text: "📅 Записаться снова", web_app: { url: `${MINI_APP_URL}?startapp=m${bk.master_id}` } }]]
+      );
+    }
+    cancelled++;
+    console.log(`✅ Booking ${bookingId} cancelled — event deleted in GCal (${masterTgId})`);
+  }
+  return cancelled;
+};
+
+let gcalPullRunning = false;
+const gcalPullSweep = async () => {
+  if (!google || gcalPullRunning) return;
+  gcalPullRunning = true;
+  try {
+    const { data: rows } = await db.from("master_gcal_tokens").select("master_telegram_id");
+    if (!rows?.length) return;
+    const since = new Date(Date.now() - GCAL_PULL_WINDOW_MS).toISOString();
+    let total = 0;
+    for (const r of rows) {
+      total += await syncFromGcal(String(r.master_telegram_id), since);
+    }
+    if (total) console.log(`📅 GCal pull: отменено записей — ${total}`);
+  } catch (e) {
+    console.error("GCal pull sweep error:", e.message);
+  } finally {
+    gcalPullRunning = false;
+  }
+};
+
+setTimeout(gcalPullSweep, 45 * 1000);
+setInterval(gcalPullSweep, GCAL_PULL_EVERY_MS);
+
 // POST /gcal/webhook — Google Calendar push notifications (when master edits/cancels)
 app.post("/gcal/webhook", async (req, res) => {
-  // Google sends a POST to this URL when a calendar event changes
-  const channelId    = req.headers["x-goog-channel-id"];
+  // Google дёргает этот адрес при изменении события. Разбор — той же
+  // функцией, что и опрос, чтобы правила отмены не разъезжались.
+  const channelId     = req.headers["x-goog-channel-id"];
   const resourceState = req.headers["x-goog-resource-state"];
-  res.sendStatus(200); // Always respond 200 immediately
+  res.sendStatus(200); // отвечаем сразу, Google не ждёт обработки
 
   if (resourceState !== "exists" && resourceState !== "not_exists") return;
   if (!channelId) return;
 
-  // channelId format: "uspot-{masterTgId}-{calId}"
+  // channelId вида "uspot-{masterTgId}-{calId}"
   const parts = channelId.split("-");
   if (parts.length < 3 || parts[0] !== "uspot") return;
   const masterTgId = parts[1];
 
-  console.log(`📅 GCal webhook: master ${masterTgId}, state: ${resourceState}`);
-
+  console.log(`📅 GCal webhook: мастер ${masterTgId}, состояние ${resourceState}`);
   try {
-    const auth = await getMasterOAuth2(masterTgId);
-    if (!auth) return;
-
-    const calendar = google.calendar({ version: "v3", auth });
-
-    // Get recently updated events from the primary calendar (where we write them).
-    // Looking the calendar up via calendarList would require the full `calendar`
-    // scope, which we deliberately no longer request.
-    const timeMin = new Date(Date.now() - 5 * 60 * 1000).toISOString(); // last 5 min
-    const { data: events } = await calendar.events.list({
-      calendarId: "primary",
-      updatedMin: timeMin,
-      singleEvents: true,
-      showDeleted: true,
-    });
-
-    for (const event of events?.items || []) {
-      const bookingId = event.extendedProperties?.private?.uspot_booking_id;
-      if (!bookingId) continue;
-
-      if (event.status === "cancelled") {
-        // Event deleted in Google Calendar → cancel booking + notify client
-        const { data: bk } = await db.from("bookings").select("*").eq("id", bookingId).single();
-        if (!bk || bk.status === "cancelled") continue;
-
-        await db.from("bookings")
-          .update({ status: "cancelled", cancel_reason: "master:gcal_delete" })
-          .eq("id", bookingId);
-
-        if (bk.client_telegram_id) {
-          await sendWithKeyboard(bk.client_telegram_id,
-            `❌ <b>Запись отменена мастером</b>\n\n` +
-            `💇 ${bk.service_name || "Услуга"}\n` +
-            `📆 ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n\n` +
-            `Выберите другую дату — записаться снова очень просто! 💜`,
-            [[{ text: "📅 Записаться снова", web_app: { url: `${MINI_APP_URL}?startapp=m${bk.master_id}` } }]]
-          );
-        }
-        console.log(`✅ Booking ${bookingId} cancelled via GCal webhook`);
-      }
-    }
+    await syncFromGcal(masterTgId, new Date(Date.now() - 5 * 60 * 1000).toISOString());
   } catch (e) {
     console.error("GCal webhook processing error:", e.message);
   }
