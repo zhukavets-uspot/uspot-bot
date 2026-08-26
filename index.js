@@ -1381,9 +1381,10 @@ const applyGcalMove = async (masterTgId, event, calendar, todayIso) => {
   // Рабочие часы мастера в этот день недели (0 = понедельник)
   const jsDay = new Date(st.date + "T12:00:00").getDay();
   const dow = jsDay === 0 ? 6 : jsDay - 1;
-  const { data: schedRow } = await db.from("master_schedule")
+  const { data: schedRows } = await db.from("master_schedule")
     .select("is_working, start_time, end_time")
-    .eq("master_id", bk.master_id).eq("day_of_week", dow).maybeSingle();
+    .eq("master_id", bk.master_id).eq("day_of_week", dow).limit(1);
+  const schedRow = (schedRows || [])[0] || null;
   const works = schedRow?.is_working !== false;
   const toMin = (t) => { const [h, m] = String(t || "0:0").split(":").map(Number); return h * 60 + (m || 0); };
   const dayFrom = toMin(schedRow?.start_time || "09:00");
