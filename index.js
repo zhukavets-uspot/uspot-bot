@@ -1335,7 +1335,136 @@ app.post("/gcal/sync", async (req, res) => {
 // функцию, опрос останется страховкой.
 
 const GCAL_PULL_EVERY_MS  = 10 * 60 * 1000;
-const GCAL_PULL_WINDOW_MS = 15 * 60 * 1000;
+// Окно шире интервала с большим запасом: перекрытие ничего не стоит
+// (повторная обработка — пустая операция), зато переживает перезапуск бота.
+const GCAL_PULL_WINDOW_MS = 30 * 60 * 1000;
+
+// Время события в минском календаре: "YYYY-MM-DD" + минуты от полуночи.
+// Минск круглый год +03:00, поэтому пересчёт однозначный.
+const minskParts = (dateTimeStr) => {
+  const d = new Date(dateTimeStr);
+  if (isNaN(d)) return null;
+  // sv-SE даёт "YYYY-MM-DD HH:MM:SS" — удобный для разбора формат
+  const s = d.toLocaleString("sv-SE", { timeZone: "Europe/Minsk" });
+  const [date, time] = s.split(" ");
+  const [h, m] = time.split(":").map(Number);
+  return { date, min: h * 60 + m, hhmm: time.slice(0, 5) };
+};
+const minToHHMM = (m) =>
+  `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+
+// Мастер подвинул событие в календаре. Возможны три исхода:
+//  1) новое время свободно — принимаем, двигаем запись, уведомляем клиента;
+//  2) занято — ставим в ближайший свободный блок и правим событие обратно,
+//     чтобы календарь и база сошлись, обоим объясняем;
+//  3) в этот день ничего не помещается — возвращаем событие на место.
+const applyGcalMove = async (masterTgId, event, calendar, todayIso) => {
+  const bookingId = event.extendedProperties?.private?.uspot_booking_id;
+  const st = minskParts(event.start?.dateTime);
+  const en = minskParts(event.end?.dateTime);
+  if (!st || !en) return;
+
+  const { data: bk } = await db.from("bookings").select("*").eq("id", bookingId).single();
+  if (!bk) return;
+  if (bk.status === "cancelled" || bk.status === "declined") return;
+  if (bk.booked_date < todayIso) return;                 // прошедший визит не трогаем
+
+  const curMin = (() => { const [h, m] = String(bk.booked_time || "0:0").split(":").map(Number);
+                          return h * 60 + (m || 0); })();
+  const curDur = +bk.duration_min || 60;
+  let newDur = en.min - st.min;
+  if (en.date !== st.date || newDur <= 0) newDur = curDur;   // через полночь — не поддерживаем
+
+  // Ничего не изменилось (в том числе после нашей же правки) — выходим
+  if (st.date === bk.booked_date && st.min === curMin && newDur === curDur) return;
+
+  // Рабочие часы мастера в этот день недели (0 = понедельник)
+  const jsDay = new Date(st.date + "T12:00:00").getDay();
+  const dow = jsDay === 0 ? 6 : jsDay - 1;
+  const { data: schedRow } = await db.from("master_schedule")
+    .select("is_working, start_time, end_time")
+    .eq("master_id", bk.master_id).eq("day_of_week", dow).maybeSingle();
+  const works = schedRow?.is_working !== false;
+  const toMin = (t) => { const [h, m] = String(t || "0:0").split(":").map(Number); return h * 60 + (m || 0); };
+  const dayFrom = toMin(schedRow?.start_time || "09:00");
+  const dayTo   = toMin(schedRow?.end_time   || "18:00");
+
+  // Чужие записи этого мастера в этот день
+  const { data: others } = await db.from("bookings")
+    .select("id, booked_time, duration_min")
+    .eq("master_id", bk.master_id).eq("booked_date", st.date)
+    .neq("id", bookingId)
+    .not("status", "in", "(cancelled,declined)");
+  const busy = (others || []).map(o => ({ s: toMin(o.booked_time), e: toMin(o.booked_time) + (+o.duration_min || 60) }));
+  const fits = (start) => start >= dayFrom && start + newDur <= dayTo &&
+                          !busy.some(b => b.s < start + newDur && b.e > start);
+
+  const revert = async (why) => {
+    const s0 = `${bk.booked_date}T${String(bk.booked_time || "09:00:00").slice(0, 8)}`;
+    const e0 = new Date(new Date(s0 + "+03:00").getTime() + curDur * 60000)
+      .toLocaleString("sv-SE", { timeZone: "Europe/Minsk" }).replace(" ", "T");
+    await calendar.events.patch({
+      calendarId: bk.gcal_calendar_id || "primary", eventId: event.id,
+      requestBody: { start: { dateTime: `${s0}+03:00`, timeZone: "Europe/Minsk" },
+                     end:   { dateTime: `${e0}+03:00`, timeZone: "Europe/Minsk" } },
+    });
+    await send(masterTgId,
+      `↩️ <b>Перенос не применён</b>\n\n` +
+      `${bk.service_name || "Услуга"} — ${bk.client_name || "Клиент"}\n` +
+      `Запись осталась на ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}.\n\n` +
+      `${why}\n\nПеренесите через приложение — там видно свободные окна.`);
+    console.log(`↩️ GCal move reverted for booking ${bookingId}: ${why}`);
+  };
+
+  if (!works) { await revert("В этот день вы не работаете."); return; }
+
+  // Куда в итоге ставим
+  let target = st.min, shifted = false;
+  if (!fits(target)) {
+    // Ищем ближайшее свободное окно: шаг 15 минут, сначала позже, потом раньше.
+    // «Позже» первым — так запись встаёт сразу за занятым блоком.
+    let found = null;
+    for (let d = 15; d <= 12 * 60 && found === null; d += 15) {
+      if (fits(st.min + d)) found = st.min + d;
+      else if (fits(st.min - d)) found = st.min - d;
+    }
+    if (found === null) { await revert("В этот день нет свободного окна нужной длины."); return; }
+    target = found; shifted = true;
+  }
+
+  const newTime = minToHHMM(target);
+  const { error } = await db.from("bookings")
+    .update({ booked_date: st.date, booked_time: newTime + ":00", duration_min: newDur })
+    .eq("id", bookingId);
+  if (error) { console.error("GCal move: не удалось обновить запись:", error.message); return; }
+
+  if (shifted) {
+    const s1 = `${st.date}T${newTime}:00`;
+    const e1 = minToHHMM(target + newDur);
+    await calendar.events.patch({
+      calendarId: bk.gcal_calendar_id || "primary", eventId: event.id,
+      requestBody: { start: { dateTime: `${s1}+03:00`, timeZone: "Europe/Minsk" },
+                     end:   { dateTime: `${st.date}T${e1}:00+03:00`, timeZone: "Europe/Minsk" } },
+    });
+    await send(masterTgId,
+      `⚠️ <b>Время занято — записал рядом</b>\n\n` +
+      `${bk.service_name || "Услуга"} — ${bk.client_name || "Клиент"}\n` +
+      `Вы поставили на ${st.hhmm}, там уже есть запись.\n` +
+      `Перенёс на <b>${newTime}</b> — ближайшее свободное окно. Событие в календаре поправлено.`);
+  }
+
+  if (bk.client_telegram_id) {
+    await sendWithKeyboard(bk.client_telegram_id,
+      `📅 <b>Мастер перенёс запись</b>\n\n` +
+      `💇 ${bk.service_name || "Услуга"}\n` +
+      `Было: ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n` +
+      `Стало: <b>${dateRu(st.date)}, ${newTime}</b>\n\n` +
+      `Подходит новое время?`,
+      [[{ text: "✅ Подходит", callback_data: `keep_${bookingId}` },
+        { text: "📅 Другое время", callback_data: `reschedule_${bookingId}` }]]);
+  }
+  console.log(`📅 Booking ${bookingId} перенесён из календаря: ${bk.booked_date} ${timeShort(bk.booked_time)} → ${st.date} ${newTime}${shifted ? " (сдвинут)" : ""}`);
+};
 
 // Разбирает изменения календаря одного мастера начиная с sinceIso.
 // Возвращает число отменённых записей.
@@ -1364,6 +1493,14 @@ const syncFromGcal = async (masterTgId, sinceIso) => {
   for (const event of events?.items || []) {
     const bookingId = event.extendedProperties?.private?.uspot_booking_id;
     if (!bookingId) continue;
+
+    // ── Событие перенесли или растянули ──────────────────────────
+    if (event.status !== "cancelled" && event.start?.dateTime) {
+      try { await applyGcalMove(masterTgId, event, calendar, todayIso); }
+      catch (e) { console.error(`GCal move ${bookingId}: ${e.message}`); }
+      continue;
+    }
+
     if (event.status !== "cancelled") continue;
 
     const { data: bk } = await db.from("bookings").select("*").eq("id", bookingId).single();
