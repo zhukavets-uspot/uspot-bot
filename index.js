@@ -1199,6 +1199,121 @@ app.post("/notify_reschedule", async (req, res) => {
   res.json({ ok: true });
 });
 
+// ════════════════════════════════════════════════════════════
+// АУТЕНТИФИКАЦИЯ КЛИЕНТА
+// ════════════════════════════════════════════════════════════
+// Раньше личность приходила из initDataUnsafe и никем не проверялась,
+// а вне Telegram подставлялась общая заглушка — все посетители сайта
+// становились одним человеком. Теперь личность подтверждает Telegram,
+// а подпись проверяем здесь, токеном бота.
+//
+// Два источника, одна проверка:
+//   • Mini App внутри Telegram — initData (ключ HMAC("WebAppData", token));
+//   • Login Widget на сайте    — payload виджета (ключ SHA256(token)).
+//
+// В ответ отдаём сессию: подписанную строку, которую фронт кладёт в
+// localStorage и присылает при записи. Подделать её без секрета нельзя.
+
+const crypto = require("crypto");
+const AUTH_TTL_SEC     = 60 * 60 * 24 * 30;      // сессия на 30 дней
+const AUTH_MAX_AGE_SEC = 60 * 60 * 24;           // подпись Telegram не старше суток
+const SESSION_SECRET   = crypto.createHash("sha256").update("uspot-session:" + (BOT_TOKEN || "")).digest();
+
+const checkString = (obj) => Object.keys(obj).filter(k => k !== "hash").sort()
+  .map(k => `${k}=${obj[k]}`).join("\n");
+
+// Login Widget: ключ — SHA256 от токена бота
+const verifyWidget = (data) => {
+  const secret = crypto.createHash("sha256").update(BOT_TOKEN).digest();
+  const calc = crypto.createHmac("sha256", secret).update(checkString(data)).digest("hex");
+  return calc === data.hash;
+};
+
+// Mini App: ключ — HMAC("WebAppData", токен бота)
+const verifyInitData = (initData) => {
+  const params = new URLSearchParams(initData);
+  const obj = {}; for (const [k, v] of params) obj[k] = v;
+  if (!obj.hash) return null;
+  const secret = crypto.createHmac("sha256", "WebAppData").update(BOT_TOKEN).digest();
+  const calc = crypto.createHmac("sha256", secret).update(checkString(obj)).digest("hex");
+  if (calc !== obj.hash) return null;
+  try { return { ...obj, user: JSON.parse(obj.user || "null") }; } catch { return null; }
+};
+
+const signSession = (tgId) => {
+  const body = Buffer.from(JSON.stringify({ id: String(tgId), exp: Math.floor(Date.now() / 1000) + AUTH_TTL_SEC })).toString("base64url");
+  const sig  = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
+  return `${body}.${sig}`;
+};
+
+// Возвращает telegram id или null. Используется и здесь, и позже при записи.
+const readSession = (token) => {
+  if (!token || typeof token !== "string" || !token.includes(".")) return null;
+  const [body, sig] = token.split(".");
+  const expect = crypto.createHmac("sha256", SESSION_SECRET).update(body).digest("base64url");
+  // сравнение постоянного времени — чтобы подпись нельзя было подобрать по таймингу
+  const a = Buffer.from(sig || "", "utf8"), b = Buffer.from(expect, "utf8");
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const p = JSON.parse(Buffer.from(body, "base64url").toString());
+    if (!p.id || !p.exp || p.exp < Math.floor(Date.now() / 1000)) return null;
+    return String(p.id);
+  } catch { return null; }
+};
+
+// POST /auth/telegram  { mode: "widget"|"initdata", payload }
+app.post("/auth/telegram", async (req, res) => {
+  try {
+    const { mode, payload } = req.body || {};
+    let user = null, authDate = 0;
+
+    if (mode === "initdata") {
+      const d = verifyInitData(payload);
+      if (!d?.user?.id) return res.status(401).json({ error: "bad_signature" });
+      user = d.user; authDate = +d.auth_date || 0;
+    } else if (mode === "widget") {
+      if (!payload?.hash || !verifyWidget(payload)) return res.status(401).json({ error: "bad_signature" });
+      user = payload; authDate = +payload.auth_date || 0;
+    } else {
+      return res.status(400).json({ error: "bad_mode" });
+    }
+
+    if (!authDate || (Date.now() / 1000 - authDate) > AUTH_MAX_AGE_SEC) {
+      return res.status(401).json({ error: "expired" });
+    }
+
+    const tgId = String(user.id);
+    const name = [user.first_name, user.last_name].filter(Boolean).join(" ") || "Клиент";
+    await db.from("clients").upsert(
+      { telegram_user_id: tgId, name, photo_url: user.photo_url || null },
+      { onConflict: "telegram_user_id" }
+    );
+    const { data: row } = await db.from("clients")
+      .select("name, phone, photo_url, bio").eq("telegram_user_id", tgId).single();
+
+    res.json({
+      ok: true,
+      token: signSession(tgId),
+      client: { telegram_user_id: tgId, name: row?.name || name,
+                phone: row?.phone || null, photo_url: row?.photo_url || user.photo_url || null,
+                bio: row?.bio || "" },
+    });
+  } catch (e) {
+    console.error("auth error:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /auth/me?token=... — фронт проверяет сохранённую сессию при загрузке
+app.get("/auth/me", async (req, res) => {
+  const tgId = readSession(req.query.token);
+  if (!tgId) return res.status(401).json({ error: "invalid_session" });
+  const { data: row } = await db.from("clients")
+    .select("name, phone, photo_url, bio").eq("telegram_user_id", tgId).single();
+  res.json({ ok: true, client: { telegram_user_id: tgId, name: row?.name || "Клиент",
+             phone: row?.phone || null, photo_url: row?.photo_url || null, bio: row?.bio || "" } });
+});
+
 // ── POST /notify_moderation ────────────────────────────────
 app.post("/notify_moderation", async (req, res) => {
   const { type, masterName, clientName, stars, preview } = req.body;
