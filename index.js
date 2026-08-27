@@ -1505,17 +1505,37 @@ const askPhoneOnce = async (tgId) => {
     .select("phone, phone_asked_at").eq("telegram_user_id", tgId).single();
   if (cl?.phone || cl?.phone_asked_at) { phoneAsked.add(tgId); return; }
   phoneAsked.add(tgId);
-  // Помечаем до отправки: если сообщение не уйдёт, повторно приставать не будем
-  try { await db.from("clients")
-    .update({ phone_asked_at: new Date().toISOString() }).eq("telegram_user_id", tgId); } catch (e) {}
+  const text =
+    "📞 <b>Оставите номер?</b>\n\n" +
+    "Он нужен только на случай, если мастеру придётся срочно с вами связаться — " +
+    "например, изменилось время. Никаких рассылок.";
+  const kb = { keyboard: [[{ text: "📱 Поделиться номером", request_contact: true }]],
+               resize_keyboard: true, one_time_keyboard: true };
+
+  // Отметку ставим ТОЛЬКО после удачной отправки: раньше помечали заранее,
+  // и когда сообщение не ушло, человек не получал просьбу уже никогда.
+  const mark = async () => { try { await db.from("clients")
+    .update({ phone_asked_at: new Date().toISOString() }).eq("telegram_user_id", tgId); } catch (e) {} };
+
   try {
-    await bot.sendMessage(tgId,
-      "📞 <b>Оставите номер?</b>\n\n" +
-      "Он нужен только на случай, если мастеру придётся срочно с вами связаться — " +
-      "например, изменилось время. Никаких рассылок.",
-      { parse_mode: "HTML", reply_markup: { keyboard: [[{ text: "📱 Поделиться номером", request_contact: true }]],
-        resize_keyboard: true, one_time_keyboard: true } });
-  } catch (e) { console.error("askPhone:", e.message); }
+    await bot.sendMessage(tgId, text, { parse_mode: "HTML", reply_markup: kb });
+    await mark();
+    console.log(`📞 Просьба о номере отправлена ${tgId}`);
+    return;
+  } catch (e) {
+    // Telegram присылает причину в теле ответа — без неё диагностировать нечем
+    console.error("askPhone (с кнопкой):", e.message, JSON.stringify(e.response?.body || null));
+  }
+  // Запасной путь: тем же способом, что и все остальные уведомления бота
+  try {
+    await bot.sendMessage(tgId, text + "\n\nОтправьте свой контакт через скрепку → «Контакт».",
+      { parse_mode: "HTML", disable_web_page_preview: true });
+    await mark();
+    console.log(`📞 Просьба о номере отправлена ${tgId} (без кнопки)`);
+  } catch (e2) {
+    console.error("askPhone (без кнопки):", e2.message, JSON.stringify(e2.response?.body || null));
+    phoneAsked.delete(tgId);      // не пометили — попробуем при следующей записи
+  }
 };
 
 // ── POST /notify_moderation ────────────────────────────────
