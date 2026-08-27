@@ -637,6 +637,31 @@ bot.on("callback_query", async (query) => {
 // Message handler: free-text cancel reasons
 bot.on("message", async (msg) => {
   const chatId = String(msg.chat.id);
+
+  // Клиент поделился номером кнопкой — сохраняем и убираем клавиатуру.
+  // Берём только свой контакт: пересланный чужой не наш.
+  if (msg.contact) {
+    const c = msg.contact;
+    if (String(c.user_id || "") !== chatId) {
+      await bot.sendMessage(chatId, "Это чужой контакт — поделитесь, пожалуйста, своим номером.",
+        { reply_markup: { remove_keyboard: true } });
+      return;
+    }
+    const phone = String(c.phone_number || "").slice(0, 32);
+    try {
+      await db.from("clients").update({ phone }).eq("telegram_user_id", chatId);
+      await bot.sendMessage(chatId,
+        "Спасибо! Номер сохранён — позвоним только если что-то срочное по записи.",
+        { reply_markup: { remove_keyboard: true } });
+      console.log(`📞 Телефон сохранён для ${chatId}`);
+    } catch (e) {
+      console.error("phone save:", e.message);
+      await bot.sendMessage(chatId, "Не получилось сохранить номер. Ничего страшного — попробуем позже.",
+        { reply_markup: { remove_keyboard: true } });
+    }
+    return;
+  }
+
   if (!msg.text || msg.text.startsWith("/")) return;
   const pending = pendingCancelText.get(chatId);
   if (!pending) return;
@@ -1313,6 +1338,180 @@ app.get("/auth/me", async (req, res) => {
   res.json({ ok: true, client: { telegram_user_id: tgId, name: row?.name || "Клиент",
              phone: row?.phone || null, photo_url: row?.photo_url || null, bio: row?.bio || "" } });
 });
+
+// ════════════════════════════════════════════════════════════
+// СОЗДАНИЕ ЗАПИСИ — только здесь
+// ════════════════════════════════════════════════════════════
+// Раньше браузер писал в bookings напрямую публичным ключом: этот ключ
+// лежит в исходниках страницы, поэтому кто угодно мог отправить бронь от
+// чужого имени, на занятое время и с любой ценой. Теперь запись создаёт
+// бот сервисным ключом, а публичному ключу вставка в bookings закрыта.
+//
+// Ничему из присланного не верим: цену и длительность берём из услуги в
+// базе, занятость и рабочие часы проверяем сами, личность — из сессии.
+
+const toMinutes = (t) => { const [h, m] = String(t || "0:0").split(":").map(Number); return h * 60 + (m || 0); };
+
+app.post("/bookings", async (req, res) => {
+  try {
+    const b = req.body || {};
+    const tgId = readSession(b.token);
+    if (!tgId) return res.status(401).json({ error: "not_authorized" });
+
+    const masterId = b.master_id;
+    const date     = String(b.booked_date || "");
+    const time     = String(b.booked_time || "").slice(0, 5);
+    if (!masterId || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{2}:\d{2}$/.test(time)) {
+      return res.status(400).json({ error: "bad_request" });
+    }
+    const todayIso = new Date().toLocaleString("sv-SE", { timeZone: "Europe/Minsk" }).slice(0, 10);
+    if (date < todayIso) return res.status(400).json({ error: "past_date" });
+
+    const { data: master } = await db.from("masters")
+      .select("id, name, kind, salon_id, telegram_user_id, is_active, works_from, works_until")
+      .eq("id", masterId).single();
+    if (!master || master.is_active === false) return res.status(404).json({ error: "master_not_found" });
+    if (master.works_until && master.works_until < date) return res.status(409).json({ error: "master_left" });
+    if (master.works_from  && master.works_from  > date) return res.status(409).json({ error: "master_not_started" });
+
+    // Кто просит: сам мастер/салон заводит запись рукой или клиент себе
+    const { data: ownerRows } = await db.from("masters").select("id, kind, salon_id").eq("telegram_user_id", tgId);
+    const owners = ownerRows || [];
+    const isAdmin = owners.some(o =>
+      o.id === masterId ||                                        // сам мастер
+      (o.kind === "salon" && master.salon_id === o.id) ||         // директор салона
+      (o.salon_id && master.salon_id === o.salon_id)              // коллега по салону
+    );
+
+    // Служебная блокировка времени — без услуги и клиента
+    const isBlock = !!b.block;
+    let svc = null;
+    if (!isBlock) {
+      const { data: svcRow } = await db.from("services")
+        .select("name, price, duration_min").eq("master_id", masterId)
+        .eq("name", String(b.service_name || "")).eq("is_active", true).limit(1);
+      svc = (svcRow || [])[0] || null;
+      if (!svc) return res.status(400).json({ error: "service_not_found" });
+    }
+    // Цена и длительность — из базы, не из запроса
+    const dur   = isBlock ? Math.max(15, Math.min(600, +b.duration_min || 60)) : (+svc.duration_min || 60);
+    const price = isBlock ? 0 : (+svc.price || 0);
+
+    // Рабочие часы мастера в этот день
+    const jsDay = new Date(date + "T12:00:00").getDay();
+    const dow   = jsDay === 0 ? 6 : jsDay - 1;
+    const { data: schedRows } = await db.from("master_schedule")
+      .select("is_working, start_time, end_time").eq("master_id", masterId).eq("day_of_week", dow).limit(1);
+    const sch = (schedRows || [])[0];
+    const start = toMinutes(time);
+    if (!isAdmin) {                       // администратор может ставить и вне смены
+      if (sch && sch.is_working === false) return res.status(409).json({ error: "day_off" });
+      const from = toMinutes(sch?.start_time || "09:00"), to = toMinutes(sch?.end_time || "18:00");
+      if (start < from || start + dur > to) return res.status(409).json({ error: "outside_hours" });
+    }
+
+    // Не занято ли
+    const { data: busy } = await db.from("bookings")
+      .select("booked_time, duration_min").eq("master_id", masterId).eq("booked_date", date)
+      .not("status", "in", "(cancelled,declined)");
+    const clash = (busy || []).some(x => {
+      const s2 = toMinutes((x.booked_time || "").slice(0, 5)), d2 = +x.duration_min || 60;
+      return s2 < start + dur && s2 + d2 > start;
+    });
+    // Служебную блокировку (перерыв, выходной) администратор ставит и поверх
+    // занятого времени — он знает, что делает. Клиентскую запись — никогда.
+    if (clash && !(isBlock && isAdmin)) return res.status(409).json({ error: "slot_taken" });
+
+    // Клиент: сам записывающийся или тот, кого вписал администратор
+    let clientName, clientTg = null;
+    if (isBlock) {
+      clientName = "\uD83D\uDD12 " + (String(b.client_name || "Перерыв").slice(0, 60));
+    } else if (isAdmin && b.client_name) {
+      clientName = String(b.client_name).slice(0, 80);
+    } else {
+      const { data: cl } = await db.from("clients").select("name").eq("telegram_user_id", tgId).single();
+      clientName = cl?.name || "Клиент";
+      clientTg = tgId;
+      const { data: bl } = await db.from("master_blacklist").select("id")
+        .eq("master_id", masterId).eq("client_telegram_id", tgId).limit(1);
+      if ((bl || []).length) return res.status(403).json({ error: "blacklisted" });
+    }
+
+    const row = {
+      master_id: masterId, master_name: master.name || null,
+      salon_id: b.salon_id || master.salon_id || null,
+      booked_date: date, booked_time: time + ":00", duration_min: dur,
+      service_name: isBlock ? (b.service_name || "Перерыв") : svc.name,
+      total_price: price,
+      client_name: clientName, client_telegram_id: clientTg,
+      client_notes: b.client_notes ? String(b.client_notes).slice(0, 1000) : null,
+      client_photo_urls: Array.isArray(b.client_photo_urls) ? b.client_photo_urls.slice(0, 6) : null,
+      // Запись от администратора не нуждается в подтверждении — он её и завёл
+      status: isAdmin ? "confirmed" : "pending",
+    };
+    const { data: created, error } = await db.from("bookings").insert(row).select().single();
+    if (error) { console.error("booking insert:", error.message); return res.status(500).json({ error: "insert_failed" }); }
+
+    console.log(`📝 Запись ${created.id} создана через бота (${isAdmin ? "администратор" : "клиент"})`);
+    if (clientTg) askPhoneOnce(clientTg).catch(() => {});
+    res.json({ ok: true, booking: created });
+  } catch (e) {
+    console.error("POST /bookings:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /bookings/cancel { token, booking_id } — отменить может только владелец
+app.post("/bookings/cancel", async (req, res) => {
+  try {
+    const { token, booking_id, reason } = req.body || {};
+    const tgId = readSession(token);
+    if (!tgId) return res.status(401).json({ error: "not_authorized" });
+
+    const { data: bk } = await db.from("bookings").select("*").eq("id", booking_id).single();
+    if (!bk) return res.status(404).json({ error: "not_found" });
+    if (bk.status === "cancelled") return res.json({ ok: true, booking: bk });
+
+    const { data: ownerRows } = await db.from("masters").select("id, kind, salon_id").eq("telegram_user_id", tgId);
+    const owners = ownerRows || [];
+    const isOwnerSide = owners.some(o => o.id === bk.master_id ||
+      (o.kind === "salon" && o.id === bk.salon_id) || (o.salon_id && o.salon_id === bk.salon_id));
+    const isClient = bk.client_telegram_id && String(bk.client_telegram_id) === tgId;
+    if (!isClient && !isOwnerSide) return res.status(403).json({ error: "forbidden" });
+
+    const cancelReason = isClient
+      ? `client:${String(reason || "не указана").slice(0, 200)}`
+      : `master:${String(reason || "salon").slice(0, 200)}`;
+    const { data: upd, error } = await db.from("bookings")
+      .update({ status: "cancelled", cancel_reason: cancelReason }).eq("id", booking_id).select().single();
+    if (error) return res.status(500).json({ error: "update_failed" });
+    res.json({ ok: true, booking: upd });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Телефон: просим один раз, после первой записи ───────────
+// Номер не нужен для входа — он нужен салону, чтобы позвонить, если
+// клиент не читает Telegram. Поэтому спрашиваем мягко и однократно.
+const phoneAsked = new Set();
+const askPhoneOnce = async (tgId) => {
+  if (phoneAsked.has(tgId)) return;
+  const { data: cl } = await db.from("clients").select("phone").eq("telegram_user_id", tgId).single();
+  if (cl?.phone) { phoneAsked.add(tgId); return; }
+  const { count } = await db.from("bookings")
+    .select("id", { count: "exact", head: true }).eq("client_telegram_id", tgId);
+  if ((count || 0) > 1) { phoneAsked.add(tgId); return; }   // не первая запись — не пристаём
+  phoneAsked.add(tgId);
+  try {
+    await bot.sendMessage(tgId,
+      "📞 <b>Оставите номер?</b>\n\n" +
+      "Он нужен только на случай, если мастеру придётся срочно с вами связаться — " +
+      "например, изменилось время. Никаких рассылок.",
+      { parse_mode: "HTML", reply_markup: { keyboard: [[{ text: "📱 Поделиться номером", request_contact: true }]],
+        resize_keyboard: true, one_time_keyboard: true } });
+  } catch (e) { console.error("askPhone:", e.message); }
+};
 
 // ── POST /notify_moderation ────────────────────────────────
 app.post("/notify_moderation", async (req, res) => {
