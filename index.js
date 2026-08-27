@@ -400,6 +400,11 @@ const subBookingUpdates = () => {
             { text: "❌ Отменить",  callback_data: `client_cancel_${b.id}` },
           ]]
         );
+        /* Номер спрашиваем здесь, а не при создании записи: сразу после
+           отправки человек ждёт ответа мастера, и просьба о телефоне в тот
+           же миг читается как лишнее уведомление. Пауза — чтобы это была
+           отдельная мысль, а не часть очереди сообщений. */
+        setTimeout(() => { askPhoneOnce(b.client_telegram_id).catch(() => {}); }, 15000);
       }
       // Update GCal event from tentative (grey) → confirmed (green)
       // If event already exists from when booking was pending, update it.
@@ -659,6 +664,15 @@ bot.on("message", async (msg) => {
       await bot.sendMessage(chatId, "Не получилось сохранить номер. Ничего страшного — попробуем позже.",
         { reply_markup: { remove_keyboard: true } });
     }
+    return;
+  }
+
+  // Вежливый отказ на просьбу о номере — снимаем клавиатуру и больше не просим
+  if (msg.text && msg.text.trim() === "Не сейчас") {
+    try { await db.from("clients")
+      .update({ phone_asked_at: new Date().toISOString() }).eq("telegram_user_id", chatId); } catch (e) {}
+    await bot.sendMessage(chatId, "Хорошо, не будем спрашивать. Всё по записи придёт сюда.",
+      { reply_markup: { remove_keyboard: true } });
     return;
   }
 
@@ -1377,7 +1391,12 @@ app.post("/bookings", async (req, res) => {
     // Кто просит: сам мастер/салон заводит запись рукой или клиент себе
     const { data: ownerRows } = await db.from("masters").select("id, kind, salon_id").eq("telegram_user_id", tgId);
     const owners = ownerRows || [];
-    const isAdmin = owners.some(o =>
+    /* Важно: «администратор» — это не про личность, а про то, откуда пришла
+       запись. Мастер может записаться сам к себе как обычный клиент, и такая
+       запись обязана ждать подтверждения. Раньше она подтверждалась сама,
+       потому что telegram совпадал с владельцем профиля мастера. */
+    const asClient = b.as === "client";
+    const isAdmin = !asClient && owners.some(o =>
       o.id === masterId ||                                        // сам мастер
       (o.kind === "salon" && master.salon_id === o.id) ||         // директор салона
       (o.salon_id && master.salon_id === o.salon_id)              // коллега по салону
@@ -1453,7 +1472,8 @@ app.post("/bookings", async (req, res) => {
     if (error) { console.error("booking insert:", error.message); return res.status(500).json({ error: "insert_failed" }); }
 
     console.log(`📝 Запись ${created.id} создана через бота (${isAdmin ? "администратор" : "клиент"})`);
-    if (clientTg) askPhoneOnce(clientTg).catch(() => {});
+    // Номер здесь не просим: человек только что отправил запись и ждёт
+    // ответа мастера. Просьба уходит после подтверждения — см. askPhoneOnce.
     res.json({ ok: true, booking: created });
   } catch (e) {
     console.error("POST /bookings:", e.message);
@@ -1506,10 +1526,12 @@ const askPhoneOnce = async (tgId) => {
   if (cl?.phone || cl?.phone_asked_at) { phoneAsked.add(tgId); return; }
   phoneAsked.add(tgId);
   const text =
-    "📞 <b>Оставите номер?</b>\n\n" +
-    "Он нужен только на случай, если мастеру придётся срочно с вами связаться — " +
-    "например, изменилось время. Никаких рассылок.";
-  const kb = { keyboard: [[{ text: "📱 Поделиться номером", request_contact: true }]],
+    "📞 <b>Оставьте номер телефона</b>\n\n" +
+    "Он понадобится в одном случае: если мастеру нужно срочно с вами связаться — " +
+    "например, изменится время визита.\n\n" +
+    "Номер видит только мастер, рассылок не будет. Можно пропустить — на запись это не влияет.";
+  const kb = { keyboard: [[{ text: "📱 Поделиться номером", request_contact: true }],
+                          [{ text: "Не сейчас" }]],
                resize_keyboard: true, one_time_keyboard: true };
 
   // Отметку ставим ТОЛЬКО после удачной отправки: раньше помечали заранее,
@@ -1528,7 +1550,7 @@ const askPhoneOnce = async (tgId) => {
   }
   // Запасной путь: тем же способом, что и все остальные уведомления бота
   try {
-    await bot.sendMessage(tgId, text + "\n\nОтправьте свой контакт через скрепку → «Контакт».",
+    await bot.sendMessage(tgId, text + "\n\nЧтобы поделиться, отправьте контакт через скрепку → «Контакт».",
       { parse_mode: "HTML", disable_web_page_preview: true });
     await mark();
     console.log(`📞 Просьба о номере отправлена ${tgId} (без кнопки)`);
