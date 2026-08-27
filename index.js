@@ -1494,15 +1494,20 @@ app.post("/bookings/cancel", async (req, res) => {
 // ── Телефон: просим один раз, после первой записи ───────────
 // Номер не нужен для входа — он нужен салону, чтобы позвонить, если
 // клиент не читает Telegram. Поэтому спрашиваем мягко и однократно.
+// Спрашиваем, если номера нет и мы ещё не спрашивали. Привязка к «первой
+// записи» была ошибкой: человек с историей записей и без номера не получил
+// бы просьбу никогда. Отметку храним в базе, иначе перезапуск бота сбрасывал
+// бы память и мы бы спрашивали снова у тех, кто уже отказался.
 const phoneAsked = new Set();
 const askPhoneOnce = async (tgId) => {
   if (phoneAsked.has(tgId)) return;
-  const { data: cl } = await db.from("clients").select("phone").eq("telegram_user_id", tgId).single();
-  if (cl?.phone) { phoneAsked.add(tgId); return; }
-  const { count } = await db.from("bookings")
-    .select("id", { count: "exact", head: true }).eq("client_telegram_id", tgId);
-  if ((count || 0) > 1) { phoneAsked.add(tgId); return; }   // не первая запись — не пристаём
+  const { data: cl } = await db.from("clients")
+    .select("phone, phone_asked_at").eq("telegram_user_id", tgId).single();
+  if (cl?.phone || cl?.phone_asked_at) { phoneAsked.add(tgId); return; }
   phoneAsked.add(tgId);
+  // Помечаем до отправки: если сообщение не уйдёт, повторно приставать не будем
+  try { await db.from("clients")
+    .update({ phone_asked_at: new Date().toISOString() }).eq("telegram_user_id", tgId); } catch (e) {}
   try {
     await bot.sendMessage(tgId,
       "📞 <b>Оставите номер?</b>\n\n" +
