@@ -323,7 +323,14 @@ const subBookingUpdates = () => {
     table: "bookings",
   }, async (payload) => {
     const b   = payload.new;
-    const old = payload.old;
+    const old = payload.old || {};
+    /* Postgres по умолчанию кладёт в поток репликации только ключ старой
+       строки, поэтому old.status бывает пустым. Раньше на этом молча
+       умирала ветка подтверждения. Теперь отличаем «статус был другим»
+       от «мы не знаем, каким он был». */
+    const oldKnown  = Object.keys(old).length > 1;
+    const oldStatus = oldKnown ? old.status : undefined;
+    if (!oldKnown) console.warn(`⚠️  Realtime: старая строка не пришла (REPLICA IDENTITY не FULL) — применяю патч v15`);
 
     // ── Салон переназначил запись на другого мастера ──────────────
     // Отдельная ветка: статус при этом не меняется, поэтому проверку
@@ -377,8 +384,8 @@ const subBookingUpdates = () => {
       }
     }
 
-    if (b.status === old.status) return;
-    console.log(`🔄 Booking ${b.id}: ${old.status} → ${b.status}`);
+    if (oldKnown && b.status === oldStatus) return;
+    console.log(`🔄 Booking ${b.id}: ${oldStatus ?? "?"} → ${b.status}`);
 
     const date  = dateRu(b.booked_date);
     const time  = timeShort(b.booked_time);
@@ -393,7 +400,8 @@ const subBookingUpdates = () => {
     }
 
     // pending → confirmed
-    if (b.status === "confirmed" && old.status === "pending") {
+    if (b.status === "confirmed" &&
+        (oldStatus === "pending" || (!oldKnown && !b.client_confirm_notified_at))) {
       if (b.client_telegram_id) {
         await sendWithKeyboard(b.client_telegram_id,
           `✅ <b>Мастер подтвердил вашу запись!</b>\n\n` +
@@ -411,6 +419,11 @@ const subBookingUpdates = () => {
            отправки человек ждёт ответа мастера, и просьба о телефоне в тот
            же миг читается как лишнее уведомление. Пауза — чтобы это была
            отдельная мысль, а не часть очереди сообщений. */
+        // Отметка ставится после отправки: по ней сверка поймёт, что клиент
+        // уже знает, и не пришлёт второе уведомление
+        await db.from("bookings")
+          .update({ client_confirm_notified_at: new Date().toISOString() })
+          .eq("id", b.id).catch(() => {});
         setTimeout(() => { askPhoneOnce(b.client_telegram_id).catch(() => {}); }, 15000);
         // Серое «ожидает» в календаре клиента становится зелёным подтверждённым
         updateClientGcal(b, masterName, false).catch(e =>
@@ -432,7 +445,7 @@ const subBookingUpdates = () => {
     }
 
     // → declined (master can't make it)
-    else if (b.status === "declined" && old.status !== "declined") {
+    else if (b.status === "declined" && oldStatus !== "declined") {
       if (b.client_telegram_id) {
         await sendWithKeyboard(b.client_telegram_id,
           `😔 К сожалению, у мастера произошла накладка и он не может принять вас в это время.\n\n` +
@@ -448,7 +461,7 @@ const subBookingUpdates = () => {
     }
 
     // → cancelled
-    else if (b.status === "cancelled" && old.status !== "cancelled") {
+    else if (b.status === "cancelled" && oldStatus !== "cancelled") {
       const reason = b.cancel_reason || "";
 
       if (reason.startsWith("client:") || reason === "client_reschedule" || reason === "client") {
@@ -489,7 +502,7 @@ const subBookingUpdates = () => {
     }
 
     // → completed
-    else if (b.status === "completed" && old.status !== "completed") {
+    else if (b.status === "completed" && oldStatus !== "completed") {
       console.log("✅ Booking completed:", b.id);
       // Review request is handled by the hourly cron (3-4h window after booking)
     }
@@ -1190,6 +1203,36 @@ const reconcileBookings = async () => {
           } catch (e) {
             console.error(`🩹 Reconcile: GCal push failed for ${b.id}:`, e.message);
           }
+        }
+      }
+
+      /* (a2) Клиенту не сообщили о подтверждении.
+         Realtime — единственный источник этого уведомления, и когда он
+         молчит, человек просто не узнаёт, что его ждут. Отметка в базе
+         делает починку идемпотентной и переживает перезапуск. */
+      if (b.status === "confirmed" && b.client_telegram_id && !b.client_confirm_notified_at) {
+        console.warn(`🩹 Сверка: клиенту не сообщили о подтверждении записи ${b.id} — отправляю`);
+        try {
+          const d = dateRu(b.booked_date), t = timeShort(b.booked_time);
+          await sendWithKeyboard(b.client_telegram_id,
+            `✅ <b>Мастер подтвердил вашу запись!</b>\n\n` +
+            `👩‍🎨 ${m.name || "Мастер"}\n` +
+            `💇 ${b.service_name || "Услуга"}\n` +
+            `📆 ${d}, ${t}\n` +
+            `💳 ${b.total_price ? b.total_price + " BYN" : "—"}\n\n` +
+            `Ждём вас в Uspot! 💜`,
+            [[
+              { text: "📅 Перенести", callback_data: `reschedule_${b.id}` },
+              { text: "❌ Отменить",  callback_data: `client_cancel_${b.id}` },
+            ]]
+          );
+          await db.from("bookings")
+            .update({ client_confirm_notified_at: new Date().toISOString() }).eq("id", b.id);
+          if (tg) confirmGcalEvent(b.id, tg).catch(() => {});
+          updateClientGcal(b, m.name || "Мастер", false).catch(() => {});
+          repaired++;
+        } catch (e) {
+          console.error(`🩹 Сверка: не удалось сообщить о подтверждении ${b.id}:`, e.message);
         }
       }
 
