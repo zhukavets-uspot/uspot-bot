@@ -161,6 +161,17 @@ const addrBlock = (m) => {
   return `📍 ${a}\n🗺 На карте: <a href="${ya}">Яндекс</a> · <a href="${gg}">Google</a>\n`;
 };
 
+/* Короткая карточка записи. Нужна везде, где мастер читает историю
+   чата: после подтверждения бот раньше стирал все подробности и оставлял
+   «Запись подтверждена» — две записи подряд выглядели одинаково, и было
+   не понять, кто и на какое время. Теперь детали остаются на месте. */
+const bookingCard = (bk, masterName = null) =>
+  `👤 ${bk.client_name || "Клиент"}\n` +
+  `💇 ${bk.service_name || "Услуга"}\n` +
+  `📆 ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n` +
+  `💳 ${bk.total_price ? bk.total_price + " BYN" : "—"}` +
+  (masterName ? `\n👩‍🎨 ${masterName}` : "");
+
 /* ─── Захват права на отправку ────────────────────────────────────
    Каждое разовое сообщение о записи (подтверждение, напоминания, опрос)
    отправляется из двух мест: по событию Realtime и из сверки, которая
@@ -588,9 +599,10 @@ const subNewBookings = () => {
     const shIds = await getShareholderIds("notify_bookings");
     for (const id of shIds) {
       await send(id,
-        `📊 [Uspot] Новая запись\n` +
+        `📊 [Uspot] ${b.reschedule_of ? "Перенос записи" : "Новая запись"}\n` +
         `${b.client_name || "Клиент"} → ${masterName}\n` +
-        `${b.service_name || "Услуга"} · ${price}`
+        `${b.service_name || "Услуга"} · ${price}\n` +
+        `${date}, ${time}`
       );
     }
 
@@ -870,10 +882,14 @@ bot.on("callback_query", async (query) => {
   if (data.startsWith("confirm_")) {
     const bookingId = data.slice(8);
     try {
+      const { data: cb } = await db.from("bookings")
+        .select("client_name, service_name, booked_date, booked_time, total_price")
+        .eq("id", bookingId).single();
       await db.from("bookings").update({ status: "confirmed" }).eq("id", bookingId);
       await bot.answerCallbackQuery(query.id, { text: "✅ Запись подтверждена!" });
       await bot.editMessageText(
-        `✅ <b>Запись подтверждена</b>\n\nКлиент получит уведомление. Ждём его в Uspot! 💜`,
+        `✅ <b>Запись подтверждена</b>\n\n` + (cb ? bookingCard(cb) + `\n\n` : "") +
+        `Клиент получит уведомление. Ждём его в Uspot! 💜`,
         { chat_id: chatId, message_id: msgId, parse_mode: "HTML",
           reply_markup: { inline_keyboard: [[{ text: "📅 Открыть кабинет мастера", web_app: { url: MINI_APP_URL + "?startapp=master" } }]] } }
       ).catch(() => {});
@@ -926,22 +942,6 @@ bot.on("callback_query", async (query) => {
     }
   }
 
-  if (data.startsWith("__legacy_suggest_")) {
-    const bookingId = data.slice(17);
-    try {
-      await db.from("bookings").update({ status: "declined" }).eq("id", bookingId);
-      await bot.answerCallbackQuery(query.id, { text: "⏰ Клиент получит уведомление" });
-      await bot.editMessageText(
-        `⏰ <b>Другое время предложено</b>\n\nКлиент получит уведомление и сможет перезаписаться.`,
-        { chat_id: chatId, message_id: msgId, parse_mode: "HTML",
-          reply_markup: { inline_keyboard: [[{ text: "📅 Открыть кабинет мастера", web_app: { url: MINI_APP_URL + "?startapp=master" } }]] } }
-      ).catch(() => {});
-    } catch (e) {
-      await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка" });
-      console.error("[Callback] suggest error:", e.message);
-    }
-    return;
-  }
 
   /* Мастер выбрал время → предложение уходит клиенту.
      Запись остаётся в статусе «ожидает»: пока клиент не согласился,
@@ -966,7 +966,12 @@ bot.on("callback_query", async (query) => {
         .update({ proposed_date: iso, proposed_time: time + ":00" }).eq("id", bookingId);
       await bot.answerCallbackQuery(query.id, { text: "Предложение отправлено" });
       await bot.editMessageText(
-        `⏰ <b>Предложено: ${dateRu(iso)}, ${time}</b>\n\nЖдём ответа клиента — сообщим сразу.`,
+        `⏰ <b>Предложено другое время</b>\n\n` +
+        `👤 ${bk.client_name || "Клиент"}\n` +
+        `💇 ${bk.service_name || "Услуга"}\n` +
+        `📅 Просили: ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n` +
+        `📅 Предложено: <b>${dateRu(iso)}, ${time}</b>\n\n` +
+        `Ждём ответа клиента — сообщим сразу.`,
         { chat_id: chatId, message_id: msgId, parse_mode: "HTML" }).catch(() => {});
 
       if (bk.client_telegram_id) {
