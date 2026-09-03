@@ -153,6 +153,53 @@ const addrBlock = (m) => {
   return `📍 ${a}\n🗺 Маршрут: <a href="${ya}">Яндекс</a> · <a href="${gg}">Google</a>\n`;
 };
 
+/* ─── Временны́е границы ──────────────────────────────────────────
+   Мастеру нужно время доехать: запись «через пятнадцать минут» ставит
+   его в положение, из которого нет выхода. И симметрично — отмена за
+   десять минут до визита оставляет окно пустым, заработать в него уже
+   нельзя. Обе границы проверяются здесь, на сервере: клиент — сторона
+   недоверенная, любые ограничения в интерфейсе обходятся.
+
+   Мастера и салоны границы не касаются: они распоряжаются своим
+   временем сами, в том числе в форс-мажоре.                         */
+const BOOK_LEAD_MIN     = 60;    // записаться можно не позже чем за час
+const CHANGE_CUTOFF_MIN = 120;   // отменить или перенести — не позже чем за два часа
+
+// Сколько минут осталось до начала записи (минус — уже началась)
+const minutesUntil = (dateIso, timeStr) => {
+  const t = String(timeStr || "00:00").slice(0, 5);
+  const startUtcMs = new Date(`${dateIso}T${t}:00+03:00`).getTime();   // Минск круглый год UTC+3
+  return Math.round((startUtcMs - Date.now()) / 60000);
+};
+
+const humanLead = (min) => {
+  if (min % 60 === 0) {
+    const h = min / 60;
+    return h === 1 ? "час" : h < 5 ? `${h} часа` : `${h} часов`;
+  }
+  return `${min} минут`;
+};
+
+/* Поздно ли клиенту менять запись. Возвращает текст отказа или null.
+   Отказ обязан давать выход: человек с настоящим форс-мажором должен
+   иметь возможность достучаться, а не упереться в стену. */
+const tooLateToChange = async (bookingId, what = "отменить") => {
+  const { data: bk } = await db.from("bookings")
+    .select("booked_date, booked_time, status, service_name").eq("id", bookingId).single();
+  if (!bk) return null;
+  if (bk.status === "cancelled" || bk.status === "declined") return null;
+  const left = minutesUntil(bk.booked_date, bk.booked_time);
+  if (left >= CHANGE_CUTOFF_MIN) return null;
+  const when = left < 0 ? "уже началась" : `начнётся через ${left} мин`;
+  return `⏳ <b>Поздно ${what}</b>\n\n` +
+    `Запись ${when}. Менять её можно не позже чем за ${humanLead(CHANGE_CUTOFF_MIN)} до начала — ` +
+    `мастер уже держит для вас время и не успеет занять окно.\n\n` +
+    `Если случился форс-мажор — напишите нам, разберёмся вручную.`;
+};
+const forceMajeureKb = (bookingId) => ([[
+  { text: "✉️ Написать нам", web_app: { url: `${MINI_APP_URL}?startapp=help_${bookingId}` } },
+]]);
+
 /* ─── Поиск свободных окон мастера ────────────────────────────────
    Нужен для переноса по инициативе мастера: бот предлагает конкретные
    времена, а не отправляет мастера искать их вручную. Учитывает недельный
@@ -973,6 +1020,12 @@ bot.on("callback_query", async (query) => {
 
   if (data.startsWith("reschedule_")) {
     const bookingId = data.slice(11);
+    const late = await tooLateToChange(bookingId, "переносить");
+    if (late) {
+      await bot.answerCallbackQuery(query.id, { text: "Слишком близко к началу" });
+      await sendWithKeyboard(chatId, late, forceMajeureKb(bookingId));
+      return;
+    }
     const { data: bk } = await db.from("bookings").select("master_id").eq("id", bookingId).single();
     await bot.answerCallbackQuery(query.id);
     // Send web_app link with startapp=reschedule_bookingId_masterId
@@ -986,6 +1039,12 @@ bot.on("callback_query", async (query) => {
   // Client: ❌ Отменить → show reason options
   if (data.startsWith("client_cancel_")) {
     const bookingId = data.slice(14);
+    const late = await tooLateToChange(bookingId, "отменить");
+    if (late) {
+      await bot.answerCallbackQuery(query.id, { text: "Слишком близко к началу" });
+      await sendWithKeyboard(chatId, late, forceMajeureKb(bookingId));
+      return;
+    }
     await bot.answerCallbackQuery(query.id);
     await sendWithKeyboard(chatId,
       `❌ <b>Отмена записи</b>\n\nУкажите причину — мастер её увидит:`,
@@ -1952,6 +2011,16 @@ app.post("/bookings", async (req, res) => {
       (o.salon_id && master.salon_id === o.salon_id)              // коллега по салону
     );
 
+    /* Записаться можно не позже чем за час: мастеру нужно время доехать.
+       Администратора и самого мастера это не касается — они ставят записи
+       вручную, в том числе «на сейчас». */
+    if (!isAdmin) {
+      const left = minutesUntil(date, time);
+      if (left < BOOK_LEAD_MIN) {
+        return res.status(409).json({ error: "too_soon", lead_min: BOOK_LEAD_MIN });
+      }
+    }
+
     // Служебная блокировка времени — без услуги и клиента
     const isBlock = !!b.block;
     let svc = null;
@@ -2051,6 +2120,18 @@ app.post("/bookings/cancel", async (req, res) => {
       (o.kind === "salon" && o.id === bk.salon_id) || (o.salon_id && o.salon_id === bk.salon_id));
     const isClient = bk.client_telegram_id && String(bk.client_telegram_id) === tgId;
     if (!isClient && !isOwnerSide) return res.status(403).json({ error: "forbidden" });
+
+    /* Клиент не отменяет за два часа до визита: окно уже не продать.
+       Мастера и салона это не касается — форс-мажор бывает у всех, но
+       решение остаётся за той стороной, которая теряет деньги. */
+    if (isClient && !isOwnerSide) {
+      const left = minutesUntil(bk.booked_date, bk.booked_time);
+      if (left < CHANGE_CUTOFF_MIN) {
+        return res.status(409).json({
+          error: "too_late_to_cancel", cutoff_min: CHANGE_CUTOFF_MIN, minutes_left: left,
+        });
+      }
+    }
 
     const cancelReason = isClient
       ? `client:${String(reason || "не указана").slice(0, 200)}`
