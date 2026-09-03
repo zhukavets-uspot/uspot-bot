@@ -153,6 +153,107 @@ const addrBlock = (m) => {
   return `📍 ${a}\n🗺 Маршрут: <a href="${ya}">Яндекс</a> · <a href="${gg}">Google</a>\n`;
 };
 
+/* ─── Поиск свободных окон мастера ────────────────────────────────
+   Нужен для переноса по инициативе мастера: бот предлагает конкретные
+   времена, а не отправляет мастера искать их вручную. Учитывает недельный
+   шаблон, переопределения на конкретную дату и уже занятое время.
+   Возвращает первые `count` окон начиная с завтрашнего дня.            */
+const minutesOf = (t) => { const [h, m] = String(t || "0:0").split(":").map(Number); return h * 60 + (m || 0); };
+const hhmm = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+
+const freeSlotsFor = async (masterId, durMin = 60, count = 6, daysAhead = 14, skipBookingId = null, perDay = 0) => {
+  if (!masterId) return [];
+  const [{ data: week }, { data: overrides }] = await Promise.all([
+    db.from("master_schedule").select("day_of_week, is_working, start_time, end_time").eq("master_id", masterId),
+    db.from("master_schedule_dates").select("date, is_working, start_time, end_time").eq("master_id", masterId),
+  ]);
+  const weekMap = {};
+  (week || []).forEach((r) => { weekMap[r.day_of_week] = r; });
+  const ovMap = {};
+  (overrides || []).forEach((r) => { ovMap[r.date] = r; });
+
+  const fromIso = minskDateStr(1);                         // с завтрашнего дня
+  const toIso   = minskDateStr(daysAhead);
+  const { data: booked } = await db.from("bookings")
+    .select("id, booked_date, booked_time, duration_min")
+    .eq("master_id", masterId).gte("booked_date", fromIso).lte("booked_date", toIso)
+    .not("status", "in", "(cancelled,declined)");
+  const busyByDate = {};
+  (booked || []).forEach((b) => {
+    if (skipBookingId && b.id === skipBookingId) return;    // саму переносимую запись не учитываем
+    (busyByDate[b.booked_date] ||= []).push({
+      s: minutesOf(b.booked_time), e: minutesOf(b.booked_time) + (+b.duration_min || 60),
+    });
+  });
+
+  const out = [];
+  for (let d = 1; d <= daysAhead && out.length < count; d++) {
+    const iso = minskDateStr(d);
+    const jsDay = new Date(iso + "T12:00:00").getDay();
+    const dow = jsDay === 0 ? 6 : jsDay - 1;               // 0 = понедельник
+    const row = ovMap[iso] || weekMap[dow];
+    if (!row || row.is_working === false) continue;
+    const from = minutesOf(row.start_time || "09:00");
+    const to   = minutesOf(row.end_time   || "18:00");
+    const busy = busyByDate[iso] || [];
+    /* perDay ограничивает число окон с одного дня. Без него мастеру
+       предлагались шесть подряд идущих получасовок одного утра — выбирать
+       по сути не из чего. С разбросом видно разные дни и время суток. */
+    const dayHits = [];
+    for (let t = from; t + durMin <= to; t += 30) {
+      if (busy.some((b) => b.s < t + durMin && b.e > t)) continue;
+      dayHits.push(hhmm(t));
+    }
+    if (!dayHits.length) continue;
+    const take = perDay > 0 ? Math.min(perDay, dayHits.length) : dayHits.length;
+    // Берём равномерно по дню: утро, середина, вечер — а не первые подряд
+    for (let k = 0; k < take && out.length < count; k++) {
+      const idx = take === 1 ? 0 : Math.round((k * (dayHits.length - 1)) / (take - 1));
+      out.push({ date: iso, time: dayHits[idx] });
+    }
+  }
+  return out;
+};
+
+/* Мёртвая привязка календаря.
+   invalid_grant означает, что refresh-токен больше не действует: доступ
+   отозвали, токен протух (выданные, пока приложение было в режиме
+   тестирования, живут 7 дней) или аккаунт удалён. Такой токен не
+   «полечится» повторной попыткой — раньше бот молча долбился в него
+   каждые 10 минут и засорял логи, а владелец не знал, что синхронизация
+   давно умерла. Теперь: убираем запись и один раз зовём переподключиться. */
+const deadGrantNotified = new Set();
+const isDeadGrant = (e) => {
+  const t = `${e?.message || ""} ${JSON.stringify(e?.response?.data || {})}`;
+  return /invalid_grant|Token has been expired or revoked|unauthorized_client/i.test(t);
+};
+const dropDeadGrant = async (tgId, where = "") => {
+  const id = String(tgId || "");
+  if (!id) return;
+  try { await db.from("master_gcal_tokens").delete().eq("master_telegram_id", id); } catch (e) {}
+  console.warn(`🔌 GCal: привязка ${id} мертва (${where}) — удалена, нужно переподключение`);
+  if (deadGrantNotified.has(id)) return;
+  deadGrantNotified.add(id);
+  // Кому вообще принадлежит эта привязка: мастеру, клиенту или никому
+  let owner = null;
+  try {
+    const { data: m } = await db.from("masters").select("id").eq("telegram_user_id", id).limit(1);
+    if (m?.length) owner = "master";
+    else {
+      const { data: c } = await db.from("clients").select("telegram_user_id").eq("telegram_user_id", id).limit(1);
+      if (c?.length) owner = "client";
+    }
+  } catch (e) {}
+  if (!owner) return;                       // осиротевшая тестовая привязка — молча убрали
+  try {
+    await send(id,
+      `⚠️ <b>Google Календарь отключился</b>\n\n` +
+      `Google отозвал доступ — так бывает, если сменился пароль или доступ убрали в настройках аккаунта.\n\n` +
+      `Записи в календарь пока не попадают. Подключить заново: ` +
+      (owner === "master" ? `<b>Профиль → Google Календарь</b>.` : `<b>Профиль → Google Календарь</b> в Uspot.`));
+  } catch (e) {}
+};
+
 // Мастер целиком — для сообщений, где нужен ещё и адрес
 const masterCache1h = new Map();
 const getMasterFull = async (masterId) => {
@@ -518,8 +619,11 @@ const subBookingUpdates = () => {
     }
 
     // pending → confirmed
-    if (b.status === "confirmed" &&
-        (oldStatus === "pending" || (!oldKnown && !b.client_confirm_notified_at))) {
+    /* Отметка — единственный источник правды о том, сказали ли клиенту.
+       Перенос по предложению мастера отправляет своё сообщение и ставит
+       отметку сам, поэтому обычное «мастер подтвердил» сюда не приходит. */
+    if (b.status === "confirmed" && !b.client_confirm_notified_at &&
+        (oldStatus === "pending" || !oldKnown)) {
       if (b.client_telegram_id) {
         const mFull = await getMasterFull(b.master_id);
         await sendWithKeyboard(b.client_telegram_id,
@@ -688,8 +792,49 @@ bot.on("callback_query", async (query) => {
   }
 
   // Master: ⏰ Предложить другое время
+  /* Мастер предлагает клиенту другое время.
+     Раньше эта кнопка просто отклоняла запись и клиент оставался ни с чем.
+     Теперь бот показывает мастеру его же свободные окна, мастер выбирает
+     одно, и клиент получает конкретное предложение с выбором. */
   if (data.startsWith("suggest_")) {
     const bookingId = data.slice(8);
+    try {
+      const { data: bk } = await db.from("bookings")
+        .select("master_id, duration_min, service_name, client_name, booked_date, booked_time, status")
+        .eq("id", bookingId).single();
+      if (!bk) { await bot.answerCallbackQuery(query.id, { text: "Запись не найдена" }); return; }
+      if (bk.status === "cancelled" || bk.status === "declined") {
+        await bot.answerCallbackQuery(query.id, { text: "Запись уже отменена" }); return;
+      }
+      const slots = await freeSlotsFor(bk.master_id, +bk.duration_min || 60, 6, 14, bookingId, 2);
+      await bot.answerCallbackQuery(query.id);
+      if (!slots.length) {
+        await send(chatId,
+          `⏰ <b>Свободных окон нет</b>\n\nНа ближайшие две недели в вашем расписании нет места ` +
+          `под эту услугу. Освободите время в расписании или отклоните запись.`);
+        return;
+      }
+      const rows = slots.map((x) => ([{
+        text: `${dateRu(x.date)}, ${x.time}`,
+        callback_data: `sprop_${bookingId}_${x.date}_${x.time.replace(":", "")}`,
+      }]));
+      await send(chatId,
+        `⏰ <b>Предложить другое время</b>\n\n` +
+        `👤 ${bk.client_name || "Клиент"}\n` +
+        `💇 ${bk.service_name || "Услуга"}\n` +
+        `Просили: ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n\n` +
+        `Выберите, что предложить взамен — клиент подтвердит или выберет сам:`,
+        rows);
+      return;
+    } catch (e) {
+      await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка" });
+      console.error("[Callback] suggest error:", e.message);
+      return;
+    }
+  }
+
+  if (data.startsWith("__legacy_suggest_")) {
+    const bookingId = data.slice(17);
     try {
       await db.from("bookings").update({ status: "declined" }).eq("id", bookingId);
       await bot.answerCallbackQuery(query.id, { text: "⏰ Клиент получит уведомление" });
@@ -701,6 +846,118 @@ bot.on("callback_query", async (query) => {
     } catch (e) {
       await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка" });
       console.error("[Callback] suggest error:", e.message);
+    }
+    return;
+  }
+
+  /* Мастер выбрал время → предложение уходит клиенту.
+     Запись остаётся в статусе «ожидает»: пока клиент не согласился,
+     ничего не меняем — иначе он придёт к отменённому времени. */
+  if (data.startsWith("sprop_")) {
+    const rest = data.slice(6);
+    const bookingId = rest.slice(0, 36);
+    const iso  = rest.slice(37, 47);
+    const hm   = rest.slice(48);
+    const time = `${hm.slice(0, 2)}:${hm.slice(2)}`;
+    try {
+      const { data: bk } = await db.from("bookings")
+        .select("client_telegram_id, service_name, booked_date, booked_time, master_id, total_price")
+        .eq("id", bookingId).single();
+      if (!bk) { await bot.answerCallbackQuery(query.id, { text: "Запись не найдена" }); return; }
+      await db.from("bookings")
+        .update({ proposed_date: iso, proposed_time: time + ":00" }).eq("id", bookingId);
+      await bot.answerCallbackQuery(query.id, { text: "Предложение отправлено" });
+      await bot.editMessageText(
+        `⏰ <b>Предложено: ${dateRu(iso)}, ${time}</b>\n\nЖдём ответа клиента — сообщим сразу.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: "HTML" }).catch(() => {});
+
+      if (bk.client_telegram_id) {
+        const mFull = await getMasterFull(bk.master_id);
+        await sendWithKeyboard(bk.client_telegram_id,
+          `⏰ <b>Мастер просит перенести запись</b>\n\n` +
+          `👩‍🎨 ${mFull?.name || "Мастер"}\n` +
+          `💇 ${bk.service_name || "Услуга"}\n` +
+          `📅 Вы просили: ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n` +
+          `📅 Мастер предлагает: <b>${dateRu(iso)}, ${time}</b>\n` +
+          addrBlock(mFull) +
+          `\nПодходит новое время?`,
+          [[{ text: "✅ Подтвердить", callback_data: `sok_${bookingId}_${iso}_${hm}` }],
+           [{ text: "📅 Выбрать другое время", callback_data: `reschedule_${bookingId}` }]]);
+      }
+    } catch (e) {
+      await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка" });
+      console.error("[Callback] sprop error:", e.message);
+    }
+    return;
+  }
+
+  /* Клиент согласился на предложенное время.
+     Слот перепроверяем: пока человек думал, мастер мог занять его другой
+     записью — тогда честно говорим и предлагаем выбрать самому. */
+  if (data.startsWith("sok_")) {
+    const rest = data.slice(4);
+    const bookingId = rest.slice(0, 36);
+    const iso  = rest.slice(37, 47);
+    const hm   = rest.slice(48);
+    const time = `${hm.slice(0, 2)}:${hm.slice(2)}`;
+    try {
+      const { data: bk } = await db.from("bookings").select("*").eq("id", bookingId).single();
+      if (!bk) { await bot.answerCallbackQuery(query.id, { text: "Запись не найдена" }); return; }
+      if (bk.status === "cancelled" || bk.status === "declined") {
+        await bot.answerCallbackQuery(query.id, { text: "Запись уже отменена" });
+        await send(chatId, `Эта запись уже отменена. Выберите новое время в приложении.`);
+        return;
+      }
+      const free = await freeSlotsFor(bk.master_id, +bk.duration_min || 60, 200, 21, bookingId);
+      if (!free.some((x) => x.date === iso && x.time === time)) {
+        await bot.answerCallbackQuery(query.id, { text: "Это время уже занято" });
+        await sendWithKeyboard(chatId,
+          `😔 <b>Это время только что заняли</b>\n\nВыберите, пожалуйста, другое — свободные окна видно в приложении.`,
+          [[{ text: "📅 Выбрать время", callback_data: `reschedule_${bookingId}` }]]);
+        return;
+      }
+      const mFull = await getMasterFull(bk.master_id);
+      await db.from("bookings").update({
+        booked_date: iso, booked_time: time + ":00", status: "confirmed",
+        proposed_date: null, proposed_time: null,
+        // Своё сообщение уже отправим ниже — обычное «мастер подтвердил» не нужно
+        client_confirm_notified_at: new Date().toISOString(),
+      }).eq("id", bookingId);
+      await bot.answerCallbackQuery(query.id, { text: "Перенесено!" });
+
+      await sendWithKeyboard(chatId,
+        `✅ <b>Запись перенесена</b>\n\n` +
+        `👩‍🎨 ${mFull?.name || "Мастер"}\n` +
+        `💇 ${bk.service_name || "Услуга"}\n` +
+        `📆 <b>${dateRu(iso)}, ${time}</b>\n` +
+        (bk.total_price ? `💳 ${bk.total_price} BYN\n` : "") +
+        addrBlock(mFull) +
+        `\nЖдём вас! 💜`,
+        [[{ text: "📅 Перенести", callback_data: `reschedule_${bookingId}` },
+          { text: "❌ Отменить",  callback_data: `client_cancel_${bookingId}` }]]);
+
+      if (mFull?.telegram_user_id) {
+        await send(mFull.telegram_user_id,
+          `✅ <b>Клиент согласился на перенос</b>\n\n` +
+          `👤 ${bk.client_name || "Клиент"}\n` +
+          `💇 ${bk.service_name || "Услуга"}\n` +
+          `📅 Было: ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n` +
+          `📅 Стало: <b>${dateRu(iso)}, ${time}</b>`);
+      }
+
+      // Календари: у мастера событие пересоздаём, у клиента переписываем
+      const moved = { ...bk, booked_date: iso, booked_time: time + ":00", status: "confirmed" };
+      deleteFromGcal(bookingId)
+        .then(() => db.from("bookings").update({ gcal_event_id: null, gcal_calendar_id: null }).eq("id", bookingId))
+        .then(() => mFull?.telegram_user_id &&
+          pushToGcal({ ...moved, gcal_event_id: null }, mFull.telegram_user_id, mFull.name || "Мастер", false))
+        .catch((e) => console.error("GCal перенос (мастер):", e.message));
+      updateClientGcal(moved, mFull?.name || "Мастер", false)
+        .catch((e) => console.error("GCal перенос (клиент):", e.message));
+      console.log(`📅 Перенос подтверждён клиентом: ${bookingId} → ${iso} ${time}`);
+    } catch (e) {
+      await bot.answerCallbackQuery(query.id, { text: "⚠️ Ошибка" });
+      console.error("[Callback] sok error:", e.message);
     }
     return;
   }
@@ -1115,6 +1372,7 @@ const pushToGcal = async (booking, masterTgId, masterName, isPending = false) =>
       .eq("id", booking.id);
     console.log(`✅ GCal event created (${isPending?"pending":"confirmed"}): ${created.id} for booking ${booking.id}`);
   } catch (e) {
+    if (isDeadGrant(e)) { await dropDeadGrant(masterTgId, "запись в календарь мастера"); return; }
     if (e.message?.includes("Insufficient Permission")) {
       console.error(`❌ GCal permission denied for master ${masterTgId}. Their token was issued without calendar.events scope. They must disconnect and reconnect Google Calendar in the app.`);
       // Notify master via Telegram so they know to reconnect
@@ -1177,6 +1435,7 @@ const pushClientGcal = async (booking, masterName, isPending = false) => {
       .eq("id", booking.id);
     console.log(`✅ GCal клиента: событие ${created.id} для записи ${booking.id}`);
   } catch (e) {
+    if (isDeadGrant(e)) return dropDeadGrant(tg, "запись в календарь клиента");
     console.error("GCal клиента (создание):", e.message);
   }
 };
@@ -1200,6 +1459,7 @@ const updateClientGcal = async (booking, masterName, isPending = false) => {
     });
     console.log(`✅ GCal клиента: событие обновлено для записи ${booking.id}`);
   } catch (e) {
+    if (isDeadGrant(e)) return dropDeadGrant(tg, "обновление календаря клиента");
     console.error("GCal клиента (обновление):", e.message);
   }
 };
@@ -1219,6 +1479,7 @@ const deleteClientGcal = async (bookingId) => {
     });
     console.log(`🗑️  GCal клиента: событие удалено для записи ${bookingId}`);
   } catch (e) {
+    if (isDeadGrant(e)) return dropDeadGrant(bk.client_telegram_id, "удаление в календаре клиента");
     console.warn("GCal клиента (удаление):", e.message);
   }
 };
@@ -2137,6 +2398,7 @@ const syncFromGcal = async (masterTgId, sinceIso) => {
       maxResults: 250,
     }));
   } catch (e) {
+    if (isDeadGrant(e)) { await dropDeadGrant(masterTgId, "чтение календаря"); return 0; }
     console.error(`GCal pull ${masterTgId}: ${e.message}`);
     return 0;
   }
