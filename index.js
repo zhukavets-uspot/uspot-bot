@@ -90,6 +90,81 @@ const sendWithKeyboard = async (chatId, text, actionRows = []) => {
   return send(chatId, text, actionRows);
 };
 
+/* ─── Адрес мастера ───────────────────────────────────────────────
+   В базе лежит сырая строка геокодера («58, улица Максима Богдановича,
+   Комаровка, Советский район, Минск, 220123»). Клиенту в подтверждении
+   и в календаре нужен человеческий вид и способ доехать — иначе адрес
+   приходится искать, возвращаясь в приложение. Логика та же, что в
+   приложении (fmtAddr), чтобы адрес выглядел одинаково везде.        */
+const STREET_TYPES = [
+  [/^улиц[аы]$/i, "ул."], [/^ул\.?$/i, "ул."],
+  [/^проспе?кт$/i, "просп."], [/^просп\.?$/i, "просп."], [/^пр-?т$/i, "просп."],
+  [/^переулок$/i, "пер."], [/^пер\.?$/i, "пер."],
+  [/^бульвар$/i, "бул."], [/^б-?р$/i, "бул."],
+  [/^шоссе$/i, "ш."], [/^площадь$/i, "пл."], [/^пл\.?$/i, "пл."],
+  [/^набережная$/i, "наб."], [/^проезд$/i, "проезд"],
+  [/^тракт$/i, "тракт"], [/^алле[яи]$/i, "аллея"],
+  [/^микрорайон$/i, "мкр"], [/^мкр\.?$/i, "мкр"],
+];
+const abbrevType = (w) => { for (const [re, ab] of STREET_TYPES) if (re.test(w)) return ab; return null; };
+const isHouse    = (t) => /^\d+[а-яa-z]?(\s*(к|корп|стр)\.?\s*\d+[а-яa-z]?)?$/i.test(t);
+const isPostal   = (t) => /^\d{5,6}$/.test(t);
+const isDistrict = (t) => /(^|[^\p{L}])(район|область|области|сельсовет)([^\p{L}]|$)/iu.test(t);
+const isCountry  = (t) => /^(республика\s+)?беларусь$|^belarus$/i.test(t.trim());
+
+const fmtAddr = (raw = "") => {
+  const src = String(raw || "").trim();
+  if (!src) return "";
+  const parts = src.split(",").map((t) => t.trim()).filter(Boolean);
+  if (parts.length < 2) return src;
+  let house = null, street = null, city = null;
+  const rest = [];
+  for (const t of parts) {
+    if (isPostal(t)) continue;
+    if (isHouse(t)) { if (!house) house = t; continue; }
+    if (isDistrict(t) || isCountry(t)) continue;
+    const words = t.split(/\s+/);
+    const first = abbrevType(words[0]), last = abbrevType(words[words.length - 1]);
+    if (!street && (first || last)) {
+      street = first ? first + " " + words.slice(1).join(" ")
+                     : last  + " " + words.slice(0, -1).join(" ");
+      continue;
+    }
+    rest.push(t);
+  }
+  if (!city && rest.length) city = rest[rest.length - 1];
+  if (!street) {
+    const clean = parts.filter((t) => !isPostal(t) && !isDistrict(t));
+    return clean.slice(0, 2).join(", ") || src;
+  }
+  const streetHouse = house ? `${street}, ${house}` : street;
+  return city ? `${city}, ${streetHouse}` : streetHouse;
+};
+
+// Адрес + маршрут одной строкой. Пусто, если адреса нет — лишней строки не будет.
+const addrBlock = (m) => {
+  const a = fmtAddr(m?.location || "");
+  if (!a) return "";
+  const q = encodeURIComponent(a);
+  const pt = (m?.lat && m?.lng) ? `${m.lat},${m.lng}` : null;
+  const ya = pt ? `https://yandex.by/maps/?rtext=~${pt}&rtt=auto` : `https://yandex.by/maps/?text=${q}`;
+  const gg = pt ? `https://www.google.com/maps/dir/?api=1&destination=${pt}`
+                : `https://www.google.com/maps/search/?api=1&query=${q}`;
+  return `📍 ${a}\n🗺 Маршрут: <a href="${ya}">Яндекс</a> · <a href="${gg}">Google</a>\n`;
+};
+
+// Мастер целиком — для сообщений, где нужен ещё и адрес
+const masterCache1h = new Map();
+const getMasterFull = async (masterId) => {
+  if (!masterId) return null;
+  const hit = masterCache1h.get(masterId);
+  if (hit && Date.now() - hit.t < 60 * 60 * 1000) return hit.m;
+  const { data } = await db.from("masters")
+    .select("name, telegram_user_id, location, city, lat, lng").eq("id", masterId).single();
+  masterCache1h.set(masterId, { m: data || null, t: Date.now() });
+  return data || null;
+};
+
 // ── Shareholders ─────────────────────────────────────────────────────────
 const getShareholderIds = async (field = "notify_bookings") => {
   try {
@@ -182,19 +257,47 @@ const rtRetries = {};
 // reconciler below so a repair sweep never double-alerts.
 const handledBookings = new Set();
 const BOOT_AT = new Date().toISOString();
-const rtStatus = (label, resubscribe) => (status, err) => {
+/* Переподписка съедала сама себя. subXxx() удаляет старый канал, тот
+   отдаёт статус CLOSED, его же обработчик видит CLOSED и планирует ещё
+   одну переподписку — и так по кругу. Сверху сторож каждые две минуты
+   добавлял свои. Каналы копились, и одно изменение записи приходило
+   клиенту столько раз, сколько их накопилось: отсюда двойные сообщения.
+
+   Лечим тремя вещами: у каждого канала есть поколение, отклик старого
+   поколения игнорируется; одновременная переподписка блокируется флагом;
+   и на всякий случай события отсеиваются по (запись + статус). */
+const rtGeneration = {};
+const rtResubBusy  = {};
+const rtStatus = (label, resubscribe, gen) => (status, err) => {
+  if (gen !== rtGeneration[label]) return;          // отклик отменённого канала
   if (status === "SUBSCRIBED") {
     rtRetries[label] = 0;
+    rtResubBusy[label] = false;
     console.log(`✅ Realtime: listening for ${label}`);
     return;
   }
   console.error(`❌ Realtime ${label}: ${status}`, err?.message || "");
   if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+    // Попытка закончилась неудачей — снимаем флаг, иначе и сторож, и
+    // повторная попытка окажутся заблокированы навсегда
+    rtResubBusy[label] = false;
     const n = rtRetries[label] = (rtRetries[label] || 0) + 1;
     const delay = Math.min(5000 * n, 60000);
     console.log(`🔁 Realtime ${label}: reconnecting in ${delay / 1000}s (attempt ${n})`);
     setTimeout(resubscribe, delay);
   }
+};
+
+/* Отсев повторов. Даже если каналов почему-то окажется два, один и тот
+   же переход записи не будет объявлен дважды. Ключ живёт 10 минут —
+   этого хватает на любые задержки доставки. */
+const rtSeen = new Map();
+const rtFirstTime = (key) => {
+  const now = Date.now();
+  for (const [k, t] of rtSeen) if (now - t > 10 * 60 * 1000) rtSeen.delete(k);
+  if (rtSeen.has(key)) { console.warn(`↩️  Повтор события пропущен: ${key}`); return false; }
+  rtSeen.set(key, now);
+  return true;
 };
 
 // ════════════════════════════════════════════════════════════
@@ -203,6 +306,8 @@ const rtStatus = (label, resubscribe) => (status, err) => {
 // ════════════════════════════════════════════════════════════
 let chNewBookings = null;
 const subNewBookings = () => {
+  const gen = (rtGeneration["new bookings"] = (rtGeneration["new bookings"] || 0) + 1);
+  rtResubBusy["new bookings"] = true;
   if (chNewBookings) { try { db.removeChannel(chNewBookings); } catch (e) {} }
   chNewBookings = db.channel("uspot-new-bookings")
   .on("postgres_changes", {
@@ -212,6 +317,7 @@ const subNewBookings = () => {
   }, async (payload) => {
     const b = payload.new;
     if (b.client_name?.startsWith("🔒")) return; // skip manual blocks
+    if (!rtFirstTime(`new:${b.id}`)) return;
     handledBookings.add(b.id);
     console.log("📥 New booking:", b.id, "status:", b.status, "master_id:", b.master_id, "client_tg:", b.client_telegram_id);
 
@@ -232,13 +338,22 @@ const subNewBookings = () => {
     if (b.status === "pending") {
       // Master: confirm or suggest new time
       if (masterTgId) {
+        // Перенос показываем как перенос: видно, что было и что стало
+        let wasLine = "";
+        if (b.reschedule_of) {
+          const { data: prev } = await db.from("bookings")
+            .select("booked_date, booked_time").eq("id", b.reschedule_of).single();
+          if (prev) wasLine = `📅 Было: ${dateRu(prev.booked_date)}, ${timeShort(prev.booked_time)}\n`;
+        }
         await sendWithKeyboard(masterTgId,
-          `📅 <b>Новая запись!</b>\n\n` +
+          (b.reschedule_of ? `📅 <b>Клиент просит перенести запись</b>\n\n` : `📅 <b>Новая запись!</b>\n\n`) +
           `👤 ${b.client_name || "Клиент"}\n` +
           `💇 ${b.service_name || "Услуга"}\n` +
-          `📆 ${date}, ${time}\n` +
+          wasLine +
+          `${b.reschedule_of ? "📅 Стало: " : "📆 "}${date}, ${time}\n` +
           `💳 ${price}\n\n` +
-          `Подтвердите или предложите другое время:`,
+          (b.reschedule_of ? `Подтвердите перенос или предложите другое время:`
+                           : `Подтвердите или предложите другое время:`),
           [[
             { text: "✅ Подтвердить",             callback_data: `confirm_${b.id}` },
             { text: "⏰ Другое время",             callback_data: `suggest_${b.id}` },
@@ -250,7 +365,7 @@ const subNewBookings = () => {
       // Client: waiting
       if (b.client_telegram_id) {
         await send(b.client_telegram_id,
-          `⏳ <b>Запись отправлена!</b>\n\n` +
+          (b.reschedule_of ? `⏳ <b>Запрос на перенос отправлен</b>\n\n` : `⏳ <b>Запись отправлена!</b>\n\n`) +
           `👩‍🎨 ${masterName}\n` +
           `💇 ${b.service_name || "Услуга"}\n` +
           `📆 ${date}, ${time}\n` +
@@ -306,7 +421,7 @@ const subNewBookings = () => {
       console.error("GCal клиента (новая запись):", e.message)
     );
   })
-  .subscribe(rtStatus("new bookings", subNewBookings));
+  .subscribe(rtStatus("new bookings", subNewBookings, gen));
 };
 subNewBookings();
 
@@ -315,6 +430,8 @@ subNewBookings();
 // ════════════════════════════════════════════════════════════
 let chBookingUpdates = null;
 const subBookingUpdates = () => {
+  const gen = (rtGeneration["booking updates"] = (rtGeneration["booking updates"] || 0) + 1);
+  rtResubBusy["booking updates"] = true;
   if (chBookingUpdates) { try { db.removeChannel(chBookingUpdates); } catch (e) {} }
   chBookingUpdates = db.channel("uspot-booking-updates")
   .on("postgres_changes", {
@@ -385,6 +502,7 @@ const subBookingUpdates = () => {
     }
 
     if (oldKnown && b.status === oldStatus) return;
+    if (!rtFirstTime(`upd:${b.id}:${b.status}`)) return;
     console.log(`🔄 Booking ${b.id}: ${oldStatus ?? "?"} → ${b.status}`);
 
     const date  = dateRu(b.booked_date);
@@ -403,13 +521,17 @@ const subBookingUpdates = () => {
     if (b.status === "confirmed" &&
         (oldStatus === "pending" || (!oldKnown && !b.client_confirm_notified_at))) {
       if (b.client_telegram_id) {
+        const mFull = await getMasterFull(b.master_id);
         await sendWithKeyboard(b.client_telegram_id,
-          `✅ <b>Мастер подтвердил вашу запись!</b>\n\n` +
+          (b.reschedule_of
+            ? `✅ <b>Запись перенесена по вашей просьбе</b>\n\n`
+            : `✅ <b>Мастер подтвердил вашу запись!</b>\n\n`) +
           `👩‍🎨 ${masterName}\n` +
           `💇 ${b.service_name || "Услуга"}\n` +
           `📆 ${date}, ${time}\n` +
-          `💳 ${price}\n\n` +
-          `Ждём вас в Uspot! 💜`,
+          `💳 ${price}\n` +
+          addrBlock(mFull) +
+          (b.reschedule_of ? `\nЖдём вас в новое время! 💜` : `\nЖдём вас в Uspot! 💜`),
           [[
             { text: "📅 Перенести", callback_data: `reschedule_${b.id}` },
             { text: "❌ Отменить",  callback_data: `client_cancel_${b.id}` },
@@ -507,7 +629,7 @@ const subBookingUpdates = () => {
       // Review request is handled by the hourly cron (3-4h window after booking)
     }
   })
-  .subscribe(rtStatus("booking updates", subBookingUpdates));
+  .subscribe(rtStatus("booking updates", subBookingUpdates, gen));
 };
 subBookingUpdates();
 
@@ -520,10 +642,12 @@ setInterval(() => {
   ];
   for (const [label, ch, resub] of checks) {
     const state = ch?.state;
-    if (state !== "joined") {
-      console.warn(`🩺 Realtime watchdog: ${label} state="${state}" — resubscribing`);
-      resub();
-    }
+    // "joining" — нормальное промежуточное состояние; вмешиваться в него
+    // значило заводить второй канал поверх ещё живого
+    if (state === "joined" || state === "joining") continue;
+    if (rtResubBusy[label]) continue;
+    console.warn(`🩺 Realtime watchdog: ${label} state="${state}" — resubscribing`);
+    resub();
   }
 }, 2 * 60 * 1000);
 
@@ -756,40 +880,43 @@ const runReminders = async () => {
 
   // 1h reminder
   const { data: todayBookings } = await db.from("bookings")
-    .select("*, masters(name, location)")
+    .select("*, masters(name, location, lat, lng)")
     .eq("status", "confirmed").eq("booked_date", todayStr);
 
   for (const b of todayBookings || []) {
     if (!b.client_telegram_id) continue;
     const key = `${b.id}_1h`;
-    if (sentReminders.has(key)) continue;
+    if (sentReminders.has(key) || b.reminded_1h_at) continue;
     const bookingUtc = parseMinsKDt(b.booked_date, b.booked_time || "00:00:00");
     const minsUntil  = (bookingUtc - now) / 60000;
-    if (minsUntil < 55 || minsUntil > 65) continue;
+    // Окно широкое: сверка идёт часто, а отметка в базе не даёт повторов.
+    // Раньше окно было 10 минут при часовом тике — напоминание почти не уходило.
+    if (minsUntil < 10 || minsUntil > 75) continue;
     const master = Array.isArray(b.masters) ? b.masters[0] : b.masters;
     await send(b.client_telegram_id,
       `🔔 <b>Через час ваша запись!</b>\n\n` +
       `💇 ${b.service_name || "Услуга"}\n` +
       `👩‍🎨 ${master?.name || "Мастер"}\n` +
-      (master?.location ? `📍 ${master.location}\n` : "") +
+      addrBlock(master) +
       `\nВремя: <b>${timeShort(b.booked_time)}</b> — ждём вас! 💜`
     );
     sentReminders.add(key);
+    await db.from("bookings").update({ reminded_1h_at: new Date().toISOString() }).eq("id", b.id);
     console.log(`✉️  1h reminder sent: booking ${b.id}`);
   }
 
   // 24h reminder
   const { data: tomorrowBookings } = await db.from("bookings")
-    .select("*, masters(name, location)")
+    .select("*, masters(name, location, lat, lng)")
     .eq("status", "confirmed").eq("booked_date", tomorrowStr);
 
   for (const b of tomorrowBookings || []) {
     if (!b.client_telegram_id) continue;
     const key = `${b.id}_24h`;
-    if (sentReminders.has(key)) continue;
+    if (sentReminders.has(key) || b.reminded_24h_at) continue;
     const bookingUtc  = parseMinsKDt(b.booked_date, b.booked_time || "00:00:00");
     const hoursUntil  = (bookingUtc - now) / 3600000;
-    if (hoursUntil < 23.5 || hoursUntil > 24.5) continue;
+    if (hoursUntil < 12 || hoursUntil > 26) continue;
     if (b.created_at && (now - new Date(b.created_at)) / 3600000 < 4) continue;
     const master = Array.isArray(b.masters) ? b.masters[0] : b.masters;
     await send(b.client_telegram_id,
@@ -797,11 +924,12 @@ const runReminders = async () => {
       `Завтра в <b>${timeShort(b.booked_time)}</b> у вас запись:\n` +
       `💇 ${b.service_name || "Услуга"}\n` +
       `👩‍🎨 ${master?.name || "Мастер"}\n` +
-      (master?.location ? `📍 ${master.location}\n` : "") +
+      addrBlock(master) +
       (b.total_price ? `💳 ${b.total_price} BYN\n` : "") +
       `\nДо встречи в Uspot! 💜`
     );
     sentReminders.add(key);
+    await db.from("bookings").update({ reminded_24h_at: new Date().toISOString() }).eq("id", b.id);
     console.log(`✉️  24h reminder sent: booking ${b.id}`);
   }
 
@@ -816,10 +944,13 @@ const runReminders = async () => {
   for (const b of pastBookings || []) {
     if (!b.client_telegram_id) continue;
     const key = `${b.id}_review`;
-    if (sentReminders.has(key)) continue;
+    if (sentReminders.has(key) || b.review_asked_at) continue;
     const bookingUtc = parseMinsKDt(b.booked_date, b.booked_time || "00:00:00");
     const hoursAgo   = (now - bookingUtc) / 3600000;
-    if (hoursAgo < 3 || hoursAgo > 4) continue;
+    // Не раньше трёх часов после визита и не позже полутора суток.
+    // Верхняя граница была 4 часа при часовом тике — в это окно почти
+    // никогда не попадали, и опрос не приходил вообще.
+    if (hoursAgo < 3 || hoursAgo > 36) continue;
 
     // Re-check fresh status — skip if booking was cancelled after the query ran
     const { data: fresh } = await db.from("bookings")
@@ -843,6 +974,7 @@ const runReminders = async () => {
       [[{ text: "⭐ Оставить отзыв", web_app: { url: reviewUrl } }]]
     );
     sentReminders.add(key);
+    await db.from("bookings").update({ review_asked_at: new Date().toISOString() }).eq("id", b.id);
     console.log(`✉️  Review request sent: booking ${b.id}`);
   }
 
@@ -850,7 +982,10 @@ const runReminders = async () => {
 };
 
 runReminders();
-setInterval(runReminders, 60 * 60 * 1000);
+/* Раз в пять минут, а не раз в час: окна отправки короткие, и часовой
+   тик в них не попадал. Повторов не будет — каждое отправленное
+   сообщение отмечается в базе. */
+setInterval(runReminders, 5 * 60 * 1000);
 
 // ════════════════════════════════════════════════════════════
 // GOOGLE CALENDAR INTEGRATION  — Bug #5
@@ -941,6 +1076,7 @@ const pushToGcal = async (booking, masterTgId, masterName, isPending = false) =>
     throw e;
   }
 
+  const masterAddrForEvent = fmtAddr((await getMasterFull(booking.master_id))?.location || "");
   // Build event times (Minsk UTC+3)
   const dur = booking.duration_min || 60;
   const startIso = `${booking.booked_date}T${(booking.booked_time || "09:00:00").slice(0,5)}:00`;
@@ -959,6 +1095,7 @@ const pushToGcal = async (booking, masterTgId, masterName, isPending = false) =>
       (booking.client_notes ? `Пожелания: ${booking.client_notes}\n` : "") +
       `Статус: ${isPending ? "Ожидает подтверждения" : "Подтверждено"}\n` +
       `\nUspot Booking ID: ${booking.id}`,
+    location: masterAddrForEvent || undefined,
     start: { dateTime: `${startIso}+03:00`, timeZone: "Europe/Minsk" },
     end:   { dateTime: `${endIso}+03:00`,   timeZone: "Europe/Minsk" },
     status: isPending ? "tentative" : "confirmed",
@@ -998,7 +1135,7 @@ const pushToGcal = async (booking, masterTgId, masterName, isPending = false) =>
    не «услуга — имя клиента», а «услуга у мастера». Токены берутся из той
    же таблицы: она ключуется по Telegram ID, поэтому человек, подключивший
    календарь однажды, получает записи в обеих ролях.                    */
-const clientEventBody = (booking, masterName, isPending) => {
+const clientEventBody = (booking, masterName, isPending, masterAddr = "") => {
   const dur = booking.duration_min || 60;
   const startIso = `${booking.booked_date}T${(booking.booked_time || "09:00:00").slice(0, 5)}:00`;
   const startMs  = new Date(`${startIso}+03:00`).getTime();
@@ -1013,6 +1150,8 @@ const clientEventBody = (booking, masterName, isPending) => {
       `Стоимость: ${booking.total_price ? booking.total_price + " BYN" : "—"}\n` +
       `Статус: ${isPending ? "Ожидает подтверждения мастера" : "Подтверждено"}\n` +
       `\nЗапись через Uspot · ${MINI_APP_URL}`,
+    // Адрес в отдельном поле: календарь сам делает из него карту и маршрут
+    location: masterAddr || undefined,
     start: { dateTime: `${startIso}+03:00`, timeZone: "Europe/Minsk" },
     end:   { dateTime: `${endIso}+03:00`,   timeZone: "Europe/Minsk" },
     status: isPending ? "tentative" : "confirmed",
@@ -1029,7 +1168,9 @@ const pushClientGcal = async (booking, masterName, isPending = false) => {
   const calendar = google.calendar({ version: "v3", auth });
   try {
     const { data: created } = await calendar.events.insert({
-      calendarId: "primary", requestBody: clientEventBody(booking, masterName, isPending),
+      calendarId: "primary",
+      requestBody: clientEventBody(booking, masterName, isPending,
+        fmtAddr((await getMasterFull(booking.master_id))?.location || "")),
     });
     await db.from("bookings")
       .update({ client_gcal_event_id: created.id, client_gcal_calendar_id: "primary" })
@@ -1054,7 +1195,8 @@ const updateClientGcal = async (booking, masterName, isPending = false) => {
     await calendar.events.patch({
       calendarId: bk.client_gcal_calendar_id || "primary",
       eventId: bk.client_gcal_event_id,
-      requestBody: clientEventBody(booking, masterName, isPending),
+      requestBody: clientEventBody(booking, masterName, isPending,
+        fmtAddr((await getMasterFull(booking.master_id))?.location || "")),
     });
     console.log(`✅ GCal клиента: событие обновлено для записи ${booking.id}`);
   } catch (e) {
@@ -1214,13 +1356,15 @@ const reconcileBookings = async () => {
         console.warn(`🩹 Сверка: клиенту не сообщили о подтверждении записи ${b.id} — отправляю`);
         try {
           const d = dateRu(b.booked_date), t = timeShort(b.booked_time);
+          const mF = await getMasterFull(b.master_id);
           await sendWithKeyboard(b.client_telegram_id,
             `✅ <b>Мастер подтвердил вашу запись!</b>\n\n` +
             `👩‍🎨 ${m.name || "Мастер"}\n` +
             `💇 ${b.service_name || "Услуга"}\n` +
             `📆 ${d}, ${t}\n` +
-            `💳 ${b.total_price ? b.total_price + " BYN" : "—"}\n\n` +
-            `Ждём вас в Uspot! 💜`,
+            `💳 ${b.total_price ? b.total_price + " BYN" : "—"}\n` +
+            addrBlock(mF) +
+            `\nЖдём вас в Uspot! 💜`,
             [[
               { text: "📅 Перенести", callback_data: `reschedule_${b.id}` },
               { text: "❌ Отменить",  callback_data: `client_cancel_${b.id}` },
@@ -1610,6 +1754,9 @@ app.post("/bookings", async (req, res) => {
       client_name: clientName, client_telegram_id: clientTg,
       client_notes: b.client_notes ? String(b.client_notes).slice(0, 1000) : null,
       client_photo_urls: Array.isArray(b.client_photo_urls) ? b.client_photo_urls.slice(0, 6) : null,
+      // Перенос прежней записи: бот напишет мастеру одно сообщение
+      // «перенос», а не «новая запись» следом за «переносом»
+      reschedule_of: b.reschedule_of || null,
       // Запись от администратора не нуждается в подтверждении — он её и завёл
       status: isAdmin ? "confirmed" : "pending",
     };
