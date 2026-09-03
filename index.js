@@ -153,6 +153,34 @@ const addrBlock = (m) => {
   return `📍 ${a}\n🗺 Маршрут: <a href="${ya}">Яндекс</a> · <a href="${gg}">Google</a>\n`;
 };
 
+/* ─── Захват права на отправку ────────────────────────────────────
+   Каждое разовое сообщение о записи (подтверждение, напоминания, опрос)
+   отправляется из двух мест: по событию Realtime и из сверки, которая
+   чинит пропущенное. Оба раньше работали так: «посмотреть отметку →
+   отправить → поставить отметку». Между «посмотреть» и «поставить»
+   помещается второй отправитель — и клиент получает два сообщения.
+   Именно так 3 сентября пришли подряд «Запись перенесена по вашей
+   просьбе» и «Мастер подтвердил вашу запись» об одной записи.
+
+   Лечится не проверкой, а захватом: отметка ставится ОДНИМ условным
+   запросом «поставь, если пусто». База выполняет его атомарно, поэтому
+   выигрывает ровно один отправитель, сколько бы их ни было и в каком бы
+   порядке они ни пришли. Проигравший молчит.                        */
+const claimOnce = async (bookingId, column) => {
+  try {
+    const { data, error } = await db.from("bookings")
+      .update({ [column]: new Date().toISOString() })
+      .eq("id", bookingId).is(column, null).select("id");
+    if (error) { console.error(`claimOnce ${column}:`, error.message); return false; }
+    return Array.isArray(data) && data.length > 0;
+  } catch (e) { console.error(`claimOnce ${column}:`, e.message); return false; }
+};
+
+// Отправка не удалась — отпускаем захват, чтобы сообщение ушло со следующей сверкой
+const releaseClaim = async (bookingId, column) => {
+  try { await db.from("bookings").update({ [column]: null }).eq("id", bookingId); } catch (e) {}
+};
+
 /* ─── Временны́е границы ──────────────────────────────────────────
    Мастеру нужно время доехать: запись «через пятнадцать минут» ставит
    его в положение, из которого нет выхода. И симметрично — отмена за
@@ -601,6 +629,8 @@ const subBookingUpdates = () => {
     // Отдельная ветка: статус при этом не меняется, поэтому проверку
     // ниже она бы не прошла. Клиенту сообщаем честно, кто его примет.
     if (b.master_id && old.master_id && b.master_id !== old.master_id) {
+      // Ветка идёт до общего отсева повторов, поэтому нужен свой ключ
+      if (!rtFirstTime(`reassign:${b.id}:${b.master_id}`)) return;
       console.log(`🔀 Booking ${b.id}: мастер ${old.master_id} → ${b.master_id}`);
       try {
         const [{ data: newM }, { data: oldM }] = await Promise.all([
@@ -671,8 +701,10 @@ const subBookingUpdates = () => {
        отметку сам, поэтому обычное «мастер подтвердил» сюда не приходит. */
     if (b.status === "confirmed" && !b.client_confirm_notified_at &&
         (oldStatus === "pending" || !oldKnown)) {
-      if (b.client_telegram_id) {
+      // Захват до отправки: если сверка успела раньше — молчим
+      if (b.client_telegram_id && await claimOnce(b.id, "client_confirm_notified_at")) {
         const mFull = await getMasterFull(b.master_id);
+        try {
         await sendWithKeyboard(b.client_telegram_id,
           (b.reschedule_of
             ? `✅ <b>Запись перенесена по вашей просьбе</b>\n\n`
@@ -692,11 +724,12 @@ const subBookingUpdates = () => {
            отправки человек ждёт ответа мастера, и просьба о телефоне в тот
            же миг читается как лишнее уведомление. Пауза — чтобы это была
            отдельная мысль, а не часть очереди сообщений. */
-        // Отметка ставится после отправки: по ней сверка поймёт, что клиент
-        // уже знает, и не пришлёт второе уведомление
-        await db.from("bookings")
-          .update({ client_confirm_notified_at: new Date().toISOString() })
-          .eq("id", b.id).catch(() => {});
+        } catch (e) {
+          // Не ушло — отпускаем захват, сверка попробует ещё раз
+          console.error("Подтверждение клиенту не отправлено:", e.message);
+          await releaseClaim(b.id, "client_confirm_notified_at");
+          throw e;
+        }
         setTimeout(() => { askPhoneOnce(b.client_telegram_id).catch(() => {}); }, 15000);
         // Серое «ожидает» в календаре клиента становится зелёным подтверждённым
         updateClientGcal(b, masterName, false).catch(e =>
@@ -759,8 +792,13 @@ const subBookingUpdates = () => {
         deleteFromGcal(b.id).catch(() => {});
         deleteClientGcal(b.id).catch(() => {});
       } else if (reason.startsWith("master:") || reason === "force_majeure") {
+        /* Отмену через удаление события в календаре клиенту сообщает сама
+           синхронизация — она и есть действующее лицо. Если написать ещё и
+           отсюда, человек получит два одинаковых сообщения подряд: ровно
+           это и было 2 сентября. У каждого сообщения один хозяин. */
+        const fromCalendar = reason === "master:gcal_delete";
         // Master cancelled — notify client to rebook
-        if (b.client_telegram_id) {
+        if (b.client_telegram_id && !fromCalendar) {
           await sendWithKeyboard(b.client_telegram_id,
             `❌ <b>Запись отменена мастером</b>\n\n` +
             `💇 ${b.service_name || "Услуга"}\n` +
@@ -911,6 +949,11 @@ bot.on("callback_query", async (query) => {
         .select("client_telegram_id, service_name, booked_date, booked_time, master_id, total_price")
         .eq("id", bookingId).single();
       if (!bk) { await bot.answerCallbackQuery(query.id, { text: "Запись не найдена" }); return; }
+      // Двойное нажатие той же кнопки не должно слать клиенту два предложения
+      if (!rtFirstTime(`sprop:${bookingId}:${iso}:${hm}`)) {
+        await bot.answerCallbackQuery(query.id, { text: "Уже предложено" });
+        return;
+      }
       await db.from("bookings")
         .update({ proposed_date: iso, proposed_time: time + ":00" }).eq("id", bookingId);
       await bot.answerCallbackQuery(query.id, { text: "Предложение отправлено" });
@@ -953,6 +996,14 @@ bot.on("callback_query", async (query) => {
       if (bk.status === "cancelled" || bk.status === "declined") {
         await bot.answerCallbackQuery(query.id, { text: "Запись уже отменена" });
         await send(chatId, `Эта запись уже отменена. Выберите новое время в приложении.`);
+        return;
+      }
+      /* Второе нажатие «Подтвердить»: запись уже стоит на этом времени.
+         Без проверки перенос выполнился бы ещё раз и оба — клиент и мастер —
+         получили бы по второму сообщению об одном и том же. */
+      if (bk.booked_date === iso && String(bk.booked_time).slice(0, 5) === time
+          && bk.status === "confirmed") {
+        await bot.answerCallbackQuery(query.id, { text: "Уже перенесено" });
         return;
       }
       const free = await freeSlotsFor(bk.master_id, +bk.duration_min || 60, 200, 21, bookingId);
@@ -1208,6 +1259,9 @@ const runReminders = async () => {
     // Окно широкое: сверка идёт часто, а отметка в базе не даёт повторов.
     // Раньше окно было 10 минут при часовом тике — напоминание почти не уходило.
     if (minsUntil < 10 || minsUntil > 75) continue;
+    // Захват только когда время действительно пришло: иначе пометили бы
+    // все сегодняшние записи разом, и напоминание не ушло бы вообще
+    if (!(await claimOnce(b.id, "reminded_1h_at"))) continue;
     const master = Array.isArray(b.masters) ? b.masters[0] : b.masters;
     await send(b.client_telegram_id,
       `🔔 <b>Через час ваша запись!</b>\n\n` +
@@ -1217,7 +1271,6 @@ const runReminders = async () => {
       `\nВремя: <b>${timeShort(b.booked_time)}</b> — ждём вас! 💜`
     );
     sentReminders.add(key);
-    await db.from("bookings").update({ reminded_1h_at: new Date().toISOString() }).eq("id", b.id);
     console.log(`✉️  1h reminder sent: booking ${b.id}`);
   }
 
@@ -1234,6 +1287,7 @@ const runReminders = async () => {
     const hoursUntil  = (bookingUtc - now) / 3600000;
     if (hoursUntil < 12 || hoursUntil > 26) continue;
     if (b.created_at && (now - new Date(b.created_at)) / 3600000 < 4) continue;
+    if (!(await claimOnce(b.id, "reminded_24h_at"))) continue;
     const master = Array.isArray(b.masters) ? b.masters[0] : b.masters;
     await send(b.client_telegram_id,
       `⏰ <b>Напоминание на завтра</b>\n\n` +
@@ -1245,7 +1299,6 @@ const runReminders = async () => {
       `\nДо встречи в Uspot! 💜`
     );
     sentReminders.add(key);
-    await db.from("bookings").update({ reminded_24h_at: new Date().toISOString() }).eq("id", b.id);
     console.log(`✉️  24h reminder sent: booking ${b.id}`);
   }
 
@@ -1280,6 +1333,7 @@ const runReminders = async () => {
     const master = Array.isArray(b.masters) ? b.masters[0] : b.masters;
     const masterName = master?.name || b.master_name || null;
 
+    if (!(await claimOnce(b.id, "review_asked_at"))) continue;
     const reviewStartapp = `review_${b.id}_${b.master_id}`;
     const reviewUrl = `${MINI_APP_URL}?startapp=${reviewStartapp}`;
 
@@ -1290,7 +1344,6 @@ const runReminders = async () => {
       [[{ text: "⭐ Оставить отзыв", web_app: { url: reviewUrl } }]]
     );
     sentReminders.add(key);
-    await db.from("bookings").update({ review_asked_at: new Date().toISOString() }).eq("id", b.id);
     console.log(`✉️  Review request sent: booking ${b.id}`);
   }
 
@@ -1672,31 +1725,39 @@ const reconcileBookings = async () => {
          Realtime — единственный источник этого уведомления, и когда он
          молчит, человек просто не узнаёт, что его ждут. Отметка в базе
          делает починку идемпотентной и переживает перезапуск. */
-      if (b.status === "confirmed" && b.client_telegram_id && !b.client_confirm_notified_at) {
+      /* Захват вместо проверки: снимок строк сделан одним запросом в
+         начале сверки, и за время цикла Realtime мог уже отправить своё
+         сообщение. Условный запрос решает это в базе, а не по таймингу.
+         Формулировка — та же, что в Realtime: два пути не должны
+         говорить об одной записи разными словами. */
+      if (b.status === "confirmed" && b.client_telegram_id &&
+          !b.client_confirm_notified_at && await claimOnce(b.id, "client_confirm_notified_at")) {
         console.warn(`🩹 Сверка: клиенту не сообщили о подтверждении записи ${b.id} — отправляю`);
         try {
           const d = dateRu(b.booked_date), t = timeShort(b.booked_time);
           const mF = await getMasterFull(b.master_id);
           await sendWithKeyboard(b.client_telegram_id,
-            `✅ <b>Мастер подтвердил вашу запись!</b>\n\n` +
+            (b.reschedule_of
+              ? `✅ <b>Запись перенесена по вашей просьбе</b>\n\n`
+              : `✅ <b>Мастер подтвердил вашу запись!</b>\n\n`) +
             `👩‍🎨 ${m.name || "Мастер"}\n` +
             `💇 ${b.service_name || "Услуга"}\n` +
             `📆 ${d}, ${t}\n` +
             `💳 ${b.total_price ? b.total_price + " BYN" : "—"}\n` +
             addrBlock(mF) +
-            `\nЖдём вас в Uspot! 💜`,
+            (b.reschedule_of ? `\nЖдём вас в новое время! 💜` : `\nЖдём вас в Uspot! 💜`),
             [[
               { text: "📅 Перенести", callback_data: `reschedule_${b.id}` },
               { text: "❌ Отменить",  callback_data: `client_cancel_${b.id}` },
             ]]
           );
-          await db.from("bookings")
-            .update({ client_confirm_notified_at: new Date().toISOString() }).eq("id", b.id);
+          // Отметка уже стоит — её поставил захват перед отправкой
           if (tg) confirmGcalEvent(b.id, tg).catch(() => {});
           updateClientGcal(b, m.name || "Мастер", false).catch(() => {});
           repaired++;
         } catch (e) {
           console.error(`🩹 Сверка: не удалось сообщить о подтверждении ${b.id}:`, e.message);
+          await releaseClaim(b.id, "client_confirm_notified_at");
         }
       }
 
