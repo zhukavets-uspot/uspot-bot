@@ -145,12 +145,20 @@ const fmtAddr = (raw = "") => {
 const addrBlock = (m) => {
   const a = fmtAddr(m?.location || "");
   if (!a) return "";
+  /* Показываем точку, а не строим маршрут. Человек сам решит, нужен ли
+     ему маршрут, и откуда его строить — из дома, с работы или от метро.
+     Прежние ссылки (rtext= у Яндекса, dir/ у Google) сразу открывали
+     построение маршрута, и было непонятно, куда вообще смотреть.
+     У Яндекса порядок координат обратный: сначала долгота. */
   const q = encodeURIComponent(a);
-  const pt = (m?.lat && m?.lng) ? `${m.lat},${m.lng}` : null;
-  const ya = pt ? `https://yandex.by/maps/?rtext=~${pt}&rtt=auto` : `https://yandex.by/maps/?text=${q}`;
-  const gg = pt ? `https://www.google.com/maps/dir/?api=1&destination=${pt}`
-                : `https://www.google.com/maps/search/?api=1&query=${q}`;
-  return `📍 ${a}\n🗺 Маршрут: <a href="${ya}">Яндекс</a> · <a href="${gg}">Google</a>\n`;
+  const has = m?.lat && m?.lng;
+  const ya = has
+    ? `https://yandex.by/maps/?ll=${m.lng},${m.lat}&z=17&pt=${m.lng},${m.lat},pm2rdm`
+    : `https://yandex.by/maps/?text=${q}`;
+  const gg = has
+    ? `https://www.google.com/maps/search/?api=1&query=${m.lat},${m.lng}`
+    : `https://www.google.com/maps/search/?api=1&query=${q}`;
+  return `📍 ${a}\n🗺 На карте: <a href="${ya}">Яндекс</a> · <a href="${gg}">Google</a>\n`;
 };
 
 /* ─── Захват права на отправку ────────────────────────────────────
