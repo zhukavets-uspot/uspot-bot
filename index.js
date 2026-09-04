@@ -69,12 +69,13 @@ const send = async (chatId, text, inlineRows = []) => {
     id = "@" + id;
   }
   try {
-    await bot.sendMessage(id, text, {
+    const sent = await bot.sendMessage(id, text, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
       reply_markup: inlineRows.length ? { inline_keyboard: inlineRows } : undefined,
     });
     console.log(`✉️  Sent to ${id}: ${text.substring(0, 60)}…`);
+    return sent;   // нужен message_id, чтобы позже снять кнопки
   } catch (e) {
     // "chat not found" usually means user hasn't started the bot yet — not a code bug
     if (e.message?.includes("chat not found") || e.message?.includes("user not found")) {
@@ -159,6 +160,29 @@ const addrBlock = (m) => {
     ? `https://www.google.com/maps/search/?api=1&query=${m.lat},${m.lng}`
     : `https://www.google.com/maps/search/?api=1&query=${q}`;
   return `📍 ${a}\n🗺 На карте: <a href="${ya}">Яндекс</a> · <a href="${gg}">Google</a>\n`;
+};
+
+/* Погасить карточку записи у мастера.
+   Карточка «Новая запись!» висит с кнопками «Подтвердить» и «Другое
+   время». Когда запись отменяют, она остаётся приглашать к действию,
+   которого уже нет. Переписываем её на месте и снимаем кнопки. */
+const closeMasterCard = async (bookingId, headline) => {
+  try {
+    const { data: bk } = await db.from("bookings")
+      .select("master_msg_chat, master_msg_id, client_name, service_name, booked_date, booked_time, total_price")
+      .eq("id", bookingId).single();
+    if (!bk?.master_msg_id || !bk.master_msg_chat) return;
+    await bot.editMessageText(
+      `${headline}\n\n` + bookingCard(bk),
+      { chat_id: bk.master_msg_chat, message_id: Number(bk.master_msg_id), parse_mode: "HTML" });
+    await db.from("bookings")
+      .update({ master_msg_id: null, master_msg_chat: null }).eq("id", bookingId);
+  } catch (e) {
+    // «message is not modified» и «message to edit not found» — не беда
+    if (!/not modified|not found/i.test(e.message || "")) {
+      console.warn("Карточка мастера не обновлена:", e.message);
+    }
+  }
 };
 
 /* Короткая карточка записи. Нужна везде, где мастер читает историю
@@ -540,7 +564,7 @@ const subNewBookings = () => {
             .select("booked_date, booked_time").eq("id", b.reschedule_of).single();
           if (prev) wasLine = `📅 Было: ${dateRu(prev.booked_date)}, ${timeShort(prev.booked_time)}\n`;
         }
-        await sendWithKeyboard(masterTgId,
+        const cardMsg = await sendWithKeyboard(masterTgId,
           (b.reschedule_of ? `📅 <b>Клиент просит перенести запись</b>\n\n` : `📅 <b>Новая запись!</b>\n\n`) +
           `👤 ${b.client_name || "Клиент"}\n` +
           `💇 ${b.service_name || "Услуга"}\n` +
@@ -554,6 +578,14 @@ const subNewBookings = () => {
             { text: "⏰ Другое время",             callback_data: `suggest_${b.id}` },
           ]]
         );
+        // Запоминаем карточку: если запись отменят, погасим её сразу,
+        // не дожидаясь, пока мастер нажмёт «Подтвердить» на пустоте
+        if (cardMsg?.message_id) {
+          await db.from("bookings").update({
+            master_msg_chat: String(cardMsg.chat?.id ?? masterTgId),
+            master_msg_id:   cardMsg.message_id,
+          }).eq("id", b.id).catch(() => {});
+        }
       } else {
         console.warn(`⚠️  Master ${b.master_id} has no telegram_user_id — cannot notify master`);
       }
@@ -782,6 +814,7 @@ const subBookingUpdates = () => {
         );
       }
       // Remove from GCal if exists
+      closeMasterCard(b.id, "⏰ <b>Вы отклонили запись</b>").catch(() => {});
       deleteFromGcal(b.id).catch(() => {});
       deleteClientGcal(b.id).catch(() => {});
     }
@@ -791,6 +824,8 @@ const subBookingUpdates = () => {
       const reason = b.cancel_reason || "";
 
       if (reason.startsWith("client:") || reason === "client_reschedule" || reason === "client") {
+        // Нужна и ниже, при гашении карточки, поэтому объявлена здесь
+        const isReschedule = reason === "client_reschedule";
         // Client cancelled — notify master
         if (masterTgId) {
           const reasonText = reason === "client_reschedule"
@@ -798,17 +833,19 @@ const subBookingUpdates = () => {
             : reason === "client"
             ? "Причина не указана"
             : reason.slice(7);
-          const isReschedule = reason === "client_reschedule";
           await send(masterTgId,
             (isReschedule ? `📅 <b>Перенос записи</b>` : `❌ <b>Отмена от клиента</b>`) + `\n\n` +
             `👤 ${b.client_name || "Клиент"}\n` +
             `💇 ${b.service_name || "Услуга"}\n` +
             `📆 ${date}, ${time}\n` +
             `💳 ${price}\n` +
-            `💬 Причина: ${reasonText}` +
+            (reasonText === "Причина не указана" ? `💬 Причина не указана` : `💬 Причина: ${reasonText}`) +
             (isReschedule ? `\n\nОжидайте новую запись от клиента.` : "")
           );
         }
+        closeMasterCard(b.id, isReschedule
+          ? "📅 <b>Клиент переносит запись</b>"
+          : "❌ <b>Запись отменена клиентом</b>").catch(() => {});
         deleteFromGcal(b.id).catch(() => {});
         deleteClientGcal(b.id).catch(() => {});
       } else if (reason.startsWith("master:") || reason === "force_majeure") {
@@ -827,6 +864,7 @@ const subBookingUpdates = () => {
             [[{ text: "📅 Записаться снова", web_app: { url: `${MINI_APP_URL}?startapp=m${b.master_id}` } }]]
           );
         }
+        closeMasterCard(b.id, "❌ <b>Запись отменена</b>").catch(() => {});
         deleteFromGcal(b.id).catch(() => {});
         deleteClientGcal(b.id).catch(() => {});
       }
@@ -883,8 +921,27 @@ bot.on("callback_query", async (query) => {
     const bookingId = data.slice(8);
     try {
       const { data: cb } = await db.from("bookings")
-        .select("client_name, service_name, booked_date, booked_time, total_price")
+        .select("client_name, service_name, booked_date, booked_time, total_price, status, cancel_reason")
         .eq("id", bookingId).single();
+      if (!cb) {
+        await bot.answerCallbackQuery(query.id, { text: "Запись не найдена" });
+        return;
+      }
+      /* Запись могли отменить, пока карточка висела в чате. Подтверждать
+         её нельзя: клиент уже получил отмену и не придёт. Кнопки снимаем,
+         чтобы карточка не приглашала нажать ещё раз. */
+      if (cb.status === "cancelled" || cb.status === "declined") {
+        const who = String(cb.cancel_reason || "").startsWith("client") ? "клиентом" : "мастером";
+        await bot.answerCallbackQuery(query.id, { text: "Запись уже отменена" });
+        await bot.editMessageText(
+          `❌ <b>Запись отменена ${who}</b>\n\n` + bookingCard(cb) + `\n\nПодтверждать нечего.`,
+          { chat_id: chatId, message_id: msgId, parse_mode: "HTML" }).catch(() => {});
+        return;
+      }
+      if (cb.status === "confirmed") {
+        await bot.answerCallbackQuery(query.id, { text: "Уже подтверждена" });
+        return;
+      }
       await db.from("bookings").update({ status: "confirmed" }).eq("id", bookingId);
       await bot.answerCallbackQuery(query.id, { text: "✅ Запись подтверждена!" });
       await bot.editMessageText(
