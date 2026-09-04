@@ -1315,10 +1315,15 @@ const runReminders = async () => {
   const tomorrowStr  = minskDateStr(1);
   const yesterdayStr = minskDateStr(-1);
 
+  /* Связка указывается явно: у bookings две ссылки на masters — master_id
+     и salon_id, и без уточнения PostgREST отказывается выполнять запрос
+     (PGRST201). Раньше ошибку никто не смотрел, data приходила пустой, и
+     все напоминания молча не отправлялись — месяцами. Ошибку теперь видно. */
   // 1h reminder
-  const { data: todayBookings } = await db.from("bookings")
-    .select("*, masters(name, location, lat, lng)")
+  const { data: todayBookings, error: e1h } = await db.from("bookings")
+    .select("*, masters!bookings_master_id_fkey(name, location, lat, lng)")
     .eq("status", "confirmed").eq("booked_date", todayStr);
+  if (e1h) console.error("⏰ Напоминание за час: запрос не выполнен —", e1h.message);
 
   for (const b of todayBookings || []) {
     if (!b.client_telegram_id) continue;
@@ -1345,9 +1350,10 @@ const runReminders = async () => {
   }
 
   // 24h reminder
-  const { data: tomorrowBookings } = await db.from("bookings")
-    .select("*, masters(name, location, lat, lng)")
+  const { data: tomorrowBookings, error: e24h } = await db.from("bookings")
+    .select("*, masters!bookings_master_id_fkey(name, location, lat, lng)")
     .eq("status", "confirmed").eq("booked_date", tomorrowStr);
+  if (e24h) console.error("⏰ Напоминание за сутки: запрос не выполнен —", e24h.message);
 
   for (const b of tomorrowBookings || []) {
     if (!b.client_telegram_id) continue;
@@ -1374,11 +1380,12 @@ const runReminders = async () => {
 
   // ── Review request ──────────────────────────────────────────────
   // Send 3-4h after booking time, only if visit actually happened
-  const { data: pastBookings } = await db.from("bookings")
-    .select("*, masters(name)")
+  const { data: pastBookings, error: eRev } = await db.from("bookings")
+    .select("*, masters!bookings_master_id_fkey(name)")
     .in("status", ["confirmed", "completed"])
     .not("client_name", "like", "🔒%")          // skip manual/block-time entries
     .in("booked_date", [todayStr, yesterdayStr]);
+  if (eRev) console.error("⏰ Опрос после визита: запрос не выполнен —", eRev.message);
 
   for (const b of pastBookings || []) {
     if (!b.client_telegram_id) continue;
