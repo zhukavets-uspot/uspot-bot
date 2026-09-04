@@ -1398,7 +1398,20 @@ const runReminders = async () => {
     if (!b.client_telegram_id) continue;
     if (askedThisRun.has(String(b.client_telegram_id))) continue;
     const key = `${b.id}_review`;
-    if (sentReminders.has(key) || b.review_asked_at) continue;
+    if (sentReminders.has(key)) continue;
+    /* Отметка, проставленная ДО конца сеанса, недействительна: спросить
+       «как всё прошло» до окончания визита нельзя, значит это след сбоя,
+       а не настоящий опрос. Такая отметка не должна навсегда затыкать
+       настоящий вопрос — именно так у клиента пропал опрос 4 сентября. */
+    if (b.review_asked_at) {
+      const askedMs = new Date(b.review_asked_at).getTime();
+      const startMsChk = parseMinsKDt(b.booked_date, b.booked_time || "00:00:00").getTime();
+      const endMsChk = startMsChk + (+b.duration_min || 60) * 60000;
+      if (!Number.isFinite(askedMs) || askedMs >= endMsChk) continue;   // настоящая отметка
+      console.warn(`⏰ Опрос: отметка у записи ${b.id} стоит раньше конца сеанса — считаю её недействительной`);
+      await db.from("bookings").update({ review_asked_at: null }).eq("id", b.id);
+      b.review_asked_at = null;
+    }
     /* Когда спрашивать «как всё прошло».
        Раньше считали три часа от НАЧАЛА записи — для часового маникюра
        это два часа тишины после выхода из салона, а для окрашивания на
