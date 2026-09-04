@@ -1391,12 +1391,23 @@ const runReminders = async () => {
     if (!b.client_telegram_id) continue;
     const key = `${b.id}_review`;
     if (sentReminders.has(key) || b.review_asked_at) continue;
+    /* Когда спрашивать «как всё прошло».
+       Раньше считали три часа от НАЧАЛА записи — для часового маникюра
+       это два часа тишины после выхода из салона, а для окрашивания на
+       два с половиной часа вопрос прилетал, пока человек ещё в кресле.
+       Теперь точка отсчёта — конец сеанса:
+         • мастер нажал «Завершить» → сеанс точно окончен, ждём 15 минут;
+         • не нажал → считаем конец как начало плюс длительность услуги
+           и ждём час, чтобы человек успел дойти до дома. */
     const bookingUtc = parseMinsKDt(b.booked_date, b.booked_time || "00:00:00");
-    const hoursAgo   = (now - bookingUtc) / 3600000;
-    // Не раньше трёх часов после визита и не позже полутора суток.
-    // Верхняя граница была 4 часа при часовом тике — в это окно почти
-    // никогда не попадали, и опрос не приходил вообще.
-    if (hoursAgo < 3 || hoursAgo > 36) continue;
+    const endUtc     = bookingUtc + (+b.duration_min || 60) * 60000;
+    const finishedAt = b.completed_at ? new Date(b.completed_at).getTime() : null;
+    const minsSince  = finishedAt
+      ? (now - finishedAt) / 60000
+      : (now - endUtc) / 60000;
+    const waitMin    = finishedAt ? 15 : 60;
+    // Верхняя граница — полтора суток: позже спрашивать уже неуместно
+    if (minsSince < waitMin || minsSince > 36 * 60) continue;
 
     // Re-check fresh status — skip if booking was cancelled after the query ran
     const { data: fresh } = await db.from("bookings")
@@ -1421,7 +1432,7 @@ const runReminders = async () => {
       [[{ text: "⭐ Оставить отзыв", web_app: { url: reviewUrl } }]]
     );
     sentReminders.add(key);
-    console.log(`✉️  Review request sent: booking ${b.id}`);
+    console.log(`✉️  Опрос отправлен: запись ${b.id} (${finishedAt ? "через 15 мин после «Завершить»" : "через час после конца сеанса"})`);
   }
 
   console.log("⏰ Reminder check done");
