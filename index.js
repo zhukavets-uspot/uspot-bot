@@ -1387,8 +1387,16 @@ const runReminders = async () => {
     .in("booked_date", [todayStr, yesterdayStr]);
   if (eRev) console.error("⏰ Опрос после визита: запрос не выполнен —", eRev.message);
 
+  /* Один опрос одному человеку за проход. У Aksana было три записи за
+     день, и все три опроса пришли ей одной секундой подряд — три
+     одинаковых сообщения в чате. Даже когда каждое по отдельности
+     уместно, вместе они выглядят как поломка. Остальные уйдут
+     следующими проходами, с интервалом в пять минут. */
+  const askedThisRun = new Set();
+
   for (const b of pastBookings || []) {
     if (!b.client_telegram_id) continue;
+    if (askedThisRun.has(String(b.client_telegram_id))) continue;
     const key = `${b.id}_review`;
     if (sentReminders.has(key) || b.review_asked_at) continue;
     /* Когда спрашивать «как всё прошло».
@@ -1399,13 +1407,34 @@ const runReminders = async () => {
          • мастер нажал «Завершить» → сеанс точно окончен, ждём 15 минут;
          • не нажал → считаем конец как начало плюс длительность услуги
            и ждём час, чтобы человек успел дойти до дома. */
-    const bookingUtc = parseMinsKDt(b.booked_date, b.booked_time || "00:00:00");
-    const endUtc     = bookingUtc + (+b.duration_min || 60) * 60000;
+    /* Осторожно с типами: parseMinsKDt отдаёт объект даты, и «дата + число»
+       в JavaScript даёт СТРОКУ, а не время. Дальше вычитание даёт NaN, а
+       любое сравнение с NaN ложно — окно перестаёт что-либо ограничивать
+       и опрос уходит по каждой записи, включая будущую. Поэтому везде
+       работаем числами через getTime(). */
+    const startMs    = parseMinsKDt(b.booked_date, b.booked_time || "00:00:00").getTime();
+    const endMs      = startMs + (+b.duration_min || 60) * 60000;
     const finishedAt = b.completed_at ? new Date(b.completed_at).getTime() : null;
-    const minsSince  = finishedAt
-      ? (now - finishedAt) / 60000
-      : (now - endUtc) / 60000;
+    const nowMs      = now.getTime();
+    const baseMs     = finishedAt || endMs;
+    const minsSince  = (nowMs - baseMs) / 60000;
     const waitMin    = finishedAt ? 15 : 60;
+    /* Пояс безопасности: если расчёт вдруг снова окажется нечислом,
+       спрашивать «как всё прошло» до конца сеанса нельзя ни при каких
+       условиях. Проверка не зависит от арифметики выше. */
+    if (!Number.isFinite(minsSince)) {
+      console.error(`⏰ Опрос: не удалось вычислить время для записи ${b.id} — пропускаю`);
+      continue;
+    }
+    /* Пока мастер не нажал «Завершить», ориентируемся на расписание:
+       до конца сеанса спрашивать нельзя. Но если кнопка нажата — сеанс
+       окончен по факту, даже если управились раньше срока, и расписание
+       больше не указ. Отметку в будущем или раньше начала считаем битой. */
+    if (!finishedAt && nowMs < endMs) continue;
+    if (finishedAt && (finishedAt > nowMs || finishedAt < startMs)) {
+      console.warn(`⏰ Опрос: странная отметка завершения у записи ${b.id} — пропускаю`);
+      continue;
+    }
     // Верхняя граница — полтора суток: позже спрашивать уже неуместно
     if (minsSince < waitMin || minsSince > 36 * 60) continue;
 
@@ -1421,7 +1450,15 @@ const runReminders = async () => {
     const master = Array.isArray(b.masters) ? b.masters[0] : b.masters;
     const masterName = master?.name || b.master_name || null;
 
+    /* Пишем в лог, на каком основании решили спросить. Если опрос снова
+       уйдёт не вовремя, причина будет видна сразу, а не выводиться
+       рассуждением по коду. */
+    console.log(`⏰ Опрос по записи ${b.id}: визит ${b.booked_date} ${String(b.booked_time).slice(0,5)}, ` +
+      `длительность ${+b.duration_min || 60} мин, конец ${new Date(endMs).toISOString()}, ` +
+      `${finishedAt ? "завершено вручную " + new Date(finishedAt).toISOString() : "вручную не завершали"}, ` +
+      `сейчас ${new Date(nowMs).toISOString()}, прошло ${minsSince.toFixed(1)} мин, порог ${waitMin}`);
     if (!(await claimOnce(b.id, "review_asked_at"))) continue;
+    askedThisRun.add(String(b.client_telegram_id));
     const reviewStartapp = `review_${b.id}_${b.master_id}`;
     const reviewUrl = `${MINI_APP_URL}?startapp=${reviewStartapp}`;
 
