@@ -30,6 +30,13 @@ const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const PORT         = process.env.PORT || 3000;
 const MINI_APP_URL = process.env.MINI_APP_URL || "https://uspot.netlify.app";
 const MODERATION_URL = process.env.MODERATION_URL || "https://uspot-bot-production.up.railway.app/moderation";
+/* Страница модерации открыта по прямому адресу и ходит в базу публичным
+   ключом. Одобрять мастеров и салоны с открытой страницы нельзя, поэтому
+   решения идут через бот и требуют ключа. Ссылку с ключом бот присылает
+   фаундерам сам — вручную его вводить не нужно. */
+const MODERATION_KEY = process.env.MODERATION_KEY || "";
+const moderationLink = () =>
+  MODERATION_KEY ? `${MODERATION_URL}?k=${encodeURIComponent(MODERATION_KEY)}` : MODERATION_URL;
 
 // Google Calendar OAuth (set in Railway env vars)
 const GCAL_CLIENT_ID     = process.env.GCAL_CLIENT_ID     || "";
@@ -2395,12 +2402,138 @@ const askPhoneOnce = async (tgId) => {
 
 // ── POST /notify_moderation ────────────────────────────────
 app.post("/notify_moderation", async (req, res) => {
-  const { type, masterName, clientName, stars, preview } = req.body;
+  const { type } = req.body || {};
   if (!type) return res.status(400).json({ error: "Missing type" });
   try {
-    const result = await notifyModeration({ type, masterName, clientName, stars, preview, dashboardUrl: MODERATION_URL });
+    const result = await notifyModeration({ ...req.body, dashboardUrl: moderationLink() });
     res.json({ ok: true, ...result });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /moderation/decision ──────────────────────────────
+// Одобрение и отказ по мастерам и заявкам на салон. Приходит со страницы
+// модерации, ключ берётся из адреса этой страницы.
+app.post("/moderation/decision", async (req, res) => {
+  const { key, kind, id, action, reason } = req.body || {};
+  if (!MODERATION_KEY) {
+    return res.status(503).json({ error: "MODERATION_KEY не задан в переменных Railway — решения отключены" });
+  }
+  if (String(key || "") !== MODERATION_KEY) {
+    return res.status(403).json({ error: "Неверный ключ модерации. Откройте страницу по ссылке из чата фаундеров." });
+  }
+  if (!id || (action !== "approve" && action !== "decline")) {
+    return res.status(400).json({ error: "Нужны id и action" });
+  }
+  const why = String(reason || "").trim();
+  if (action === "decline" && !why) {
+    return res.status(400).json({ error: "Нужна причина отказа — её увидит человек" });
+  }
+  const now = new Date().toISOString();
+
+  try {
+    if (kind === "master") {
+      /* Обновляем только строку в статусе pending: два одновременных нажатия
+         не должны отправить человеку два сообщения. Кто первый — тот и решил. */
+      const { data, error } = await db.from("masters")
+        .update({
+          moderation_status: action === "approve" ? "approved" : "declined",
+          moderation_reason: action === "approve" ? null : why,
+          moderated_at: now,
+        })
+        .eq("id", id).eq("moderation_status", "pending")
+        .select("id, name, telegram_user_id");
+      if (error) return res.status(500).json({ error: error.message });
+      if (!data || data.length === 0) {
+        return res.json({ ok: true, changed: false, note: "Решение уже принято" });
+      }
+      const m = data[0];
+      if (m.telegram_user_id) {
+        if (action === "approve") {
+          await send(m.telegram_user_id,
+            `✅ <b>Профиль одобрен</b>\n\n` +
+            `${m.name}, вы в поиске Uspot — клиенты вас видят и могут записаться.\n` +
+            `Персональная ссылка в кабинете заработала: отправьте её своим клиентам.\n\n` +
+            `Дальнейшие правки профиля проверять не нужно — они применяются сразу.`,
+            [[{ text: "Открыть кабинет", url: MINI_APP_URL }]]);
+        } else {
+          await send(m.telegram_user_id,
+            `⚠️ <b>Профиль пока не прошёл проверку</b>\n\n` +
+            `${m.name}, вот что нужно поправить:\n«${why}»\n\n` +
+            `Откройте кабинет, внесите правки и нажмите «Отправить на проверку» — мы посмотрим ещё раз.`,
+            [[{ text: "Открыть кабинет", url: MINI_APP_URL }]]);
+        }
+      }
+      console.log(`🛡 Мастер ${m.name} → ${action}`);
+      return res.json({ ok: true, changed: true });
+    }
+
+    if (kind === "salon_app") {
+      const { data, error } = await db.from("salon_applications")
+        .update({
+          status: action === "approve" ? "approved" : "declined",
+          reason: action === "approve" ? null : why,
+          decided_at: now,
+        })
+        .eq("id", id).eq("status", "pending")
+        .select("id, salon_name, telegram_user_id");
+      if (error) return res.status(500).json({ error: error.message });
+      if (!data || data.length === 0) {
+        return res.json({ ok: true, changed: false, note: "Решение уже принято" });
+      }
+      const a = data[0];
+      if (a.telegram_user_id) {
+        if (action === "approve") {
+          await send(a.telegram_user_id,
+            `✅ <b>Заявка на салон одобрена</b>\n\n` +
+            `«${a.salon_name}» можно создавать.\n` +
+            `Откройте Uspot → «Вход для мастеров» → «Создать салон» — все шаги теперь доступны: ` +
+            `адрес и логотип, прайс, часы работы и мастера.\n\n` +
+            `После создания салона ничего согласовывать не нужно.`,
+            [[{ text: "Создать салон", url: MINI_APP_URL }]]);
+        } else {
+          await send(a.telegram_user_id,
+            `⚠️ <b>Заявка на салон отклонена</b>\n\n` +
+            `«${a.salon_name}»\n\nПричина:\n«${why}»\n\n` +
+            `Это не окончательно — поправьте и отправьте заявку заново в приложении.`,
+            [[{ text: "Открыть Uspot", url: MINI_APP_URL }]]);
+        }
+      }
+      console.log(`🛡 Заявка на салон «${a.salon_name}» → ${action}`);
+      return res.json({ ok: true, changed: true });
+    }
+
+    return res.status(400).json({ error: "Неизвестный kind" });
+  } catch (e) {
+    console.error("moderation/decision:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /moderation/resubmit ──────────────────────────────
+// Мастер поправил отклонённый профиль и просит посмотреть ещё раз.
+// Ключ не нужен: единственное, что можно этим сделать, — вернуть
+// собственную отклонённую строку в нашу очередь.
+app.post("/moderation/resubmit", async (req, res) => {
+  const { kind, id } = req.body || {};
+  if (kind !== "master" || !id) return res.status(400).json({ error: "Нужны kind=master и id" });
+  try {
+    const { data, error } = await db.from("masters")
+      .update({ moderation_status: "pending", moderation_reason: null, submitted_at: new Date().toISOString() })
+      .eq("id", id).eq("moderation_status", "declined")
+      .select("id, name, role, telegram_user_id");
+    if (error) return res.status(500).json({ error: error.message });
+    if (!data || data.length === 0) return res.json({ ok: true, changed: false });
+    const m = data[0];
+    await notifyModeration({
+      type: "master_new", masterName: m.name, role: m.role,
+      telegramId: m.telegram_user_id, repeat: true, dashboardUrl: moderationLink(),
+    });
+    console.log(`🛡 Мастер ${m.name} отправлен на повторную проверку`);
+    res.json({ ok: true, changed: true });
+  } catch (e) {
+    console.error("moderation/resubmit:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
