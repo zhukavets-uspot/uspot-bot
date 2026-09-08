@@ -660,6 +660,9 @@
     <button class="tab-btn" id="tab-salons" onclick="switchTab('salons')">
       🏛 Салоны <span class="badge" id="badge-salons">0</span>
     </button>
+    <button class="tab-btn" id="tab-registry" onclick="switchTab('registry')">
+      📒 Реестр <span class="badge" id="badge-registry">0</span>
+    </button>
   </div>
 
   <!-- Ключ модерации: без него решения по мастерам и салонам не проходят -->
@@ -751,6 +754,38 @@
       <div class="empty-sub">Новых обращений нет.</div>
     </div>
     <div id="salons-list" style="display:none"></div>
+  </div>
+
+  <!-- REGISTRY PANEL -->
+  <div class="tab-panel" id="panel-registry">
+    <div id="registry-loading" class="state-box">
+      <div class="spinner"></div>
+      <p>Собираем реестр…</p>
+    </div>
+    <div id="registry-error" class="error-box" style="display:none;">
+      <div class="error-box-icon">⚠️</div>
+      <div>
+        <h4>Не удалось собрать реестр</h4>
+        <p id="registry-error-msg"></p>
+      </div>
+    </div>
+    <div id="registry-empty" class="state-box" style="display:none;">
+      <div class="empty-icon">📭</div>
+      <div class="empty-title">Пока никого нет</div>
+      <div class="empty-sub">Ни мастеров, ни салонов в базе.</div>
+    </div>
+    <div id="registry-list" style="display:none">
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px">
+        <input id="registry-search" type="search" placeholder="Имя, УНП, Telegram ID, адрес…"
+          oninput="renderRegistry()"
+          style="flex:1;min-width:220px;padding:11px 14px;border:1px solid #e5e7eb;border-radius:12px;
+                 font-size:14px;font-family:inherit;outline:none">
+        <label style="display:flex;align-items:center;gap:7px;font-size:13px;color:#4b5563;cursor:pointer;white-space:nowrap">
+          <input type="checkbox" id="registry-only-gaps" onchange="renderRegistry()"> только с пробелами
+        </label>
+      </div>
+      <div id="registry-rows"></div>
+    </div>
   </div>
 
   <!-- SQL SETUP -->
@@ -899,6 +934,7 @@ let portfolioItems = [];
 let reviewItems = [];
 let masterItems = [];
 let salonItems = [];
+let registryRows = [];
 let activeTab = 'portfolio';
 
 /* Ключ модерации приходит в адресе страницы: бот присылает фаундерам
@@ -916,7 +952,7 @@ let _loadError = false;
 async function loadAll() {
   _loadError = false;
   animateRefresh(true);
-  await Promise.all([loadPortfolio(), loadReviews(), loadMasters(), loadSalonApps()]);
+  await Promise.all([loadPortfolio(), loadReviews(), loadMasters(), loadSalonApps(), loadRegistry()]);
   const warn = document.getElementById('nokey-warn');
   if (warn) warn.style.display = MOD_KEY ? 'none' : 'block';
   animateRefresh(false);
@@ -947,7 +983,7 @@ function updateConnection(ok) {
 // ── TAB SWITCH ───────────────────────────────────────────────────────────────
 function switchTab(name) {
   activeTab = name;
-  ['portfolio', 'reviews', 'masters', 'salons'].forEach(t => {
+  ['portfolio', 'reviews', 'masters', 'salons', 'registry'].forEach(t => {
     document.getElementById('tab-' + t).classList.toggle('active', t === name);
     document.getElementById('panel-' + t).classList.toggle('active', t === name);
   });
@@ -1296,6 +1332,171 @@ function approveMaster(id)    { decide('master',    id, 'approve', 'mcard-' + id
 function declineMaster(id)    { decide('master',    id, 'decline', 'mcard-' + id, 'masters', 'Мастер отклонён ❌'); }
 function approveSalonApp(id)  { decide('salon_app', id, 'approve', 'scard-' + id, 'salons',  'Создание салона разрешено ✅'); }
 function declineSalonApp(id)  { decide('salon_app', id, 'decline', 'scard-' + id, 'salons',  'Заявка отклонена ❌'); }
+
+// ── РЕЕСТР: все мастера и салоны ─────────────────────────────────────────────
+// Не очередь на модерацию, а справочник: посмотреть, что заполнено,
+// у кого пробелы, и как с человеком связаться, чтобы дозапросить.
+async function loadRegistry() {
+  showState('registry', 'loading');
+  try {
+    const { data: rows, error } = await sb.from('masters').select('*').order('created_at');
+    if (error) throw error;
+    const all = rows || [];
+    const ids = all.map(m => m.id);
+
+    // Считаем услуги, рабочие дни и портфолио одним запросом на таблицу
+    const [svcRes, schRes, portRes] = await Promise.all([
+      ids.length ? sb.from('services').select('master_id, is_active').in('master_id', ids) : {data: []},
+      ids.length ? sb.from('master_schedule').select('master_id, is_working').in('master_id', ids) : {data: []},
+      ids.length ? sb.from('portfolio').select('master_id, status').in('master_id', ids) : {data: []},
+    ]);
+    const cnt = (arr, keep) => {
+      const m = {};
+      (arr || []).forEach(x => { if (!keep || keep(x)) m[x.master_id] = (m[x.master_id] || 0) + 1; });
+      return m;
+    };
+    const svcN  = cnt(svcRes.data,  x => x.is_active !== false);
+    const dayN  = cnt(schRes.data,  x => x.is_working);
+    const portN = cnt(portRes.data, x => x.status === 'approved');
+
+    const salonName = {};
+    all.forEach(m => { if (m.kind === 'salon') salonName[m.id] = m.name; });
+
+    registryRows = all.map(m => {
+      const isSalon = m.kind === 'salon';
+      const gaps = [];
+      if (isSalon) {
+        if (!m.logo_url) gaps.push('логотип');
+        if (!(Array.isArray(m.photos) && m.photos.length)) gaps.push('фото салона');
+        if (!m.legal_name) gaps.push('юр. название');
+        if (!m.unp) gaps.push('УНП');
+        if (!m.legal_address) gaps.push('юр. адрес');
+        if (!m.director_name) gaps.push('ФИО директора');
+        if (!m.director_doc_no || !m.director_doc_date) gaps.push('документ директора');
+        if (!m.contact_phone) gaps.push('телефон');
+        if (!m.contact_email) gaps.push('почта');
+        if (!all.some(x => x.salon_id === m.id)) gaps.push('мастера');
+      } else {
+        if (!m.photo_url) gaps.push('фото');
+        if (!m.bio) gaps.push('описание');
+        if (!(svcN[m.id] > 0)) gaps.push('услуги');
+        if (!(dayN[m.id] > 0)) gaps.push('рабочие дни');
+        if (!m.telegram_user_id) gaps.push('Telegram');
+        if (m.kind !== 'salon_master' && !(portN[m.id] > 0)) gaps.push('портфолио');
+      }
+      if (!m.lat || !m.lng) gaps.push('точка на карте');
+      return { ...m, _svc: svcN[m.id] || 0, _days: dayN[m.id] || 0, _port: portN[m.id] || 0,
+               _gaps: gaps, _salonName: m.salon_id ? (salonName[m.salon_id] || '—') : null };
+    });
+
+    document.getElementById('badge-registry').textContent = registryRows.length;
+    if (!registryRows.length) { showState('registry', 'empty'); return; }
+    showState('registry', 'list');
+    renderRegistry();
+  } catch (err) {
+    console.error('Registry error:', err);
+    _loadError = true; updateConnection(false);
+    document.getElementById('registry-error-msg').textContent = err.message || 'Неизвестная ошибка.';
+    showState('registry', 'error');
+  }
+}
+
+function renderRegistry() {
+  const box = document.getElementById('registry-rows');
+  if (!box) return;
+  const q = (document.getElementById('registry-search').value || '').trim().toLowerCase();
+  const onlyGaps = document.getElementById('registry-only-gaps').checked;
+
+  const match = (m) => {
+    if (onlyGaps && m._gaps.length === 0) return false;
+    if (!q) return true;
+    return [m.name, m.legal_name, m.unp, m.telegram_user_id, m.location, m.role, m.contact_phone, m.contact_email]
+      .filter(Boolean).join(' ').toLowerCase().includes(q);
+  };
+
+  const groups = [
+    ['Салоны',           registryRows.filter(m => m.kind === 'salon'        && match(m))],
+    ['Частные мастера',  registryRows.filter(m => (m.kind || 'solo') === 'solo' && match(m))],
+    ['Мастера салонов',  registryRows.filter(m => m.kind === 'salon_master' && match(m))],
+  ];
+
+  const shown = groups.reduce((n, g) => n + g[1].length, 0);
+  box.innerHTML = '';
+  if (!shown) {
+    box.innerHTML = '<div style="padding:26px 0;text-align:center;color:#9ca3af;font-size:14px">Ничего не нашлось</div>';
+    return;
+  }
+  groups.forEach(([title, list]) => {
+    if (!list.length) return;
+    const h = document.createElement('div');
+    h.style.cssText = 'margin:18px 0 10px;font-size:13px;font-weight:700;color:#6b7280;text-transform:uppercase;letter-spacing:.04em';
+    h.textContent = title + ' · ' + list.length;
+    box.appendChild(h);
+    list.forEach(m => box.appendChild(buildRegistryCard(m)));
+  });
+}
+
+function buildRegistryCard(m) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  const isSalon = m.kind === 'salon';
+  const mod = m.moderation_status || 'approved';
+  const chip = (text, bg, color) =>
+    `<span style="background:${bg};color:${color};font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;white-space:nowrap">${text}</span>`;
+
+  const status = mod === 'pending'  ? chip('на проверке', '#fffbeb', '#b45309')
+               : mod === 'declined' ? chip('отклонён', '#fef2f2', '#b91c1c')
+               : m.is_active === false ? chip('скрыт', '#f3f4f6', '#6b7280')
+               : chip('в поиске', '#f0fdf4', '#15803d');
+
+  const facts = isSalon
+    ? [ m.legal_name ? esc(m.legal_name) : null,
+        m.unp ? 'УНП ' + esc(m.unp) : null,
+        m.contact_phone ? prettyPhone(m.contact_phone) : null,
+        m.contact_email ? esc(m.contact_email) : null,
+        (Array.isArray(m.addresses) && m.addresses.length > 1) ? ('адресов: ' + m.addresses.length) : null,
+        (Array.isArray(m.photos) && m.photos.length) ? ('фото: ' + m.photos.length) : null,
+      ].filter(Boolean).join(' · ')
+    : [ 'услуг: ' + m._svc,
+        'рабочих дней: ' + m._days,
+        'работ в портфолио: ' + m._port,
+        m.price_from ? ('от ' + m.price_from + ' BYN') : null,
+      ].filter(Boolean).join(' · ');
+
+  const gaps = m._gaps.length
+    ? `<div style="margin-top:10px;background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:9px 12px">
+         <div style="font-size:12px;font-weight:700;color:#b45309;margin-bottom:3px">Не заполнено</div>
+         <div style="font-size:12.5px;color:#92400e;line-height:1.5">${m._gaps.map(esc).join(', ')}</div>
+       </div>`
+    : `<div style="margin-top:10px;font-size:12.5px;color:#15803d;font-weight:600">Заполнено полностью</div>`;
+
+  card.innerHTML = `
+    <div class="card-body">
+      <div class="master-row">
+        <div class="master-avatar" style="background:${m.bg_color || '#ede9fe'}">${isSalon ? '🏛' : (m.emoji || '💅')}</div>
+        <div class="master-name">${esc(m.name || '—')}</div>
+        ${status}
+        <span class="master-date">${formatDate(m.created_at)}</span>
+      </div>
+      <div class="client-row">
+        <strong>${esc(m.role || (isSalon ? 'Салон красоты' : 'Мастер'))}</strong>
+        ${m._salonName ? `<span class="tag-chip">${esc(m._salonName)}</span>` : ''}
+        ${m.telegram_user_id ? `<span class="tg-id">${esc(m.telegram_user_id)}</span>` : ''}
+      </div>
+      <div style="font-size:13px;color:#4b5563;margin-top:8px">${esc(m.location || 'адрес не указан')}</div>
+      ${facts ? `<div style="font-size:12.5px;color:#6b7280;margin-top:6px">${facts}</div>` : ''}
+      ${gaps}
+    </div>
+  `;
+  return card;
+}
+
+// Телефон в базе канонический, человеку показываем читаемо
+function prettyPhone(v) {
+  const d = String(v || '').replace(/\D/g, '').replace(/^375/, '');
+  if (d.length !== 9) return esc(v || '');
+  return '+375 ' + d.slice(0, 2) + ' ' + d.slice(2, 5) + '-' + d.slice(5, 7) + '-' + d.slice(7, 9);
+}
 
 // ── SHOW STATE ───────────────────────────────────────────────────────────────
 function showState(type, state) {
