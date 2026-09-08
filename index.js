@@ -451,6 +451,19 @@ bot.onText(/\/start$/, async (msg) => {
 });
 
 // ── /test_notify — diagnostic endpoint via bot command ─────────────────
+/* /id — человек узнаёт свой Telegram ID.
+   Салон вводит его, чтобы привязать мастера или администратора: без ID
+   мастер не получает уведомлений о записях и не видит своё расписание. */
+bot.onText(/\/id/, async (msg) => {
+  const id = msg.from?.id;
+  const name = msg.from?.first_name || "";
+  await send(msg.chat.id,
+    `🆔 <b>Ваш Telegram ID</b>\n\n<code>${id}</code>\n\n` +
+    `${name ? name + ", п" : "П"}ередайте это число администратору салона — ` +
+    `он привяжет его к вашей карточке, и вам начнут приходить уведомления о записях.`
+  );
+});
+
 bot.onText(/\/test_notify/, async (msg) => {
   const chatId = msg.chat.id;
   await send(chatId,
