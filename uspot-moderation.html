@@ -654,6 +654,19 @@
     <button class="tab-btn" id="tab-reviews" onclick="switchTab('reviews')">
       ⭐ Отзывы <span class="badge" id="badge-reviews">0</span>
     </button>
+    <button class="tab-btn" id="tab-masters" onclick="switchTab('masters')">
+      🆕 Мастера <span class="badge" id="badge-masters">0</span>
+    </button>
+    <button class="tab-btn" id="tab-salons" onclick="switchTab('salons')">
+      🏛 Салоны <span class="badge" id="badge-salons">0</span>
+    </button>
+  </div>
+
+  <!-- Ключ модерации: без него решения по мастерам и салонам не проходят -->
+  <div id="nokey-warn" style="display:none;background:#FEF3C7;border:1px solid #FDE68A;
+    border-radius:12px;padding:12px 14px;margin-bottom:14px;font-size:13px;color:#92400E;line-height:1.5;">
+    <strong>Страница открыта без ключа.</strong> Смотреть очередь можно, а одобрять мастеров и салоны —
+    нет. Откройте её по ссылке из чата фаундеров: бот присылает адрес с ключом.
   </div>
 
   <!-- PORTFOLIO PANEL -->
@@ -696,6 +709,48 @@
       <div class="empty-sub">Все отзывы обработаны. Так держать!</div>
     </div>
     <div id="reviews-list" style="display:none"></div>
+  </div>
+
+  <!-- MASTERS PANEL -->
+  <div class="tab-panel" id="panel-masters">
+    <div id="masters-loading" class="state-box">
+      <div class="spinner"></div>
+      <p>Загружаем данные…</p>
+    </div>
+    <div id="masters-error" class="error-box" style="display:none;">
+      <div class="error-box-icon">⚠️</div>
+      <div>
+        <h4>Не удалось получить мастеров на проверке</h4>
+        <p id="masters-error-msg">Проверьте, что выполнен патч v20 (колонка moderation_status).</p>
+      </div>
+    </div>
+    <div id="masters-empty" class="state-box" style="display:none;">
+      <div class="empty-icon">🎉</div>
+      <div class="empty-title">Нет мастеров на проверке</div>
+      <div class="empty-sub">Все анкеты разобраны.</div>
+    </div>
+    <div id="masters-list" style="display:none"></div>
+  </div>
+
+  <!-- SALONS PANEL -->
+  <div class="tab-panel" id="panel-salons">
+    <div id="salons-loading" class="state-box">
+      <div class="spinner"></div>
+      <p>Загружаем данные…</p>
+    </div>
+    <div id="salons-error" class="error-box" style="display:none;">
+      <div class="error-box-icon">⚠️</div>
+      <div>
+        <h4>Не удалось получить заявки на салон</h4>
+        <p id="salons-error-msg">Проверьте, что выполнен патч v20 (таблица salon_applications).</p>
+      </div>
+    </div>
+    <div id="salons-empty" class="state-box" style="display:none;">
+      <div class="empty-icon">🎉</div>
+      <div class="empty-title">Нет заявок на салон</div>
+      <div class="empty-sub">Новых обращений нет.</div>
+    </div>
+    <div id="salons-list" style="display:none"></div>
   </div>
 
   <!-- SQL SETUP -->
@@ -842,7 +897,14 @@ const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
 // ── STATE ───────────────────────────────────────────────────────────────────
 let portfolioItems = [];
 let reviewItems = [];
+let masterItems = [];
+let salonItems = [];
 let activeTab = 'portfolio';
+
+/* Ключ модерации приходит в адресе страницы: бот присылает фаундерам
+   ссылку вида /moderation?k=… Решения по мастерам и салонам проходят
+   через бот и без ключа отклоняются — сама страница открыта всем. */
+const MOD_KEY = new URLSearchParams(location.search).get('k') || '';
 
 // ── INIT ────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
@@ -854,7 +916,9 @@ let _loadError = false;
 async function loadAll() {
   _loadError = false;
   animateRefresh(true);
-  await Promise.all([loadPortfolio(), loadReviews()]);
+  await Promise.all([loadPortfolio(), loadReviews(), loadMasters(), loadSalonApps()]);
+  const warn = document.getElementById('nokey-warn');
+  if (warn) warn.style.display = MOD_KEY ? 'none' : 'block';
   animateRefresh(false);
   if (!_loadError) updateConnection(true);
 }
@@ -883,7 +947,7 @@ function updateConnection(ok) {
 // ── TAB SWITCH ───────────────────────────────────────────────────────────────
 function switchTab(name) {
   activeTab = name;
-  ['portfolio', 'reviews'].forEach(t => {
+  ['portfolio', 'reviews', 'masters', 'salons'].forEach(t => {
     document.getElementById('tab-' + t).classList.toggle('active', t === name);
     document.getElementById('panel-' + t).classList.toggle('active', t === name);
   });
@@ -1014,6 +1078,224 @@ async function loadReviews() {
     showState('reviews', 'error');
   }
 }
+
+// ── LOAD MASTERS (анкеты на проверке) ────────────────────────────────────────
+async function loadMasters() {
+  showState('masters', 'loading');
+  try {
+    const { data, error } = await sb
+      .from('masters')
+      .select('*')
+      .eq('moderation_status', 'pending')
+      .order('submitted_at', { ascending: true });
+    if (error) throw error;
+
+    masterItems = data || [];
+    // Количество услуг — по нему сразу видно, заполнил человек анкету или бросил
+    if (masterItems.length) {
+      const ids = masterItems.map(m => m.id);
+      const { data: svc } = await sb.from('services').select('master_id').in('master_id', ids);
+      const cnt = {};
+      (svc || []).forEach(x => { cnt[x.master_id] = (cnt[x.master_id] || 0) + 1; });
+      masterItems.forEach(m => { m._svcCount = cnt[m.id] || 0; });
+    }
+    document.getElementById('badge-masters').textContent = masterItems.length;
+    if (!masterItems.length) { showState('masters', 'empty'); return; }
+    showState('masters', 'list');
+    renderMasters();
+  } catch (err) {
+    console.error('Masters error:', err);
+    _loadError = true; updateConnection(false);
+    document.getElementById('masters-error-msg').textContent =
+      err.message || 'Неизвестная ошибка. Проверьте патч v20.';
+    showState('masters', 'error');
+  }
+}
+
+// ── LOAD SALON APPLICATIONS ──────────────────────────────────────────────────
+async function loadSalonApps() {
+  showState('salons', 'loading');
+  try {
+    const { data, error } = await sb
+      .from('salon_applications')
+      .select('*')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true });
+    if (error) throw error;
+
+    salonItems = data || [];
+    // Есть ли у заявителя уже профили в Uspot — это меняет решение
+    if (salonItems.length) {
+      const tgs = [...new Set(salonItems.map(a => a.telegram_user_id).filter(Boolean))];
+      if (tgs.length) {
+        const { data: owned } = await sb.from('masters')
+          .select('id, name, kind, telegram_user_id').in('telegram_user_id', tgs);
+        const byTg = {};
+        (owned || []).forEach(m => { (byTg[m.telegram_user_id] = byTg[m.telegram_user_id] || []).push(m); });
+        salonItems.forEach(a => { a._owned = byTg[a.telegram_user_id] || []; });
+      }
+    }
+    document.getElementById('badge-salons').textContent = salonItems.length;
+    if (!salonItems.length) { showState('salons', 'empty'); return; }
+    showState('salons', 'list');
+    renderSalons();
+  } catch (err) {
+    console.error('Salon applications error:', err);
+    _loadError = true; updateConnection(false);
+    document.getElementById('salons-error-msg').textContent =
+      err.message || 'Неизвестная ошибка. Проверьте патч v20.';
+    showState('salons', 'error');
+  }
+}
+
+// ── RENDER MASTERS ───────────────────────────────────────────────────────────
+function renderMasters() {
+  const list = document.getElementById('masters-list');
+  list.innerHTML = '';
+  masterItems.forEach(m => list.appendChild(buildMasterCard(m)));
+}
+
+function buildMasterCard(m) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.id = 'mcard-' + m.id;
+
+  const bg = m.bg_color || '#ede9fe';
+  const emoji = m.emoji || '💅';
+  const date = formatDate(m.submitted_at || m.created_at);
+  const facts = [
+    'услуг: ' + (m._svcCount || 0),
+    'цена от: ' + (m.price_from ? m.price_from + ' BYN' : '—'),
+    'описание: ' + (m.bio ? 'есть' : 'нет'),
+    'фото: ' + (m.photo_url ? 'есть' : 'нет'),
+  ].join(' · ');
+
+  card.innerHTML = `
+    <div class="card-body">
+      <div class="master-row">
+        <div class="master-avatar" style="background:${bg}">${emoji}</div>
+        <div class="master-name">${esc(m.name || 'Мастер')}</div>
+        <span class="tag-chip">${esc(m.role || 'Мастер')}</span>
+        <span class="master-date">${date}</span>
+      </div>
+
+      <div class="client-row">
+        <strong>${esc(m.location || 'Минск')}</strong>
+        ${m.telegram_user_id ? `<span class="tg-id">${esc(m.telegram_user_id)}</span>` : ''}
+      </div>
+
+      ${m.photo_url ? `<div style="margin-top:10px"><img src="${esc(m.photo_url)}" alt=""
+        style="width:84px;height:84px;object-fit:cover;border-radius:14px;cursor:zoom-in"
+        onclick="openLightbox('${esc(m.photo_url)}')"></div>` : ''}
+
+      <div class="field-label">Анкета</div>
+      <div style="font-size:13px;color:#4b5563">${facts}</div>
+      ${m.bio ? `<div style="font-size:13px;color:#4b5563;margin-top:8px;line-height:1.5">${esc(m.bio)}</div>` : ''}
+
+      <div class="field-label">Причина отказа — её увидит мастер</div>
+      <textarea class="editable-text" id="why-${m.id}" placeholder="Заполните, если отклоняете"></textarea>
+
+      <div class="card-actions">
+        <button class="btn-approve" onclick="approveMaster('${m.id}')">✅ Одобрить</button>
+        <button class="btn-decline" onclick="declineMaster('${m.id}')">❌ Отклонить</button>
+        <span class="mod-note">После одобрения мастер появляется в поиске</span>
+      </div>
+    </div>
+  `;
+  return card;
+}
+
+// ── RENDER SALON APPLICATIONS ────────────────────────────────────────────────
+function renderSalons() {
+  const list = document.getElementById('salons-list');
+  list.innerHTML = '';
+  salonItems.forEach(a => list.appendChild(buildSalonCard(a)));
+}
+
+function buildSalonCard(a) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.id = 'scard-' + a.id;
+
+  const date = formatDate(a.created_at);
+  const owned = a._owned || [];
+  const ownedLine = owned.length
+    ? owned.map(o => esc(o.name) + ' (' + (o.kind === 'salon' ? 'салон' : o.kind === 'salon_master' ? 'мастер салона' : 'частный мастер') + ')').join(', ')
+    : 'профилей в Uspot пока нет';
+
+  card.innerHTML = `
+    <div class="card-body">
+      <div class="master-row">
+        <div class="master-avatar" style="background:#ede9fe">🏛</div>
+        <div class="master-name">${esc(a.salon_name || 'Салон')}</div>
+        <span class="master-date">${date}</span>
+      </div>
+
+      <div class="client-row">
+        <strong>${esc(a.applicant_name || 'Заявитель')}</strong>
+        ${a.applicant_username ? `<span class="tg-id">@${esc(a.applicant_username)}</span>` : ''}
+      </div>
+
+      <div class="field-label">Связь</div>
+      <div style="font-size:13px;color:#4b5563">${esc(a.contact || '—')}${a.telegram_user_id ? ' · Telegram ID ' + esc(a.telegram_user_id) : ''}</div>
+
+      <div class="field-label">Уже в Uspot</div>
+      <div style="font-size:13px;color:#4b5563">${ownedLine}</div>
+
+      <div class="field-label">Причина отказа — её увидит заявитель</div>
+      <textarea class="editable-text" id="why-${a.id}" placeholder="Заполните, если отклоняете"></textarea>
+
+      <div class="card-actions">
+        <button class="btn-approve" onclick="approveSalonApp('${a.id}')">✅ Разрешить создать</button>
+        <button class="btn-decline" onclick="declineSalonApp('${a.id}')">❌ Отклонить</button>
+        <span class="mod-note">После разрешения салон он создаёт сам, без модерации</span>
+      </div>
+    </div>
+  `;
+  return card;
+}
+
+// ── РЕШЕНИЕ ──────────────────────────────────────────────────────────────────
+// Решения по мастерам и салонам идут через бот: там сервисный ключ, там же
+// отправка сообщения человеку. Страница сама статусы не меняет.
+async function decide(kind, id, action, cardId, panel, okMsg) {
+  const card = document.getElementById(cardId);
+  if (!card) return;
+  if (!MOD_KEY) {
+    toast('Нет ключа модерации — откройте страницу по ссылке из чата фаундеров', 'err');
+    return;
+  }
+  let reason = '';
+  if (action === 'decline') {
+    const ta = document.getElementById('why-' + id);
+    reason = ta ? ta.value.trim() : '';
+    if (!reason) {
+      toast('Напишите причину — её увидит человек', 'err');
+      if (ta) ta.focus();
+      return;
+    }
+  }
+  setCardBusy(card, true);
+  try {
+    const r = await fetch('/moderation/decision', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: MOD_KEY, kind, id, action, reason }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    dismissCard(card, panel, id, j.changed === false ? (j.note || 'Решение уже было принято') : okMsg);
+  } catch (err) {
+    console.error(err);
+    toast('Ошибка: ' + (err.message || 'не удалось сохранить'), 'err');
+    setCardBusy(card, false);
+  }
+}
+
+function approveMaster(id)    { decide('master',    id, 'approve', 'mcard-' + id, 'masters', 'Мастер одобрен ✅'); }
+function declineMaster(id)    { decide('master',    id, 'decline', 'mcard-' + id, 'masters', 'Мастер отклонён ❌'); }
+function approveSalonApp(id)  { decide('salon_app', id, 'approve', 'scard-' + id, 'salons',  'Создание салона разрешено ✅'); }
+function declineSalonApp(id)  { decide('salon_app', id, 'decline', 'scard-' + id, 'salons',  'Заявка отклонена ❌'); }
 
 // ── SHOW STATE ───────────────────────────────────────────────────────────────
 function showState(type, state) {
@@ -1321,6 +1603,18 @@ function dismissCard(card, type, id, message) {
     document.getElementById('badge-portfolio').textContent = portfolioItems.length;
     if (portfolioItems.length === 0) {
       setTimeout(() => showState('portfolio', 'empty'), 450);
+    }
+  } else if (type === 'masters') {
+    masterItems = masterItems.filter(i => i.id !== id);
+    document.getElementById('badge-masters').textContent = masterItems.length;
+    if (masterItems.length === 0) {
+      setTimeout(() => showState('masters', 'empty'), 450);
+    }
+  } else if (type === 'salons') {
+    salonItems = salonItems.filter(i => i.id !== id);
+    document.getElementById('badge-salons').textContent = salonItems.length;
+    if (salonItems.length === 0) {
+      setTimeout(() => showState('salons', 'empty'), 450);
     }
   } else {
     reviewItems = reviewItems.filter(i => i.id !== id);

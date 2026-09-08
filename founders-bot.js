@@ -525,7 +525,8 @@ const notifyFeedback = async ({ message, user_name, user_telegram_id, user_role 
 // ════════════════════════════════════════════════════════════
 // MODERATION — notify founders when portfolio/review needs review
 // ════════════════════════════════════════════════════════════
-const notifyModeration = async ({ type, masterName, clientName, stars, preview, dashboardUrl }) => {
+const notifyModeration = async ({ type, masterName, clientName, stars, preview, dashboardUrl,
+                                  role, telegramId, salonName, applicantName, contact, repeat }) => {
   if (registeredFounders.size === 0) {
     console.warn("[Founders] notifyModeration: no registered founders to notify");
     return { sent: 0 };
@@ -535,7 +536,27 @@ const notifyModeration = async ({ type, masterName, clientName, stars, preview, 
   const isPortfolio = type === "portfolio";
 
   let text = "";
-  if (isReview) {
+  if (type === "master_new") {
+    // Мастер закончил онбординг. Кабинет у него уже есть, в поиск попадёт
+    // после нашего «ок». Дальнейшие правки профиля не модерируются.
+    text =
+      (repeat ? `🔁 <b>Мастер поправил профиль и просит проверить снова</b>\n\n`
+              : `🆕 <b>Новый мастер на модерации</b>\n\n`) +
+      `👩‍🎨 <b>${masterName || "Мастер"}</b>\n` +
+      (role ? `💼 ${role}\n` : "") +
+      (telegramId ? `🆔 ${telegramId}\n` : "") +
+      `\nПока не одобрим — его не видно в поиске.\nОткройте дашборд 👇`;
+  } else if (type === "salon_request") {
+    // Заявка приходит ДО создания салона: сам путь создания закрыт,
+    // пока мы не подтвердим, что этому человеку можно завести салон.
+    text =
+      `🏛 <b>Заявка на создание салона</b>\n\n` +
+      `🏷 <b>${salonName || "Салон"}</b>\n` +
+      (applicantName ? `👤 ${applicantName}\n` : "") +
+      (contact ? `📞 ${contact}\n` : "") +
+      (telegramId ? `🆔 ${telegramId}\n` : "") +
+      `\nПуть создания салона закрыт до вашего решения.\nОткройте дашборд 👇`;
+  } else if (isReview) {
     const starsStr = stars ? `${"⭐".repeat(Math.min(stars, 5))} (${stars}/5)` : "";
     text =
       `⭐ <b>Новый отзыв на модерации</b>\n\n` +
