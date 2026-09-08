@@ -386,7 +386,7 @@ const getMasterFull = async (masterId) => {
   const hit = masterCache1h.get(masterId);
   if (hit && Date.now() - hit.t < 60 * 60 * 1000) return hit.m;
   const { data } = await db.from("masters")
-    .select("name, telegram_user_id, location, city, lat, lng").eq("id", masterId).single();
+    .select("name, telegram_user_id, location, city, lat, lng, salon_id").eq("id", masterId).single();
   masterCache1h.set(masterId, { m: data || null, t: Date.now() });
   return data || null;
 };
@@ -664,6 +664,12 @@ const subNewBookings = () => {
         console.error("GCal push (new booking):", e.message)
       );
     }
+    /* То же событие — в календарь салона. Отдельно от мастерского: у
+       мастеров салона Telegram чаще всего нет, и без этого календарь
+       салона не получал бы вообще ничего. */
+    pushSalonGcal(b, masterName, b.status === "pending").catch(e =>
+      console.error("GCal салона (новая запись):", e.message)
+    );
     // То же событие — в календарь клиента, если он подключал свой
     pushClientGcal(b, masterName, b.status === "pending").catch(e =>
       console.error("GCal клиента (новая запись):", e.message)
@@ -738,11 +744,16 @@ const subBookingUpdates = () => {
         }
         // Календарь: убираем у прежнего мастера, заводим у нового
         await deleteFromGcal(b.id).catch(() => {});
+        await deleteFromGcal(b.id, "salon").catch(() => {});
         await db.from("bookings").update({ gcal_event_id: null, gcal_calendar_id: null }).eq("id", b.id);
         if (newM?.telegram_user_id) {
           pushToGcal({ ...b, gcal_event_id: null }, newM.telegram_user_id, newM.name || "Мастер",
                      b.status === "pending").catch(e => console.error("GCal reassign:", e.message));
         }
+        // В календаре салона событие тоже пересоздаём: в нём сменился мастер
+        // b уже обновлён: b.master_id — новый мастер
+        pushSalonGcal({ ...b, salon_gcal_event_id: null }, newM?.name || "Мастер", b.status === "pending")
+          .catch(e => console.error("GCal салона (передача):", e.message));
         // У клиента событие не удаляем, а переписываем: время то же, мастер другой
         updateClientGcal(b, newM?.name || "Мастер", b.status === "pending")
           .catch(e => console.error("GCal клиента (передача):", e.message));
@@ -820,6 +831,9 @@ const subBookingUpdates = () => {
           );
         });
       }
+      confirmSalonGcal(b.id, b.master_id, masterName).catch(() =>
+        pushSalonGcal({ ...b, salon_gcal_event_id: null }, masterName, false).catch(e =>
+          console.error("GCal салона (подтверждение):", e.message)));
     }
 
     // → declined (master can't make it)
@@ -836,6 +850,7 @@ const subBookingUpdates = () => {
       // Remove from GCal if exists
       closeMasterCard(b.id, "⏰ <b>Вы отклонили запись</b>").catch(() => {});
       deleteFromGcal(b.id).catch(() => {});
+      deleteFromGcal(b.id, "salon").catch(() => {});
       deleteClientGcal(b.id).catch(() => {});
     }
 
@@ -867,6 +882,7 @@ const subBookingUpdates = () => {
           ? "📅 <b>Клиент переносит запись</b>"
           : "❌ <b>Запись отменена клиентом</b>").catch(() => {});
         deleteFromGcal(b.id).catch(() => {});
+        deleteFromGcal(b.id, "salon").catch(() => {});
         deleteClientGcal(b.id).catch(() => {});
       } else if (reason.startsWith("master:") || reason === "force_majeure") {
         /* Отмену через удаление события в календаре клиенту сообщает сама
@@ -886,6 +902,7 @@ const subBookingUpdates = () => {
         }
         closeMasterCard(b.id, "❌ <b>Запись отменена</b>").catch(() => {});
         deleteFromGcal(b.id).catch(() => {});
+        deleteFromGcal(b.id, "salon").catch(() => {});
         deleteClientGcal(b.id).catch(() => {});
       }
     }
@@ -1140,6 +1157,9 @@ bot.on("callback_query", async (query) => {
         .then(() => mFull?.telegram_user_id &&
           pushToGcal({ ...moved, gcal_event_id: null }, mFull.telegram_user_id, mFull.name || "Мастер", false))
         .catch((e) => console.error("GCal перенос (мастер):", e.message));
+      deleteFromGcal(bookingId, "salon")
+        .then(() => pushSalonGcal({ ...moved, salon_gcal_event_id: null }, mFull?.name || "Мастер", false))
+        .catch((e) => console.error("GCal перенос (салон):", e.message));
       updateClientGcal(moved, mFull?.name || "Мастер", false)
         .catch((e) => console.error("GCal перенос (клиент):", e.message));
       console.log(`📅 Перенос подтверждён клиентом: ${bookingId} → ${iso} ${time}`);
@@ -1585,7 +1605,26 @@ const ensureUspotCalendar = async (_auth) => "primary";
 
 // Push a booking to master's Google Calendar
 // isPending=true → grey "tentative" event; false → green "confirmed"
-const pushToGcal = async (booking, masterTgId, masterName, isPending = false) => {
+/* Одно и то же событие живёт в трёх календарях: мастера, клиента и салона.
+   Колонки у каждого свои, поэтому цель передаём явно. */
+const GCAL_COLS = {
+  master: { ev: "gcal_event_id",       cal: "gcal_calendar_id" },
+  salon:  { ev: "salon_gcal_event_id", cal: "salon_gcal_calendar_id" },
+};
+
+/* Календарь салона принадлежит Telegram, записанному на строке салона —
+   это директор или тот, кого он поставил владельцем кабинета. У мастеров
+   салона Telegram чаще всего нет вовсе, поэтому привязка к салону, а не
+   к исполнителю, — единственный способ, чтобы календарь вообще работал. */
+const salonTgFor = async (masterId) => {
+  const m = await getMasterFull(masterId);
+  if (!m?.salon_id) return null;
+  const { data } = await db.from("masters")
+    .select("telegram_user_id").eq("id", m.salon_id).single();
+  return data?.telegram_user_id ? String(data.telegram_user_id) : null;
+};
+
+const pushToGcal = async (booking, masterTgId, masterName, isPending = false, target = "master") => {
   if (!google || !GCAL_CLIENT_ID) { console.log("GCal: googleapis or client_id missing"); return; }
   const auth = await getMasterOAuth2(masterTgId);
   if (!auth) {
@@ -1611,12 +1650,16 @@ const pushToGcal = async (booking, masterTgId, masterName, isPending = false) =>
   const endMinsKMs = startMs + dur * 60000 + 3 * 60 * 60 * 1000;
   const endIso     = new Date(endMinsKMs).toISOString().slice(0, 19);
 
+  /* В календаре салона мастеров много — без имени исполнителя событие
+     невозможно прочитать. У мастера в его личном календаре имя лишнее. */
+  const who = target === "salon" && masterName ? ` · ${masterName}` : "";
   const event = {
     summary: isPending
-      ? `⏳ ${booking.service_name || "Услуга"} — ${booking.client_name || "Клиент"} (ожидает)`
-      : `✅ ${booking.service_name || "Услуга"} — ${booking.client_name || "Клиент"}`,
+      ? `⏳ ${booking.service_name || "Услуга"} — ${booking.client_name || "Клиент"}${who} (ожидает)`
+      : `✅ ${booking.service_name || "Услуга"} — ${booking.client_name || "Клиент"}${who}`,
     description:
       `Клиент: ${booking.client_name || "—"}\n` +
+      (target === "salon" ? `Мастер: ${masterName || "—"}\n` : "") +
       `Услуга: ${booking.service_name || "—"}\n` +
       `Цена: ${booking.total_price ? booking.total_price + " BYN" : "—"}\n` +
       (booking.client_notes ? `Пожелания: ${booking.client_notes}\n` : "") +
@@ -1637,10 +1680,11 @@ const pushToGcal = async (booking, masterTgId, masterName, isPending = false) =>
       calendarId: calId,
       requestBody: event,
     });
+    const C = GCAL_COLS[target] || GCAL_COLS.master;
     await db.from("bookings")
-      .update({ gcal_event_id: created.id, gcal_calendar_id: calId })
+      .update({ [C.ev]: created.id, [C.cal]: calId })
       .eq("id", booking.id);
-    console.log(`✅ GCal event created (${isPending?"pending":"confirmed"}): ${created.id} for booking ${booking.id}`);
+    console.log(`✅ GCal (${target}) event created (${isPending?"pending":"confirmed"}): ${created.id} for booking ${booking.id}`);
   } catch (e) {
     if (isDeadGrant(e)) { await dropDeadGrant(masterTgId, "запись в календарь мастера"); return; }
     if (e.message?.includes("Insufficient Permission")) {
@@ -1754,53 +1798,71 @@ const deleteClientGcal = async (bookingId) => {
   }
 };
 
-const confirmGcalEvent = async (bookingId, masterTgId) => {
+const confirmGcalEvent = async (bookingId, masterTgId, target = "master", masterName = "") => {
   if (!google || !GCAL_CLIENT_ID) return;
+  const C = GCAL_COLS[target] || GCAL_COLS.master;
   try {
     const { data: bk } = await db.from("bookings")
-      .select("gcal_event_id, gcal_calendar_id, service_name, client_name")
+      .select(`${C.ev}, ${C.cal}, service_name, client_name`)
       .eq("id", bookingId).single();
-    if (!bk?.gcal_event_id) return;
+    if (!bk?.[C.ev]) return;
     const auth = await getMasterOAuth2(masterTgId);
     if (!auth) return;
+    const who = target === "salon" && masterName ? ` · ${masterName}` : "";
     const calendar = google.calendar({ version: "v3", auth });
     await calendar.events.patch({
-      calendarId: bk.gcal_calendar_id,
-      eventId: bk.gcal_event_id,
+      calendarId: bk[C.cal],
+      eventId: bk[C.ev],
       requestBody: {
-        summary: `✅ ${bk.service_name || "Услуга"} — ${bk.client_name || "Клиент"}`,
+        summary: `✅ ${bk.service_name || "Услуга"} — ${bk.client_name || "Клиент"}${who}`,
         status: "confirmed",
         colorId: "3", // green
       },
     });
-    console.log(`✅ GCal event updated to confirmed: ${bk.gcal_event_id}`);
+    console.log(`✅ GCal (${target}) event updated to confirmed: ${bk[C.ev]}`);
   } catch (e) {
-    console.error("GCal confirm update failed:", e.message);
+    console.error(`GCal (${target}) confirm update failed:`, e.message);
   }
 };
 
 // Delete calendar event when booking is cancelled
-const deleteFromGcal = async (bookingId) => {
+const deleteFromGcal = async (bookingId, target = "master") => {
   if (!google || !GCAL_CLIENT_ID) return;
+  const C = GCAL_COLS[target] || GCAL_COLS.master;
   const { data: bk } = await db.from("bookings")
-    .select("gcal_event_id, gcal_calendar_id, master_id")
+    .select(`${C.ev}, ${C.cal}, master_id`)
     .eq("id", bookingId).single();
-  if (!bk?.gcal_event_id) return;
+  if (!bk?.[C.ev]) return;
 
-  // Get master tg id
-  const { data: m } = await db.from("masters")
-    .select("telegram_user_id").eq("id", bk.master_id).single();
-  if (!m?.telegram_user_id) return;
+  // Чей календарь: у салона — его собственный Telegram, у мастера — свой
+  const ownerTg = target === "salon"
+    ? await salonTgFor(bk.master_id)
+    : (await getMasterFull(bk.master_id))?.telegram_user_id;
+  if (!ownerTg) return;
 
-  const auth = await getMasterOAuth2(m.telegram_user_id);
+  const auth = await getMasterOAuth2(String(ownerTg));
   if (!auth) return;
   const calendar = google.calendar({ version: "v3", auth });
   try {
-    await calendar.events.delete({ calendarId: bk.gcal_calendar_id, eventId: bk.gcal_event_id });
-    console.log(`🗑️  GCal event deleted for booking ${bookingId}`);
+    await calendar.events.delete({ calendarId: bk[C.cal], eventId: bk[C.ev] });
+    await db.from("bookings").update({ [C.ev]: null, [C.cal]: null }).eq("id", bookingId);
+    console.log(`🗑️  GCal (${target}) event deleted for booking ${bookingId}`);
   } catch (e) {
-    console.warn("GCal delete failed:", e.message);
+    console.warn(`GCal (${target}) delete failed:`, e.message);
   }
+};
+
+/* Обёртка: то же событие в календарь салона. Вызывается рядом с мастерским,
+   отдельно — потому что у салона свой владелец и свои колонки. */
+const pushSalonGcal = async (booking, masterName, isPending = false) => {
+  const tg = await salonTgFor(booking.master_id);
+  if (!tg) return;                      // запись не салонная или салон без Telegram
+  await pushToGcal(booking, tg, masterName, isPending, "salon");
+};
+const confirmSalonGcal = async (bookingId, masterId, masterName) => {
+  const tg = await salonTgFor(masterId);
+  if (!tg) return;
+  await confirmGcalEvent(bookingId, tg, "salon", masterName);
 };
 
 // ════════════════════════════════════════════════════════════
@@ -1863,6 +1925,14 @@ const reconcileBookings = async () => {
       }
       const m  = masterCache[b.master_id];
       const tg = m.telegram_user_id ? String(m.telegram_user_id) : null;
+
+      /* (a0) Календарь салона: у мастеров салона Telegram обычно нет,
+         поэтому проверка connected по мастеру сюда не годится — сверяем
+         отдельно по самой записи. */
+      if (!b.salon_gcal_event_id && b.salon_id) {
+        try { await pushSalonGcal(b, m.name || "Мастер", b.status === "pending"); }
+        catch (e) { console.error(`🩹 Reconcile: GCal салона для ${b.id}:`, e.message); }
+      }
 
       // (a) Calendar catch-up
       if (!b.gcal_event_id && tg && connected.has(tg)) {
