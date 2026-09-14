@@ -11,12 +11,15 @@
 //   /start   — register for notifications
 //   /today   — all bookings for today with status
 //   /recent  — last 5 bookings
+//   /pending — bookings the master has not confirmed yet
 //   /stats   — 7-day summary (count, revenue, cancellations)
 //   /help    — command list
 //
 // Notifications:
 //   • Every new booking (Realtime INSERT)
 //   • Booking cancelled (Realtime UPDATE → cancelled)
+//   • Master is not confirming / booking expired unconfirmed
+//     (sent by index.js through notifyFounders)
 // ============================================================
 
 const TelegramBot = require("node-telegram-bot-api");
@@ -32,6 +35,7 @@ if (!FOUNDERS_BOT_TOKEN) {
   module.exports = {
     notifyFeedback: async () => ({ sent: 0 }),
     notifyModeration: async () => ({ sent: 0 }),
+    notifyFounders: async () => ({ sent: 0 }),
     setMainBot: () => {},
     processFoundersUpdate: () => {},
     setFoundersWebhook: async () => {},
@@ -58,21 +62,26 @@ const db  = createClient(SUPABASE_URL, SUPABASE_KEY);
 const registeredFounders = new Set();
 
 // ── Helpers ──────────────────────────────────────────────────
-const send = async (chatId, text) => {
+const send = async (chatId, text, { silent = false } = {}) => {
   try {
     await bot.sendMessage(String(chatId), text, {
       parse_mode: "HTML",
       disable_web_page_preview: true,
+      disable_notification: silent,
     });
+    return true;
   } catch (e) {
     console.error(`[Founders] Failed to send to ${chatId}:`, e.message);
+    return false;
   }
 };
 
-const broadcast = async (text) => {
+const broadcast = async (text, opts) => {
+  let sent = 0;
   for (const chatId of registeredFounders) {
-    await send(chatId, text);
+    if (await send(chatId, text, opts)) sent++;
   }
+  return sent;
 };
 
 const M = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
@@ -82,7 +91,16 @@ const dateRu = (iso) => {
   return `${d.getDate()} ${M[d.getMonth()]}`;
 };
 const t5 = (t) => (t || "").substring(0, 5);
-const STATUS = { pending: "🟡", confirmed: "🟢", completed: "✅", cancelled: "❌" };
+/* Запись, которую мастер так и не подтвердил, лежит в базе как отменённая
+   с причиной expired. Для нас это не отмена, а провал — у неё свой значок. */
+const STATUS = { pending: "🟡", confirmed: "🟢", completed: "✅", cancelled: "❌", declined: "🟠" };
+const statusIcon = (b) =>
+  b.status === "cancelled" && b.cancel_reason === "expired" ? "⌛" : (STATUS[b.status] || "⚪");
+
+/* У bookings две ссылки на masters — master_id и salon_id. Без явного
+   указания связи PostgREST отказывается выполнять запрос (PGRST201), и
+   /today, /recent и /stats отвечали «Ошибка при получении данных». */
+const MASTER_EMBED = "masters!bookings_master_id_fkey(name)";
 
 const minskToday = (offsetDays = 0) => {
   const MINSK_OFFSET_MS = 3 * 60 * 60 * 1000;
@@ -140,10 +158,13 @@ bot.onText(/\/start/, async (msg) => {
     `Добро пожаловать в <b>Uspot Founders</b> — ваш приватный канал акционера.\n\n` +
     `Вы будете получать:\n` +
     `📅 Уведомление о каждой новой записи\n` +
-    `❌ Уведомление об отменах\n\n` +
+    `❌ Уведомление об отменах\n` +
+    `🟡 Сигнал, если мастер не подтверждает запись\n` +
+    `⌛ Сигнал, если запись сгорела без ответа мастера\n\n` +
     `Команды для аналитики:\n` +
     `/today — все записи на сегодня\n` +
     `/recent — последние 5 записей\n` +
+    `/pending — записи, которые ждут подтверждения\n` +
     `/stats — сводка за 7 дней\n` +
     `/help — список команд\n\n` +
     `Уведомления подключены. 💜`
@@ -157,10 +178,11 @@ bot.onText(/\/help/, async (msg) => {
 
   await send(chatId,
     `<b>Uspot Founders — команды</b>\n\n` +
-    `/today  — записи на сегодня\n` +
-    `/recent — последние 5 записей\n` +
-    `/stats  — сводка за 7 дней\n` +
-    `/help   — этот список`
+    `/today   — записи на сегодня\n` +
+    `/recent  — последние 5 записей\n` +
+    `/pending — ждут подтверждения мастера\n` +
+    `/stats   — сводка за 7 дней\n` +
+    `/help    — этот список`
   );
 });
 
@@ -173,11 +195,11 @@ bot.onText(/\/today/, async (msg) => {
 
   const { data, error } = await db
     .from("bookings")
-    .select("*, masters(name)")
+    .select(`*, ${MASTER_EMBED}`)
     .eq("booked_date", todayStr)
     .order("booked_time", { ascending: true });
 
-  if (error) { await send(chatId, "⚠️ Ошибка при получении данных."); return; }
+  if (error) { console.error("[Founders] /today:", error.message); await send(chatId, "⚠️ Ошибка при получении данных."); return; }
 
   // Filter out manual calendar blocks
   const bookings = (data || []).filter((b) => !b.client_name?.startsWith("🔒"));
@@ -189,7 +211,7 @@ bot.onText(/\/today/, async (msg) => {
 
   const lines = bookings.map((b) => {
     const m   = Array.isArray(b.masters) ? b.masters[0] : b.masters;
-    const s   = STATUS[b.status] || "⚪";
+    const s   = statusIcon(b);
     const who = b.client_name || "—";
     const to  = m?.name || b.master_name || "—";
     const svc = b.service_name ? ` · ${b.service_name}` : "";
@@ -198,7 +220,7 @@ bot.onText(/\/today/, async (msg) => {
   });
 
   const activeRevenue = bookings
-    .filter((b) => b.status !== "cancelled")
+    .filter((b) => b.status === "confirmed" || b.status === "completed")
     .reduce((sum, b) => sum + (b.total_price || 0), 0);
 
   await send(chatId,
@@ -215,12 +237,12 @@ bot.onText(/\/recent/, async (msg) => {
 
   const { data, error } = await db
     .from("bookings")
-    .select("*, masters(name)")
+    .select(`*, ${MASTER_EMBED}`)
     .not("client_name", "like", "🔒%")
     .order("created_at", { ascending: false })
     .limit(5);
 
-  if (error) { await send(chatId, "⚠️ Ошибка при получении данных."); return; }
+  if (error) { console.error("[Founders] /recent:", error.message); await send(chatId, "⚠️ Ошибка при получении данных."); return; }
 
   if (!data?.length) {
     await send(chatId, "📋 Записей пока нет.");
@@ -229,7 +251,7 @@ bot.onText(/\/recent/, async (msg) => {
 
   const lines = data.map((b) => {
     const m   = Array.isArray(b.masters) ? b.masters[0] : b.masters;
-    const s   = STATUS[b.status] || "⚪";
+    const s   = statusIcon(b);
     const prc = b.total_price ? `${b.total_price} BYN` : "—";
     return (
       `${s} ${dateRu(b.booked_date)} ${t5(b.booked_time)} · ` +
@@ -253,25 +275,28 @@ bot.onText(/\/stats/, async (msg) => {
 
   const { data, error } = await db
     .from("bookings")
-    .select("status, total_price, master_name, masters(name)")
+    .select(`status, cancel_reason, total_price, master_name, ${MASTER_EMBED}`)
     .gte("booked_date", weekAgo)
     .lte("booked_date", todayStr)
     .not("client_name", "like", "🔒%");
 
-  if (error) { await send(chatId, "⚠️ Ошибка при получении данных."); return; }
+  if (error) { console.error("[Founders] /stats:", error.message); await send(chatId, "⚠️ Ошибка при получении данных."); return; }
 
   if (!data?.length) {
     await send(chatId, "📊 За последние 7 дней записей нет.");
     return;
   }
 
+  const isExpired = (b) => b.status === "cancelled" && b.cancel_reason === "expired";
   const total     = data.length;
   const confirmed = data.filter((b) => b.status === "confirmed").length;
   const completed = data.filter((b) => b.status === "completed").length;
-  const cancelled = data.filter((b) => b.status === "cancelled").length;
+  const cancelled = data.filter((b) => b.status === "cancelled" && !isExpired(b)).length;
+  const declined  = data.filter((b) => b.status === "declined").length;
+  const expired   = data.filter(isExpired).length;
   const pending   = data.filter((b) => b.status === "pending").length;
   const revenue   = data
-    .filter((b) => b.status !== "cancelled")
+    .filter((b) => b.status === "confirmed" || b.status === "completed")
     .reduce((sum, b) => sum + (b.total_price || 0), 0);
   const cancelRate = total ? Math.round((cancelled / total) * 100) : 0;
 
@@ -281,9 +306,48 @@ bot.onText(/\/stats/, async (msg) => {
     `🟡 Ожидает: <b>${pending}</b>\n` +
     `🟢 Подтверждено: <b>${confirmed}</b>\n` +
     `✅ Завершено: <b>${completed}</b>\n` +
-    `❌ Отменено: <b>${cancelled}</b> (${cancelRate}%)\n\n` +
-    `💰 Ожидаемая выручка: <b>${revenue} BYN</b>`
+    `❌ Отменено: <b>${cancelled}</b> (${cancelRate}%)\n` +
+    `🟠 Мастер отклонил: <b>${declined}</b>\n` +
+    `⌛ Сгорели без ответа мастера: <b>${expired}</b>\n\n` +
+    `💰 Выручка по подтверждённым: <b>${revenue} BYN</b>`
   );
+});
+
+// ── /pending ─────────────────────────────────────────────────
+/* Записи, на которые мастер ещё не ответил. Сигнал приходит сам, но
+   нужен и способ посмотреть всё разом — например, утром, чтобы обзвонить
+   мастеров одним заходом. */
+bot.onText(/\/pending/, async (msg) => {
+  const chatId = String(msg.chat.id);
+  if (!registeredFounders.has(chatId)) return;
+
+  const { data, error } = await db
+    .from("bookings")
+    .select(`id, client_name, service_name, booked_date, booked_time, created_at, master_name, proposed_date, ${MASTER_EMBED}`)
+    .eq("status", "pending")
+    .gte("booked_date", minskToday(-1))
+    .not("client_name", "like", "🔒%")
+    .order("booked_date").order("booked_time");
+  if (error) { console.error("[Founders] /pending:", error.message); await send(chatId, "⚠️ Ошибка при получении данных."); return; }
+
+  const now = Date.now();
+  const live = (data || []).filter((b) =>
+    new Date(`${b.booked_date}T${t5(b.booked_time) || "00:00"}:00+03:00`).getTime() > now);
+  if (!live.length) {
+    await send(chatId, "🟢 Все записи подтверждены — никто не ждёт ответа мастера.");
+    return;
+  }
+  const ago = (iso) => {
+    const min = Math.max(0, Math.round((now - new Date(iso).getTime()) / 60000));
+    return min < 60 ? `${min} мин` : min < 48 * 60 ? `${Math.round(min / 60)} ч` : `${Math.round(min / 1440)} дн`;
+  };
+  const lines = live.map((b) => {
+    const m = Array.isArray(b.masters) ? b.masters[0] : b.masters;
+    return `🟡 <b>${dateRu(b.booked_date)} ${t5(b.booked_time)}</b> · ${m?.name || b.master_name || "—"}\n` +
+      `   ${b.client_name || "Клиент"} · ${b.service_name || "Услуга"}\n` +
+      (b.proposed_date ? `   мастер предложил другое время, ждём клиента\n` : `   ждёт ответа ${ago(b.created_at)}\n`);
+  });
+  await send(chatId, `🟡 <b>Ждут подтверждения: ${live.length}</b>\n\n` + lines.join("\n"));
 });
 
 // ════════════════════════════════════════════════════════════
@@ -337,6 +401,11 @@ db.channel("uspot-founders-cancellations")
     const old = payload.old;
     if (b.status !== "cancelled" || old.status === "cancelled") return;
     if (b.client_name?.startsWith("🔒")) return;
+    /* Сгоревшую запись закрывает бот, и он же присылает о ней подробный
+       сигнал: сколько ждала, сколько было напоминаний, контакты мастера.
+       Отсюда ушло бы второе, пустое «Запись отменена» — у сообщения
+       должен быть один отправитель. */
+    if (b.cancel_reason === "expired") return;
 
     console.log(`[Founders] Booking ${b.id} cancelled → notifying founders`);
 
@@ -595,8 +664,24 @@ const notifyModeration = async ({ type, masterName, clientName, stars, preview, 
   return { sent };
 };
 
+// ════════════════════════════════════════════════════════════
+// ПРОИЗВОЛЬНЫЙ СИГНАЛ — неподтверждённые и сгоревшие записи
+// Текст собирает index.js: там известно, сколько запись ждала, сколько
+// было напоминаний и кому их удалось доставить. silent — ночью сигнал
+// приходит без звука, но приходит.
+// ════════════════════════════════════════════════════════════
+const notifyFounders = async (text, { silent = false } = {}) => {
+  if (registeredFounders.size === 0) {
+    console.warn("[Founders] notifyFounders: no registered founders to notify");
+    return { sent: 0 };
+  }
+  const sent = await broadcast(text, { silent });
+  console.log(`[Founders] notifyFounders: sent to ${sent}/${registeredFounders.size} founder(s)`);
+  return { sent };
+};
+
 const processFoundersUpdate  = (update) => bot.processUpdate(update);
 const setFoundersWebhook     = (url)    => bot.setWebHook(url);
 const deleteFoundersWebhook  = ()       => bot.deleteWebHook();
 
-module.exports = { notifyFeedback, notifyModeration, setMainBot, processFoundersUpdate, setFoundersWebhook, deleteFoundersWebhook };
+module.exports = { notifyFeedback, notifyModeration, notifyFounders, setMainBot, processFoundersUpdate, setFoundersWebhook, deleteFoundersWebhook };

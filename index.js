@@ -21,7 +21,7 @@ const express        = require("express");
 const cors           = require("cors");
 
 // Founders bot runs in the same process
-const { notifyFeedback, notifyModeration, setMainBot, processFoundersUpdate, setFoundersWebhook, deleteFoundersWebhook } = require("./founders-bot");
+const { notifyFeedback, notifyModeration, notifyFounders, setMainBot, processFoundersUpdate, setFoundersWebhook, deleteFoundersWebhook } = require("./founders-bot");
 
 // ── Config ───────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
@@ -169,26 +169,50 @@ const addrBlock = (m) => {
   return `📍 ${a}\n🗺 На карте: <a href="${ya}">Яндекс</a> · <a href="${gg}">Google</a>\n`;
 };
 
-/* Погасить карточку записи у мастера.
+/* Погасить карточки записи.
    Карточка «Новая запись!» висит с кнопками «Подтвердить» и «Другое
    время». Когда запись отменяют, она остаётся приглашать к действию,
-   которого уже нет. Переписываем её на месте и снимаем кнопки. */
-const closeMasterCard = async (bookingId, headline) => {
+   которого уже нет. Переписываем её на месте и снимаем кнопки.
+   Карточек бывает несколько: у мастера, у директора и администраторов
+   салона — поэтому помним и гасим все (confirm_msgs, патч v25). */
+const cardRefsOf = (bk) => {
+  const out = [];
+  const add = (c, m) => {
+    if (!c || !m) return;
+    const ref = { c: String(c), m: Number(m) };
+    if (!out.some((r) => r.c === ref.c && r.m === ref.m)) out.push(ref);
+  };
+  if (Array.isArray(bk?.confirm_msgs)) bk.confirm_msgs.forEach((r) => add(r?.c, r?.m));
+  add(bk?.master_msg_chat, bk?.master_msg_id);
+  return out;
+};
+
+const closeMasterCard = async (bookingId, headline, { tail = "", keyboard = null } = {}) => {
   try {
-    const { data: bk } = await db.from("bookings")
-      .select("master_msg_chat, master_msg_id, client_name, service_name, booked_date, booked_time, total_price")
-      .eq("id", bookingId).single();
-    if (!bk?.master_msg_id || !bk.master_msg_chat) return;
-    await bot.editMessageText(
-      `${headline}\n\n` + bookingCard(bk),
-      { chat_id: bk.master_msg_chat, message_id: Number(bk.master_msg_id), parse_mode: "HTML" });
-    await db.from("bookings")
-      .update({ master_msg_id: null, master_msg_chat: null }).eq("id", bookingId);
-  } catch (e) {
-    // «message is not modified» и «message to edit not found» — не беда
-    if (!/not modified|not found/i.test(e.message || "")) {
-      console.warn("Карточка мастера не обновлена:", e.message);
+    // select("*"): до патча v25 колонки confirm_msgs нет, и явный список упал бы
+    const { data: bk } = await db.from("bookings").select("*").eq("id", bookingId).single();
+    const refs = cardRefsOf(bk);
+    if (!refs.length) return;
+    const text = `${headline}\n\n` + bookingCard(bk, bk.salon_id ? bk.master_name : null) +
+      (tail ? `\n\n${tail}` : "");
+    for (const r of refs) {
+      try {
+        await bot.editMessageText(text, {
+          chat_id: r.c, message_id: r.m, parse_mode: "HTML",
+          ...(keyboard ? { reply_markup: { inline_keyboard: keyboard } } : {}),
+        });
+      } catch (e) {
+        // «message is not modified» и «message to edit not found» — не беда
+        if (!/not modified|not found/i.test(e.message || "")) {
+          console.warn("Карточка мастера не обновлена:", e.message);
+        }
+      }
     }
+    const patch = { master_msg_id: null, master_msg_chat: null };
+    if (bk && "confirm_msgs" in bk) patch.confirm_msgs = null;
+    await db.from("bookings").update(patch).eq("id", bookingId);
+  } catch (e) {
+    console.warn("Карточки записи не погашены:", e.message);
   }
 };
 
@@ -202,6 +226,77 @@ const bookingCard = (bk, masterName = null) =>
   `📆 ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n` +
   `💳 ${bk.total_price ? bk.total_price + " BYN" : "—"}` +
   (masterName ? `\n👩‍🎨 ${masterName}` : "");
+
+/* ─── Кто может подтвердить запись ────────────────────────────────
+   Мастер — если у него есть Telegram. У салонной записи ещё директор
+   (Telegram на строке салона) и администраторы (salon_role = 'admin').
+   Мастера салона чаще всего без Telegram: раньше карточка о новой записи
+   уходила только им — то есть никуда, и запись сгорала, хотя директор
+   мог её подтвердить. Запрашиваем свежими, без кэша: Telegram
+   администратора могли только что поменять. */
+const confirmersFor = async (bk) => {
+  const ids = [];
+  const add = (id) => { const s = id ? String(id).trim() : ""; if (s && !ids.includes(s)) ids.push(s); };
+  let salonId = bk.salon_id || null;
+  if (bk.master_id) {
+    const { data: m, error } = await db.from("masters")
+      .select("telegram_user_id, salon_id").eq("id", bk.master_id).maybeSingle();
+    if (error) console.error("Кто подтверждает (мастер):", error.message);
+    add(m?.telegram_user_id);
+    salonId = salonId || m?.salon_id || null;
+  }
+  if (salonId) {
+    const [{ data: salon, error: e1 }, { data: admins, error: e2 }] = await Promise.all([
+      db.from("masters").select("telegram_user_id").eq("id", salonId).maybeSingle(),
+      db.from("masters").select("telegram_user_id")
+        .eq("salon_id", salonId).eq("salon_role", "admin").not("telegram_user_id", "is", null),
+    ]);
+    if (e1) console.error("Кто подтверждает (салон):", e1.message);
+    if (e2) console.error("Кто подтверждает (администраторы):", e2.message);
+    add(salon?.telegram_user_id);
+    (admins || []).forEach((a) => add(a.telegram_user_id));
+  }
+  return ids;
+};
+
+/* Разослать карточку «Подтвердить / Другое время» всем, кто может
+   ответить, и запомнить сообщения, чтобы потом погасить их разом.
+   У карточек прошлых напоминаний кнопки снимаем — отвечать на свежей,
+   а не листать чат в поисках живой. */
+const sendConfirmCards = async (bk, text) => {
+  const to = await confirmersFor(bk);
+  if (!to.length) return { delivered: 0, recipients: 0 };
+  const { data: fresh } = await db.from("bookings").select("*").eq("id", bk.id).maybeSingle();
+  const old = cardRefsOf(fresh || bk);
+  const kb = [[
+    { text: "✅ Подтвердить",  callback_data: `confirm_${bk.id}` },
+    { text: "⏰ Другое время", callback_data: `suggest_${bk.id}` },
+  ]];
+  const refs = [];
+  for (const id of to) {
+    const sent = await send(id, text, kb);
+    if (sent?.message_id) refs.push({ c: String(sent.chat?.id ?? id), m: sent.message_id });
+  }
+  if (!refs.length) return { delivered: 0, recipients: to.length };
+  for (const r of old) {
+    if (!refs.some((n) => n.c === r.c)) continue;       // этому получателю новая не дошла — старую не трогаем
+    bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: r.c, message_id: r.m }).catch(() => {});
+  }
+  const keep = old.filter((r) => !refs.some((n) => n.c === r.c));
+  const all = [...refs, ...keep];
+  let { error } = await db.from("bookings")
+    .update({ master_msg_chat: all[0].c, master_msg_id: all[0].m, confirm_msgs: all }).eq("id", bk.id);
+  if (error && /confirm_msgs/.test(error.message || "")) {
+    // Патч v25 ещё не применён — запоминаем хотя бы одну карточку, как раньше
+    ({ error } = await db.from("bookings")
+      .update({ master_msg_chat: all[0].c, master_msg_id: all[0].m }).eq("id", bk.id));
+  }
+  if (error) console.error(`Карточки записи ${bk.id} не запомнены:`, error.message);
+  return { delivered: refs.length, recipients: to.length };
+};
+
+// Имена и тексты от людей в HTML-сообщениях: «<» в имени ломал бы разметку
+const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
 /* ─── Захват права на отправку ────────────────────────────────────
    Каждое разовое сообщение о записи (подтверждение, напоминания, опрос)
@@ -266,6 +361,10 @@ const tooLateToChange = async (bookingId, what = "отменить") => {
     .select("booked_date, booked_time, status, service_name").eq("id", bookingId).single();
   if (!bk) return null;
   if (bk.status === "cancelled" || bk.status === "declined") return null;
+  /* Неподтверждённую запись клиент волен отменить в любой момент: мастер
+     время за ним не держит, а бот сам предупреждает клиента, что ответа
+     нет, и предлагает отменить. Упираться тут в «поздно» было бы нечестно. */
+  if (bk.status === "pending") return null;
   const left = minutesUntil(bk.booked_date, bk.booked_time);
   if (left >= CHANGE_CUTOFF_MIN) return null;
   const when = left < 0 ? "уже началась" : `начнётся через ${left} мин`;
@@ -575,39 +674,32 @@ const subNewBookings = () => {
     console.log(`  → masterTgId: ${masterTgId}, clientTgId: ${b.client_telegram_id}`);
 
     if (b.status === "pending") {
-      // Master: confirm or suggest new time
-      if (masterTgId) {
-        // Перенос показываем как перенос: видно, что было и что стало
-        let wasLine = "";
-        if (b.reschedule_of) {
-          const { data: prev } = await db.from("bookings")
-            .select("booked_date, booked_time").eq("id", b.reschedule_of).single();
-          if (prev) wasLine = `📅 Было: ${dateRu(prev.booked_date)}, ${timeShort(prev.booked_time)}\n`;
-        }
-        const cardMsg = await sendWithKeyboard(masterTgId,
-          (b.reschedule_of ? `📅 <b>Клиент просит перенести запись</b>\n\n` : `📅 <b>Новая запись!</b>\n\n`) +
-          `👤 ${b.client_name || "Клиент"}\n` +
-          `💇 ${b.service_name || "Услуга"}\n` +
-          wasLine +
-          `${b.reschedule_of ? "📅 Стало: " : "📆 "}${date}, ${time}\n` +
-          `💳 ${price}\n\n` +
-          (b.reschedule_of ? `Подтвердите перенос или предложите другое время:`
-                           : `Подтвердите или предложите другое время:`),
-          [[
-            { text: "✅ Подтвердить",             callback_data: `confirm_${b.id}` },
-            { text: "⏰ Другое время",             callback_data: `suggest_${b.id}` },
-          ]]
-        );
-        // Запоминаем карточку: если запись отменят, погасим её сразу,
-        // не дожидаясь, пока мастер нажмёт «Подтвердить» на пустоте
-        if (cardMsg?.message_id) {
-          await db.from("bookings").update({
-            master_msg_chat: String(cardMsg.chat?.id ?? masterTgId),
-            master_msg_id:   cardMsg.message_id,
-          }).eq("id", b.id).catch(() => {});
-        }
-      } else {
-        console.warn(`⚠️  Master ${b.master_id} has no telegram_user_id — cannot notify master`);
+      // Мастеру и администраторам салона: подтвердить или предложить другое время
+      // Перенос показываем как перенос: видно, что было и что стало
+      let wasLine = "";
+      if (b.reschedule_of) {
+        const { data: prev } = await db.from("bookings")
+          .select("booked_date, booked_time").eq("id", b.reschedule_of).single();
+        if (prev) wasLine = `📅 Было: ${dateRu(prev.booked_date)}, ${timeShort(prev.booked_time)}\n`;
+      }
+      /* Карточку получают все, кто может ответить. Имя мастера пишем для
+         салонной записи: директору важно, к кому пришёл клиент. Карточки
+         запоминаются — если запись отменят, погасим их сразу. */
+      const cards = await sendConfirmCards(b,
+        (b.reschedule_of ? `📅 <b>Клиент просит перенести запись</b>\n\n` : `📅 <b>Новая запись!</b>\n\n`) +
+        `👤 ${b.client_name || "Клиент"}\n` +
+        `💇 ${b.service_name || "Услуга"}\n` +
+        wasLine +
+        `${b.reschedule_of ? "📅 Стало: " : "📆 "}${date}, ${time}\n` +
+        `💳 ${price}\n` +
+        (b.salon_id ? `👩‍🎨 ${masterName}\n` : "") +
+        `\n` +
+        (b.reschedule_of ? `Подтвердите перенос или предложите другое время:`
+                         : `Подтвердите или предложите другое время:`)
+      );
+      if (!cards.recipients) {
+        // Сигнал фаундерам об этом уйдёт из сверки неподтверждённых записей
+        console.warn(`⚠️  Запись ${b.id}: подтвердить некому — ни у мастера, ни у салона нет Telegram`);
       }
       // Client: waiting
       if (b.client_telegram_id) {
@@ -776,6 +868,18 @@ const subBookingUpdates = () => {
       const { data: m } = await db.from("masters")
         .select("name, telegram_user_id").eq("id", b.master_id).single();
       if (m) { masterName = m.name || masterName; masterTgId = m.telegram_user_id; }
+    }
+
+    /* Подтверждение гасит все карточки «Подтвердить / Другое время» — у
+       мастера, директора и администраторов. Раньше, подтвердив запись в
+       приложении, мастер оставлял в Telegram живую карточку, а директор
+       салона — свою. Текст и кнопка те же, что ставит нажатие в боте,
+       поэтому неважно, кто из двух успеет первым. */
+    if (b.status === "confirmed" && oldStatus !== "confirmed") {
+      closeMasterCard(b.id, "✅ <b>Запись подтверждена</b>", {
+        tail: "Клиент получит уведомление. Ждём его в Uspot! 💜",
+        keyboard: [[{ text: "📅 Открыть кабинет мастера", web_app: { url: MINI_APP_URL + "?startapp=master" } }]],
+      }).catch(() => {});
     }
 
     // pending → confirmed
@@ -968,10 +1072,13 @@ bot.on("callback_query", async (query) => {
          её нельзя: клиент уже получил отмену и не придёт. Кнопки снимаем,
          чтобы карточка не приглашала нажать ещё раз. */
       if (cb.status === "cancelled" || cb.status === "declined") {
+        const expired = cb.cancel_reason === "expired";
         const who = String(cb.cancel_reason || "").startsWith("client") ? "клиентом" : "мастером";
-        await bot.answerCallbackQuery(query.id, { text: "Запись уже отменена" });
-        await bot.editMessageText(
-          `❌ <b>Запись отменена ${who}</b>\n\n` + bookingCard(cb) + `\n\nПодтверждать нечего.`,
+        await bot.answerCallbackQuery(query.id, { text: expired ? "Запись уже сгорела" : "Запись уже отменена" });
+        await bot.editMessageText(expired
+          ? `⌛ <b>Запись сгорела</b>\n\n` + bookingCard(cb) +
+            `\n\nВремя визита наступило, а подтверждения не было. Клиенту мы уже написали.`
+          : `❌ <b>Запись отменена ${who}</b>\n\n` + bookingCard(cb) + `\n\nПодтверждать нечего.`,
           { chat_id: chatId, message_id: msgId, parse_mode: "HTML" }).catch(() => {});
         return;
       }
@@ -979,7 +1086,34 @@ bot.on("callback_query", async (query) => {
         await bot.answerCallbackQuery(query.id, { text: "Уже подтверждена" });
         return;
       }
-      await db.from("bookings").update({ status: "confirmed" }).eq("id", bookingId);
+      /* Время визита наступило — подтверждение опоздало. Раньше кнопка
+         срабатывала и через три дня: клиенту уходило «Мастер подтвердил,
+         ждём вас» о визите, который давно прошёл. Запись закроет сверка
+         неподтверждённых, и клиенту напишет она. */
+      const tooLate = () => bot.editMessageText(
+        `⌛ <b>Подтверждать поздно</b>\n\n` + bookingCard(cb) +
+        `\n\nВремя визита уже наступило. Запись закроется как неподтверждённая — клиенту мы напишем сами.`,
+        { chat_id: chatId, message_id: msgId, parse_mode: "HTML" }).catch(() => {});
+      if (minutesUntil(cb.booked_date, cb.booked_time) <= 0) {
+        await bot.answerCallbackQuery(query.id, { text: "Время визита уже наступило" });
+        await tooLate();
+        return;
+      }
+      // Условие в самом запросе: если запись успели закрыть, обновление никого не заденет
+      const { data: upd, error: ue } = await db.from("bookings")
+        .update({ status: "confirmed" }).eq("id", bookingId).eq("status", "pending").select("id");
+      if (ue) {
+        if (/booking_start_passed/.test(ue.message || "")) {
+          await bot.answerCallbackQuery(query.id, { text: "Время визита уже наступило" });
+          await tooLate();
+          return;
+        }
+        throw new Error(ue.message);
+      }
+      if (!upd?.length) {
+        await bot.answerCallbackQuery(query.id, { text: "Запись уже не ждёт подтверждения" });
+        return;
+      }
       await bot.answerCallbackQuery(query.id, { text: "✅ Запись подтверждена!" });
       await bot.editMessageText(
         `✅ <b>Запись подтверждена</b>\n\n` + (cb ? bookingCard(cb) + `\n\n` : "") +
@@ -1003,11 +1137,18 @@ bot.on("callback_query", async (query) => {
     const bookingId = data.slice(8);
     try {
       const { data: bk } = await db.from("bookings")
-        .select("master_id, duration_min, service_name, client_name, booked_date, booked_time, status")
+        .select("master_id, duration_min, service_name, client_name, booked_date, booked_time, status, cancel_reason")
         .eq("id", bookingId).single();
       if (!bk) { await bot.answerCallbackQuery(query.id, { text: "Запись не найдена" }); return; }
       if (bk.status === "cancelled" || bk.status === "declined") {
-        await bot.answerCallbackQuery(query.id, { text: "Запись уже отменена" }); return;
+        await bot.answerCallbackQuery(query.id,
+          { text: bk.cancel_reason === "expired" ? "Запись уже сгорела" : "Запись уже отменена" });
+        return;
+      }
+      // Предлагать другое время по записи, чьё время уже наступило, бессмысленно
+      if (bk.status === "pending" && minutesUntil(bk.booked_date, bk.booked_time) <= 0) {
+        await bot.answerCallbackQuery(query.id, { text: "Время визита уже наступило" });
+        return;
       }
       const slots = await freeSlotsFor(bk.master_id, +bk.duration_min || 60, 6, 14, bookingId, 2);
       await bot.answerCallbackQuery(query.id);
@@ -1048,9 +1189,16 @@ bot.on("callback_query", async (query) => {
     const time = `${hm.slice(0, 2)}:${hm.slice(2)}`;
     try {
       const { data: bk } = await db.from("bookings")
-        .select("client_telegram_id, service_name, booked_date, booked_time, master_id, total_price")
+        .select("client_telegram_id, service_name, booked_date, booked_time, master_id, total_price, status")
         .eq("id", bookingId).single();
       if (!bk) { await bot.answerCallbackQuery(query.id, { text: "Запись не найдена" }); return; }
+      /* Список окон мог пролежать в чате долго: за это время запись
+         подтвердили, отменили или она сгорела. Предложение по ней ушло бы
+         клиенту как живое. */
+      if (bk.status !== "pending") {
+        await bot.answerCallbackQuery(query.id, { text: "Запись уже не ждёт ответа" });
+        return;
+      }
       // Двойное нажатие той же кнопки не должно слать клиенту два предложения
       if (!rtFirstTime(`sprop:${bookingId}:${iso}:${hm}`)) {
         await bot.answerCallbackQuery(query.id, { text: "Уже предложено" });
@@ -1101,8 +1249,11 @@ bot.on("callback_query", async (query) => {
       const { data: bk } = await db.from("bookings").select("*").eq("id", bookingId).single();
       if (!bk) { await bot.answerCallbackQuery(query.id, { text: "Запись не найдена" }); return; }
       if (bk.status === "cancelled" || bk.status === "declined") {
-        await bot.answerCallbackQuery(query.id, { text: "Запись уже отменена" });
-        await send(chatId, `Эта запись уже отменена. Выберите новое время в приложении.`);
+        const expired = bk.cancel_reason === "expired";
+        await bot.answerCallbackQuery(query.id, { text: expired ? "Запись уже закрыта" : "Запись уже отменена" });
+        await send(chatId, expired
+          ? `Эта запись уже закрыта: время визита прошло. Выберите новое время в приложении.`
+          : `Эта запись уже отменена. Выберите новое время в приложении.`);
         return;
       }
       /* Второе нажатие «Подтвердить»: запись уже стоит на этом времени.
@@ -1533,6 +1684,356 @@ runReminders();
    тик в них не попадал. Повторов не будет — каждое отправленное
    сообщение отмечается в базе. */
 setInterval(runReminders, 5 * 60 * 1000);
+
+// ════════════════════════════════════════════════════════════
+// НЕПОДТВЕРЖДЁННЫЕ ЗАПИСИ — напоминания, сигнал фаундерам, сгорание
+// ════════════════════════════════════════════════════════════
+/* 14 сентября 2026: у Анны Ковальски запись висела «новой» через три дня
+   после времени визита, и её можно было подтвердить. В базе нашлось
+   девять таких записей: мастер не ответил, клиент не узнал, мы не узнали.
+   Бот напоминал мастеру ровно один раз — карточкой при создании, а
+   мастерам салона без Telegram не напоминал никогда.
+
+   Теперь, пока запись ждёт ответа мастера:
+     • мастеру и администраторам салона — напоминания: через 30 минут,
+       через 2 часа, дальше раз в сутки; у самого визита чаще, но не чаще
+       раза в 45 минут;
+     • фаундерам — сигнал с контактами, если ответа нет 2 часа (раньше,
+       если визит скоро; сразу, если напомнить некому);
+     • клиенту — за 3 часа до визита честное «мастер пока не подтвердил,
+       не выезжайте без подтверждения»;
+     • наступило время визита — запись закрывается (cancelled / expired):
+       клиенту извинение и кнопка выбора другого времени, карточки у
+       мастера гаснут, фаундерам — отдельный сигнал.
+   Ночью (22:00–08:00 по Минску) никого не будим: напоминания и сигнал
+   «не подтверждает» ждут утра. Закрытие ночью всё равно происходит,
+   сигнал о нём приходит фаундерам без звука.
+
+   Если мастер предложил другое время (proposed_date), ход за клиентом:
+   мастеру не напоминаем, фаундеров не дёргаем, а срок — предложенное
+   время, если оно позже исходного.
+
+   Защита от повторов — в базе: счётчик напоминаний сравнивается в самом
+   запросе, отметки ставятся захватом, закрытие идёт условием
+   status = 'pending'. Перезаливка бота ничего не повторит. */
+
+// ── pw-rules:start — чистые функции, проверяются тестом без базы и Telegram
+const PW = {
+  NUDGE_FIRST_MIN:     30,        // первое напоминание мастеру
+  NUDGE_SECOND_MIN:    90,        // второе — ещё через полтора часа (≈2 ч от создания)
+  NUDGE_DAILY_MIN:     24 * 60,   // дальше — раз в сутки
+  NUDGE_MIN_GAP_MIN:   45,        // у самого визита чаще, но не чаще раза в 45 минут
+  FOUNDERS_MIN:        120,       // фаундерам — когда ответа нет 2 часа…
+  FOUNDERS_FLOOR_MIN:  30,        // …или раньше, если визит скоро, но не раньше чем через 30 минут
+  CLIENT_WARN_MIN:     180,       // клиенту — за 3 часа до визита…
+  CLIENT_WARN_AGE_MIN: 30,        // …и не раньше, чем у мастера было полчаса на ответ
+  LATE_CLIENT_MIN:     180,       // о сгоревшей записи клиенту — только если визит был не больше 3 ч назад
+  LATE_FOUNDERS_MIN:   24 * 60,   // фаундерам и мастеру — не больше суток назад; давнее закрываем молча
+  QUIET_FROM_H: 22, QUIET_TO_H: 8,
+};
+
+const pwSlotMs = (dateIso, timeStr) => {
+  if (!dateIso) return NaN;
+  const t = String(timeStr || "00:00").slice(0, 5);
+  return new Date(`${dateIso}T${t}:00+03:00`).getTime();     // Минск круглый год UTC+3
+};
+
+// Срок ответа: время визита, а если мастер предложил время позже — оно
+const pwDeadlineMs = (b) => {
+  const orig = pwSlotMs(b.booked_date, b.booked_time);
+  const prop = b.proposed_date ? pwSlotMs(b.proposed_date, b.proposed_time) : NaN;
+  return Number.isFinite(prop) && prop > orig ? prop : orig;
+};
+
+const pwQuiet = (nowMs) => {
+  const h = new Date(nowMs + 3 * 3600 * 1000).getUTCHours();
+  return h >= PW.QUIET_FROM_H || h < PW.QUIET_TO_H;
+};
+
+/* Что пора сделать с записью прямо сейчас. Решение зависит только от
+   строки и часов, поэтому его можно проверить тестом на любых датах. */
+const pwPlan = (b, nowMs, { hasConfirmers = true } = {}) => {
+  const plan = { expire: false, nudge: false, founders: false, warnClient: false };
+  if (!b || b.status !== "pending") return plan;
+  const deadline = pwDeadlineMs(b);
+  const created  = new Date(b.created_at).getTime();
+  if (!Number.isFinite(deadline) || !Number.isFinite(created)) return plan;
+  if (deadline <= nowMs) { plan.expire = true; return plan; }
+
+  const MIN = 60000;
+  const leftMin = (deadline - nowMs) / MIN;
+  const ageMin  = (nowMs - created) / MIN;
+  const waitingClient = !!b.proposed_date;
+  const quiet = pwQuiet(nowMs);
+
+  if (!waitingClient && !quiet && hasConfirmers) {
+    const k = +b.master_nudges || 0;
+    const lastMs = k > 0 && b.master_nudged_at ? new Date(b.master_nudged_at).getTime() : created;
+    const base = k === 0 ? PW.NUDGE_FIRST_MIN : k === 1 ? PW.NUDGE_SECOND_MIN : PW.NUDGE_DAILY_MIN;
+    const gap  = Math.min(base, Math.max(PW.NUDGE_MIN_GAP_MIN, leftMin / 2));
+    if (Number.isFinite(lastMs) && (nowMs - lastMs) / MIN >= gap) plan.nudge = true;
+  }
+
+  if (!waitingClient && !quiet && !b.founders_alerted_at) {
+    const windowMin = (deadline - created) / MIN;
+    const due = hasConfirmers
+      ? Math.min(PW.FOUNDERS_MIN, Math.max(PW.FOUNDERS_FLOOR_MIN, windowMin / 2))
+      : 0;                                            // напомнить некому — сообщаем сразу
+    if (ageMin >= due) plan.founders = true;
+  }
+
+  if (!waitingClient && !quiet && !b.client_warned_at && b.client_telegram_id &&
+      leftMin <= PW.CLIENT_WARN_MIN && ageMin >= PW.CLIENT_WARN_AGE_MIN) {
+    plan.warnClient = true;
+  }
+  return plan;
+};
+
+// «2 ч 10 мин», «45 мин», «3 дн» — для сообщений
+const pwHuman = (min) => {
+  const m = Math.max(0, Math.round(min));
+  if (m < 60) return `${m} мин`;
+  if (m < 48 * 60) {
+    const h = Math.floor(m / 60), r = m % 60;
+    return h < 3 && r >= 5 ? `${h} ч ${r} мин` : `${Math.round(m / 60)} ч`;
+  }
+  return `${Math.round(m / 1440)} дн`;
+};
+// ── pw-rules:end
+
+/* Карточка для фаундеров: кто, к кому, как связаться, что уже сделали.
+   Контакты — главное: сигнал нужен, чтобы позвонить мастеру. */
+const pwFoundersItem = async (b, nowMs, to, { expired = false, clientTold = false, delivered = null } = {}) => {
+  const [{ data: m }, { data: cl }] = await Promise.all([
+    b.master_id
+      ? db.from("masters").select("name, phone, telegram_user_id, salon_id").eq("id", b.master_id).maybeSingle()
+      : Promise.resolve({ data: null }),
+    b.client_telegram_id
+      ? db.from("clients").select("phone").eq("telegram_user_id", String(b.client_telegram_id)).maybeSingle()
+      : Promise.resolve({ data: null }),
+  ]);
+  const salonId = b.salon_id || m?.salon_id || null;
+  let salon = null;
+  if (salonId) {
+    ({ data: salon } = await db.from("masters")
+      .select("name, telegram_user_id, contact_phone, phone").eq("id", salonId).maybeSingle());
+  }
+  const tgLink = (id) => id ? `<a href="tg://user?id=${esc(id)}">${esc(id)}</a>` : "";
+  // Номер из «поделиться контактом» приходит без плюса — дописываем, чтобы по нему можно было нажать
+  const tel = (p) => { const s = String(p || "").trim(); return /^\d{10,15}$/.test(s) ? `+${s}` : s; };
+  const contact = (tg, phone) => [tg ? `🆔 ${tgLink(tg)}` : "", phone ? `📞 ${esc(tel(phone))}` : ""]
+    .filter(Boolean).join(" · ");
+  const deadline = pwDeadlineMs(b);
+  const ageMin = (Math.min(nowMs, deadline) - new Date(b.created_at).getTime()) / 60000;
+  const nudges = +b.master_nudges || 0;
+
+  let s = "";
+  if (salon) {
+    s += `🏛 <b>${esc(salon.name || "Салон")}</b>` +
+      (contact(salon.telegram_user_id, salon.contact_phone || salon.phone) ? ` · ${contact(salon.telegram_user_id, salon.contact_phone || salon.phone)}` : "") + `\n`;
+    s += `👩‍🎨 ${esc((m?.name || b.master_name || "Мастер").trim())}` +
+      (contact(m?.telegram_user_id, m?.phone) ? ` · ${contact(m?.telegram_user_id, m?.phone)}` : "") + `\n`;
+  } else {
+    s += `👩‍🎨 <b>${esc((m?.name || b.master_name || "Мастер").trim())}</b>` +
+      (contact(m?.telegram_user_id, m?.phone) ? ` · ${contact(m?.telegram_user_id, m?.phone)}` : "") + `\n`;
+  }
+  s += `👤 ${esc(b.client_name || "Клиент")}` + (cl?.phone ? ` · 📞 ${esc(tel(cl.phone))}` : "") + `\n`;
+  s += `💇 ${esc(b.service_name || "Услуга")}` + (b.total_price ? ` · ${b.total_price} BYN` : "") + `\n`;
+  s += `📆 ${dateRu(b.booked_date)}, ${timeShort(b.booked_time)}` +
+    (expired ? "" : ` — через ${pwHuman((deadline - nowMs) / 60000)}`) + `\n`;
+  s += (expired ? `⏳ Ждала подтверждения ${pwHuman(ageMin)}` : `⏳ Ждёт ответа ${pwHuman(ageMin)}`) +
+    ` · напоминаний мастеру: ${nudges}`;
+  if (!to.length) {
+    s += `\n⚠️ Напомнить некому: ни у мастера, ни у салона нет Telegram — карточка о записи никуда не ушла.`;
+  } else if (delivered === 0) {
+    s += `\n⚠️ Сообщения мастеру не доставляются — возможно, он заблокировал бота.`;
+  }
+  if (expired) {
+    s += clientTold
+      ? `\nКлиенту написали и предложили выбрать другое время.`
+      : (b.client_telegram_id ? `\nКлиенту не писали: визит был больше трёх часов назад.` : `\nКлиента в Telegram нет — сообщить ему некуда.`);
+  }
+  return s;
+};
+
+const pwFoundersText = (kind, items) => {
+  const one = items.length === 1;
+  const head = kind === "expired"
+    ? (one ? `⌛ <b>Запись сгорела без ответа мастера</b>` : `⌛ <b>Сгорели без ответа мастера: ${items.length}</b>`)
+    : (one ? `🟡 <b>Мастер не подтверждает запись</b>` : `🟡 <b>Мастера не подтверждают записи: ${items.length}</b>`);
+  const foot = kind === "expired"
+    ? `\n\nСвяжитесь с мастером: клиент ушёл без записи.`
+    : `\n\n${one ? "Свяжитесь с мастером." : "Свяжитесь с мастерами."} Все ждущие записи — /pending`;
+  return `${head}\n\n` + items.join("\n\n") + foot;
+};
+
+// Напоминание мастеру. Счётчик сравнивается в самом запросе — выигрывает один проход
+const pwNudge = async (b, nowMs) => {
+  const k = +b.master_nudges || 0;
+  const { data: won, error } = await db.from("bookings")
+    .update({ master_nudges: k + 1, master_nudged_at: new Date(nowMs).toISOString() })
+    .eq("id", b.id).eq("status", "pending").eq("master_nudges", k).select("id");
+  if (error) { console.error(`⏳ Напоминание по записи ${b.id} не отмечено:`, error.message); return null; }
+  if (!won?.length) return null;
+  const leftMin = (pwDeadlineMs(b) - nowMs) / 60000;
+  const ageMin  = (nowMs - new Date(b.created_at).getTime()) / 60000;
+  const soon = leftMin <= PW.CLIENT_WARN_MIN;
+  const res = await sendConfirmCards({ ...b, master_nudges: k + 1 },
+    (soon ? `⏰ <b>Скоро визит — клиент всё ещё ждёт ответа</b>\n\n` : `⏳ <b>Клиент ждёт подтверждения</b>\n\n`) +
+    bookingCard(b, b.salon_id ? b.master_name : null) + `\n\n` +
+    `Запись ждёт ответа ${pwHuman(ageMin)}, до визита ${pwHuman(leftMin)}.\n` +
+    `Если не ответить до начала, запись сгорит и клиент уйдёт искать другое время.`);
+  console.log(`⏳ Напоминание №${k + 1} по записи ${b.id}: доставлено ${res.delivered} из ${res.recipients}`);
+  return res;
+};
+
+// Клиенту за 3 часа до визита — пока мастер молчит
+const pwWarnClient = async (b) => {
+  if (!(await claimOnce(b.id, "client_warned_at"))) return false;
+  const mFull = await getMasterFull(b.master_id);
+  const sent = await sendWithKeyboard(b.client_telegram_id,
+    `⏳ <b>Мастер пока не подтвердил запись</b>\n\n` +
+    `👩‍🎨 ${mFull?.name || b.master_name || "Мастер"}\n` +
+    `💇 ${b.service_name || "Услуга"}\n` +
+    `📆 ${dateRu(b.booked_date)}, ${timeShort(b.booked_time)}\n\n` +
+    `Мы напомнили мастеру и сразу сообщим, как только он ответит. ` +
+    `Пожалуйста, не выезжайте, пока не придёт подтверждение.\n\n` +
+    `Если ответа не будет до начала визита, запись закроется — и мы поможем выбрать другое время.`,
+    [[{ text: "❌ Отменить запись", callback_data: `client_cancel_${b.id}` }],
+     [{ text: "✉️ Написать нам", web_app: { url: `${MINI_APP_URL}?startapp=help_${b.id}` } }]]);
+  /* Не дошло — отметку не снимаем: заблокировавшему бота человеку мы иначе
+     пытались бы писать каждые пять минут до самого визита. */
+  console.log(`⏳ Клиент ${sent ? "предупреждён" : "НЕ предупреждён (не доставлено)"}: запись ${b.id} без ответа мастера`);
+  return !!sent;
+};
+
+// Время визита наступило, подтверждения нет — закрываем запись
+const pwExpire = async (b, nowMs, to, foundersOut, clientsThisRun) => {
+  const { data: won, error } = await db.from("bookings")
+    .update({ status: "cancelled", cancel_reason: "expired" })
+    .eq("id", b.id).eq("status", "pending").select("id");
+  if (error) { console.error(`⌛ Запись ${b.id} не закрыта:`, error.message); return; }
+  if (!won?.length) return;                          // успели подтвердить или отменить
+  const lateMin = (nowMs - pwDeadlineMs(b)) / 60000;
+  const waitingClient = !!b.proposed_date;
+  console.log(`⌛ Запись ${b.id} закрыта без подтверждения: визит ${b.booked_date} ${timeShort(b.booked_time)}, ` +
+    `прошло ${Math.round(lateMin)} мин, напоминаний ${+b.master_nudges || 0}`);
+
+  const recent = lateMin <= PW.LATE_FOUNDERS_MIN;
+  // Серое «ожидает» в календарях больше не нужно
+  deleteFromGcal(b.id).catch(() => {});
+  deleteFromGcal(b.id, "salon").catch(() => {});
+  deleteClientGcal(b.id).catch(() => {});
+
+  let clientTold = false;
+  const clientKey = String(b.client_telegram_id || "");
+  if (recent && clientKey && lateMin <= PW.LATE_CLIENT_MIN) {
+    const mFull = await getMasterFull(b.master_id);
+    const sent = await sendWithKeyboard(b.client_telegram_id,
+      (waitingClient ? `⌛ <b>Запись закрыта</b>\n\n` : `😔 <b>Мастер не подтвердил запись</b>\n\n`) +
+      `👩‍🎨 ${mFull?.name || b.master_name || "Мастер"}\n` +
+      `💇 ${b.service_name || "Услуга"}\n` +
+      `📆 ${dateRu(b.booked_date)}, ${timeShort(b.booked_time)}\n\n` +
+      (waitingClient
+        ? `Мастер предлагал другое время, но ответа мы не получили, а время визита прошло.\n\n` +
+          `Выберите новое время, когда будет удобно 👇`
+        : `Время визита наступило, а подтверждения так и не пришло — запись закрыта. ` +
+          `Простите: так быть не должно, мы разбираемся с мастером.\n\n` +
+          `Выберите другое время — это займёт минуту 👇`),
+      [[{ text: "📅 Выбрать другое время", web_app: { url: `${MINI_APP_URL}?startapp=m${b.master_id}` } }]]);
+    clientTold = !!sent;
+    clientsThisRun.add(clientKey);
+  }
+
+  await closeMasterCard(b.id,
+    waitingClient ? "⌛ <b>Запись закрыта</b>" : "⌛ <b>Запись сгорела</b>",
+    { tail: waitingClient
+        ? "Клиент не ответил на предложенное время, а время визита прошло."
+        : "Вы не ответили до начала визита, и запись закрылась." +
+          (clientTold ? " Клиенту написали, что визит не состоится." : "") });
+
+  if (!recent) return;                               // давняя история: закрыли молча
+
+  /* Мастер предложил другое время, а клиент промолчал — мастер своё
+     сделал. Ни упрёка мастеру, ни сигнала «мастер не ответил». */
+  if (waitingClient) return;
+
+  /* Правка карточки приходит без звука — мастеру отдельное сообщение. Но
+     только если закрыли вовремя: письмо «запись сгорела» о визите, который
+     был полдня назад (бот лежал, первый проход после выката), мастера лишь
+     озадачит. Фаундерам сигнал уходит в любом случае — им важно знать. */
+  if (lateMin <= PW.LATE_CLIENT_MIN) {
+    for (const id of to) {
+      await send(id,
+        `⌛ <b>Запись сгорела</b>\n\n` + bookingCard(b, b.salon_id ? b.master_name : null) + `\n\n` +
+        `Её никто не подтвердил до начала визита, и клиент ушёл искать другое время. ` +
+        `Новые записи лучше подтверждать сразу — клиент в это время ждёт.`);
+    }
+  }
+  foundersOut.push(await pwFoundersItem(b, nowMs, to, { expired: true, clientTold }));
+};
+
+let pwRunning = false;
+const runPendingWatch = async () => {
+  if (pwRunning) return;
+  pwRunning = true;
+  try {
+    const nowMs = Date.now();
+    const { data: rows, error } = await db.from("bookings").select("*")
+      .eq("status", "pending").order("booked_date").order("booked_time");
+    if (error) { console.error("⏳ Неподтверждённые: запрос не выполнен —", error.message); return; }
+
+    const foundersNew = [], foundersExpired = [];
+    const clientsThisRun = new Set();    // одно разовое сообщение одному человеку за проход
+    for (const b of rows || []) {
+      if (String(b.client_name || "").startsWith("🔒")) continue;     // служебная блокировка времени
+      try {
+        const to = await confirmersFor(b);
+        const plan = pwPlan(b, nowMs, { hasConfirmers: to.length > 0 });
+        if (plan.expire) {
+          /* Второе сообщение тому же клиенту в этот же проход не шлём — две
+             сгоревшие записи одной секундой читаются как сбой. Запись
+             закроется следующим проходом, через пять минут. */
+          const lateMin = (nowMs - pwDeadlineMs(b)) / 60000;
+          const clientKey = String(b.client_telegram_id || "");
+          if (clientKey && lateMin <= PW.LATE_CLIENT_MIN && clientsThisRun.has(clientKey)) continue;
+          await pwExpire(b, nowMs, to, foundersExpired, clientsThisRun);
+          continue;
+        }
+
+        let delivered = null;
+        if (plan.nudge) {
+          const res = await pwNudge(b, nowMs);
+          if (res) { delivered = res.delivered; b.master_nudges = (+b.master_nudges || 0) + 1; }
+          /* Напоминание не дошло ни до кого (бота заблокировали, Telegram
+             удалён) — ждать двух часов бессмысленно: достучаться может
+             только человек. Фаундерам сразу. */
+          if (res && res.recipients > 0 && res.delivered === 0 && !pwQuiet(nowMs)) plan.founders = true;
+        }
+        if (plan.founders && !b.founders_alerted_at && await claimOnce(b.id, "founders_alerted_at")) {
+          foundersNew.push(await pwFoundersItem(b, nowMs, to, { delivered }));
+        }
+        const clientKey = String(b.client_telegram_id || "");
+        if (plan.warnClient && !clientsThisRun.has(clientKey)) {
+          if (await pwWarnClient(b)) clientsThisRun.add(clientKey);
+        }
+      } catch (e) {
+        console.error(`⏳ Неподтверждённая запись ${b.id}:`, e.message);
+      }
+    }
+    const silent = pwQuiet(nowMs);
+    if (foundersNew.length)     await notifyFounders(pwFoundersText("new", foundersNew), { silent });
+    if (foundersExpired.length) await notifyFounders(pwFoundersText("expired", foundersExpired), { silent });
+  } catch (e) {
+    console.error("⏳ Неподтверждённые: сбой прохода —", e.message);
+  } finally {
+    pwRunning = false;
+  }
+};
+
+// Первый проход — через минуту после старта, когда Realtime уже поднят
+setTimeout(runPendingWatch, 60 * 1000);
+setInterval(runPendingWatch, 5 * 60 * 1000);
 
 // ════════════════════════════════════════════════════════════
 // GOOGLE CALENDAR INTEGRATION  — Bug #5
@@ -1992,21 +2493,19 @@ const reconcileBookings = async () => {
       // (b) Master alert catch-up — only bookings this process never saw
       if (!handledBookings.has(b.id)) {
         handledBookings.add(b.id);
-        if (tg && b.status === "pending") {
+        if (b.status === "pending") {
           console.warn(`🩹 Reconcile: booking ${b.id} was never announced — alerting master`);
-          await sendWithKeyboard(tg,
+          // Тем же, кому уходит карточка при создании: мастеру и администраторам салона
+          const cards = await sendConfirmCards(b,
             `📅 <b>Новая запись!</b>\n\n` +
             `👤 ${b.client_name || "Клиент"}\n` +
             `💇 ${b.service_name || "Услуга"}\n` +
             `📆 ${dateRu(b.booked_date)}, ${timeShort(b.booked_time)}\n` +
-            `💳 ${b.total_price ? b.total_price + " BYN" : "—"}\n\n` +
-            `Подтвердите или предложите другое время:`,
-            [[
-              { text: "✅ Подтвердить",  callback_data: `confirm_${b.id}` },
-              { text: "⏰ Другое время", callback_data: `suggest_${b.id}` },
-            ]]
+            `💳 ${b.total_price ? b.total_price + " BYN" : "—"}\n` +
+            (b.salon_id ? `👩‍🎨 ${m.name || b.master_name || "Мастер"}\n` : "") +
+            `\nПодтвердите или предложите другое время:`
           );
-          repaired++;
+          if (cards.delivered) repaired++;
         }
       }
     }
@@ -2264,6 +2763,59 @@ app.get("/auth/me", async (req, res) => {
 
 const toMinutes = (t) => { const [h, m] = String(t || "0:0").split(":").map(Number); return h * 60 + (m || 0); };
 
+/* ─── Акции при записи ────────────────────────────────────────────
+   Правила — те же, что в приложении (promoAvailable / promoPriceOf):
+   акция включена, сегодня по Минску она уже началась и ещё не кончилась,
+   и если у неё есть число мест — места остались. У мастера салона
+   действует акция салона на эту услугу; своя акция мастера важнее. */
+const activePromoFor = async (master, serviceName, todayIso) => {
+  const owners = [master.id, master.salon_id].filter(Boolean);
+  const { data, error } = await db.from("promos").select("*")
+    .in("master_id", owners).eq("service_name", serviceName).eq("is_active", true);
+  if (error) { console.error("Акция для записи: запрос не выполнен —", error.message); return null; }
+  const live = (data || []).filter((p) =>
+    (!p.valid_from || p.valid_from <= todayIso) &&
+    (!p.valid_until || p.valid_until >= todayIso) &&
+    (!(+p.total_slots > 0) || (+p.slots_left || 0) > 0));
+  return live.find((p) => p.master_id === master.id) || live[0] || null;
+};
+
+// Процент считается от цены мастера, фиксированная цена — как задана
+const promoPriceFor = (base, p) => {
+  if (!p) return null;
+  if (p.discount_pct) return base > 0 ? Math.max(1, Math.round(base * (100 - p.discount_pct) / 100)) : null;
+  return p.promo_price != null ? +p.promo_price : null;
+};
+
+/* Место по акции берём условным обновлением: «уменьши, если осталось
+   столько, сколько я видел». Двое записавшихся на последнее место
+   одновременно не получат его оба. */
+const takePromoSlot = async (p) => {
+  if (!(+p.total_slots > 0)) return true;                  // мест не ограничивали
+  for (let i = 0; i < 3; i++) {
+    const { data: cur, error } = await db.from("promos").select("slots_left").eq("id", p.id).maybeSingle();
+    if (error) { console.error("Место по акции:", error.message); return false; }
+    const left = +cur?.slots_left || 0;
+    if (left <= 0) return false;
+    const { data: won } = await db.from("promos")
+      .update({ slots_left: left - 1 }).eq("id", p.id).eq("slots_left", left).select("id");
+    if (won?.length) return true;
+  }
+  return false;
+};
+const returnPromoSlot = async (p) => {
+  if (!(+p?.total_slots > 0)) return;
+  for (let i = 0; i < 3; i++) {
+    const { data: cur } = await db.from("promos").select("slots_left, total_slots").eq("id", p.id).maybeSingle();
+    if (!cur) return;
+    const left = +cur.slots_left || 0;
+    if (left >= (+cur.total_slots || 0)) return;
+    const { data: won } = await db.from("promos")
+      .update({ slots_left: left + 1 }).eq("id", p.id).eq("slots_left", left).select("id");
+    if (won?.length) return;
+  }
+};
+
 app.post("/bookings", async (req, res) => {
   try {
     const b = req.body || {};
@@ -2322,7 +2874,7 @@ app.post("/bookings", async (req, res) => {
     }
     // Цена и длительность — из базы, не из запроса
     const dur   = isBlock ? Math.max(15, Math.min(600, +b.duration_min || 60)) : (+svc.duration_min || 60);
-    const price = isBlock ? 0 : (+svc.price || 0);
+    let price   = isBlock ? 0 : (+svc.price || 0);
 
     // Рабочие часы мастера в этот день
     const jsDay = new Date(date + "T12:00:00").getDay();
@@ -2364,6 +2916,20 @@ app.post("/bookings", async (req, res) => {
       if ((bl || []).length) return res.status(403).json({ error: "blacklisted" });
     }
 
+    /* Цена по акции. Раньше акция жила только в интерфейсе: клиент видел
+       75 вместо 90, а в запись уходило 90, и мастер ждал полную цену. Так
+       прошли три записи к Анне Ковальски по «Back to school» 3 сентября.
+       Теперь цену считает сервер — по тем же правилам, что показывает
+       приложение: акция действует сегодня по Минску и места не кончились.
+       Стоит после всех проверок: отказ ниже по коду не должен съесть место. */
+    let promo = null;
+    if (!isBlock) {
+      promo = await activePromoFor(master, svc.name, todayIso);
+      const pp = promoPriceFor(price, promo);
+      if (pp != null && pp < price && await takePromoSlot(promo)) price = pp;
+      else promo = null;
+    }
+
     const row = {
       master_id: masterId, master_name: master.name || null,
       salon_id: b.salon_id || master.salon_id || null,
@@ -2380,9 +2946,14 @@ app.post("/bookings", async (req, res) => {
       status: isAdmin ? "confirmed" : "pending",
     };
     const { data: created, error } = await db.from("bookings").insert(row).select().single();
-    if (error) { console.error("booking insert:", error.message); return res.status(500).json({ error: "insert_failed" }); }
+    if (error) {
+      console.error("booking insert:", error.message);
+      if (promo) await returnPromoSlot(promo);         // место по акции не должно пропасть зря
+      return res.status(500).json({ error: "insert_failed" });
+    }
 
-    console.log(`📝 Запись ${created.id} создана через бота (${isAdmin ? "администратор" : "клиент"})`);
+    console.log(`📝 Запись ${created.id} создана через бота (${isAdmin ? "администратор" : "клиент"})` +
+      (promo ? ` по акции «${promo.title || promo.service_name}»: ${created.total_price} BYN вместо ${+svc.price || 0}` : ""));
     // Номер здесь не просим: человек только что отправил запись и ждёт
     // ответа мастера. Просьба уходит после подтверждения — см. askPhoneOnce.
     res.json({ ok: true, booking: created });
@@ -2401,7 +2972,10 @@ app.post("/bookings/cancel", async (req, res) => {
 
     const { data: bk } = await db.from("bookings").select("*").eq("id", booking_id).single();
     if (!bk) return res.status(404).json({ error: "not_found" });
-    if (bk.status === "cancelled") return res.json({ ok: true, booking: bk });
+    // Уже не живая запись: отменять нечего, а смена статуса разослала бы ложные уведомления
+    if (bk.status === "cancelled" || bk.status === "declined" || bk.status === "completed") {
+      return res.json({ ok: true, booking: bk });
+    }
 
     const { data: ownerRows } = await db.from("masters").select("id, kind, salon_id").eq("telegram_user_id", tgId);
     const owners = ownerRows || [];
@@ -2413,7 +2987,8 @@ app.post("/bookings/cancel", async (req, res) => {
     /* Клиент не отменяет за два часа до визита: окно уже не продать.
        Мастера и салона это не касается — форс-мажор бывает у всех, но
        решение остаётся за той стороной, которая теряет деньги. */
-    if (isClient && !isOwnerSide) {
+    // Неподтверждённую запись мастер за клиентом не держит — отменить можно всегда
+    if (isClient && !isOwnerSide && bk.status !== "pending") {
       const left = minutesUntil(bk.booked_date, bk.booked_time);
       if (left < CHANGE_CUTOFF_MIN) {
         return res.status(409).json({
