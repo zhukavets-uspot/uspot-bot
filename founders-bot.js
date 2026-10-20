@@ -12,6 +12,7 @@
 //   /today   — all bookings for today with status
 //   /recent  — last 5 bookings
 //   /pending — bookings the master has not confirmed yet
+//   /report  — did clients get their messages (yesterday / today / date)
 //   /stats   — 7-day summary (count, revenue, cancellations)
 //   /help    — command list
 //
@@ -36,6 +37,7 @@ if (!FOUNDERS_BOT_TOKEN) {
     notifyFeedback: async () => ({ sent: 0 }),
     notifyModeration: async () => ({ sent: 0 }),
     notifyFounders: async () => ({ sent: 0 }),
+    setReportProvider: () => {},
     setMainBot: () => {},
     processFoundersUpdate: () => {},
     setFoundersWebhook: async () => {},
@@ -160,11 +162,14 @@ bot.onText(/\/start/, async (msg) => {
     `📅 Уведомление о каждой новой записи\n` +
     `❌ Уведомление об отменах\n` +
     `🟡 Сигнал, если мастер не подтверждает запись\n` +
-    `⌛ Сигнал, если запись сгорела без ответа мастера\n\n` +
+    `⌛ Сигнал, если запись сгорела без ответа мастера\n` +
+    `❗️ Сигнал, если клиенту не дошло сообщение\n` +
+    `📋 Отчёт каждое утро в 9:00: всё ли дошло клиентам\n\n` +
     `Команды для аналитики:\n` +
     `/today — все записи на сегодня\n` +
     `/recent — последние 5 записей\n` +
     `/pending — записи, которые ждут подтверждения\n` +
+    `/report — дошли ли сообщения клиентам (вчера)\n` +
     `/stats — сводка за 7 дней\n` +
     `/help — список команд\n\n` +
     `Уведомления подключены. 💜`
@@ -181,6 +186,7 @@ bot.onText(/\/help/, async (msg) => {
     `/today   — записи на сегодня\n` +
     `/recent  — последние 5 записей\n` +
     `/pending — ждут подтверждения мастера\n` +
+    `/report  — дошли ли сообщения клиентам: /report, /report сегодня, /report 2026-09-13\n` +
     `/stats   — сводка за 7 дней\n` +
     `/help    — этот список`
   );
@@ -311,6 +317,29 @@ bot.onText(/\/stats/, async (msg) => {
     `⌛ Сгорели без ответа мастера: <b>${expired}</b>\n\n` +
     `💰 Выручка по подтверждённым: <b>${revenue} BYN</b>`
   );
+});
+
+// ── /report ──────────────────────────────────────────────────
+/* «Получили ли клиенты напоминания?» — ответ по кнопке. Отчёт собирает
+   index.js: там журнал доставки и правила, что и когда клиент должен был
+   получить. Сюда он передаётся через setReportProvider. */
+let reportProvider = null;
+const setReportProvider = (fn) => { reportProvider = fn; };
+
+bot.onText(/\/report(?:@\w+)?(?:\s+(\S+))?/, async (msg, match) => {
+  const chatId = String(msg.chat.id);
+  if (!registeredFounders.has(chatId)) return;
+  if (!reportProvider) { await send(chatId, "⚠️ Отчёт пока недоступен — бот ещё запускается."); return; }
+  const arg = String((match && match[1]) || "").toLowerCase();
+  const day = arg === "сегодня" || arg === "today" ? minskToday(0)
+    : /^\d{4}-\d{2}-\d{2}$/.test(arg) ? arg
+    : minskToday(-1);
+  try {
+    await send(chatId, await reportProvider(day));
+  } catch (e) {
+    console.error("[Founders] /report:", e.message);
+    await send(chatId, "⚠️ Не удалось собрать отчёт. Журнал доставки ещё не создан (патч v26)?");
+  }
 });
 
 // ── /pending ─────────────────────────────────────────────────
@@ -684,4 +713,4 @@ const processFoundersUpdate  = (update) => bot.processUpdate(update);
 const setFoundersWebhook     = (url)    => bot.setWebHook(url);
 const deleteFoundersWebhook  = ()       => bot.deleteWebHook();
 
-module.exports = { notifyFeedback, notifyModeration, notifyFounders, setMainBot, processFoundersUpdate, setFoundersWebhook, deleteFoundersWebhook };
+module.exports = { notifyFeedback, notifyModeration, notifyFounders, setReportProvider, setMainBot, processFoundersUpdate, setFoundersWebhook, deleteFoundersWebhook };
