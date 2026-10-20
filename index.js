@@ -3290,6 +3290,18 @@ app.post("/bookings", async (req, res) => {
     // занятого времени — он знает, что делает. Клиентскую запись — никогда.
     if (clash && !(isBlock && isAdmin)) return res.status(409).json({ error: "slot_taken" });
 
+    /* Блокировка идемпотентна: «Выходной» на это время уже стоит — второй
+       не нужен. Раньше это проверял браузер, вычитывая client_name чужих
+       записей; теперь проверяем здесь, и права на это поле браузеру не нужны. */
+    if (isBlock) {
+      const { data: already } = await db.from("bookings")
+        .select("id").eq("master_id", masterId).eq("booked_date", date)
+        .eq("booked_time", time + ":00").like("client_name", "🔒%").limit(1);
+      if ((already || []).length) {
+        return res.json({ ok: true, duplicate: true, booking: { id: already[0].id } });
+      }
+    }
+
     // Клиент: сам записывающийся или тот, кого вписал администратор
     let clientName, clientTg = null;
     if (isBlock) {
@@ -3465,6 +3477,373 @@ app.post("/notify/cancelled", async (req, res) => {
   }
 });
 
+/* ════════════════════════════════════════════════════════════
+   ЛИЧНЫЕ ДАННЫЕ — читает бот, а не браузер
+   ════════════════════════════════════════════════════════════
+   Публикуемый ключ лежит в index.html: его видит любой, кто откроет
+   исходник страницы. Пока имена, телефоны и telegram id клиентов
+   отдавала сама база, выгрузить их мог кто угодно одной строкой curl
+   (проверено 20 октября 2026: 149 записей и 26 клиентов целиком).
+
+   Теперь эти поля отдаёт только бот и только тому, чья подпись сессии
+   это подтверждает: клиенту — его записи, кабинету — записи своих
+   мастеров. Безличная часть расписания (дата, время, длительность,
+   статус) осталась в базе: без неё клиент не увидел бы свободные окна,
+   а личного в ней нет — права там урезаны по столбцам (патч v28).
+
+   Токен в адресную строку не кладём: он попал бы в журналы Railway и
+   в историю браузера. Поэтому все ручки ниже — POST с телом.        */
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const BK_STATUSES = ["pending", "confirmed", "completed", "cancelled", "declined"];
+
+const sessionOf = (req) => readSession(req.body?.token || req.get("x-uspot-session"));
+
+// Личность обязательна. Отдельной функцией, чтобы ни одна ручка не
+// могла «забыть» проверку и при этом выглядеть как остальные.
+const needSession = (req, res) => {
+  const tgId = sessionOf(req);
+  if (!tgId) { res.status(401).json({ error: "not_authorized" }); return null; }
+  return tgId;
+};
+
+const cleanList = (v, re, max = 60) => [...new Set((Array.isArray(v) ? v : [])
+  .filter((x) => typeof x === "string" && x && (!re || re.test(x))))].slice(0, max);
+
+/* Чьи записи и карточки видит эта сессия: свои профили, мастера своих
+   салонов и коллеги по салону. Считаем один раз на запрос — на этом
+   множестве стоит вся проверка «своё/чужое», поэтому id из запроса мы
+   не доверяем, а пересекаем с ним. */
+const visibleMasters = async (owners) => {
+  const ids = new Set(owners.map((o) => o.id));
+  const salonIds = [...new Set(owners
+    .flatMap((o) => [o.kind === "salon" ? o.id : null, o.salon_id])
+    .filter(Boolean))];
+  if (salonIds.length) {
+    const { data } = await db.from("masters").select("id").in("salon_id", salonIds);
+    (data || []).forEach((m) => ids.add(m.id));
+  }
+  return ids;
+};
+
+// Кабинет этой сессии или отказ. Возвращает null, ответ уже отправлен.
+const needCabinet = async (req, res) => {
+  const tgId = needSession(req, res);
+  if (!tgId) return null;
+  const owners = await ownedCabinets(tgId);
+  if (!owners.length) { res.status(403).json({ error: "forbidden" }); return null; }
+  return { tgId, owners, visible: await visibleMasters(owners) };
+};
+
+// ── POST /cabinet/bookings ────────────────────────────────
+// Записи своих мастеров: кабинет мастера, салона, администратора.
+// master_ids из запроса — это просьба, а не право: оставляем только те,
+// что принадлежат этой сессии.
+app.post("/cabinet/bookings", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const b = req.body || {};
+    const asked = cleanList(b.master_ids, UUID_RE);
+    if (!asked.length) return res.status(400).json({ error: "bad_request" });
+    const mine = asked.filter((id) => c.visible.has(id));
+    if (mine.length !== asked.length) {
+      console.warn(`🚫 /cabinet/bookings: сессия ${c.tgId} просила чужие кабинеты — отброшено ${asked.length - mine.length}`);
+    }
+    if (!mine.length) return res.json({ ok: true, rows: [] });
+
+    let q = db.from("bookings").select("*").in("master_id", mine);
+    if (DATE_RE.test(b.date  || "")) q = q.eq("booked_date", b.date);
+    if (DATE_RE.test(b.from  || "")) q = q.gte("booked_date", b.from);
+    if (DATE_RE.test(b.to    || "")) q = q.lte("booked_date", b.to);
+    if (DATE_RE.test(b.after || "")) q = q.gt("booked_date", b.after);
+    const inSt  = cleanList(b.status_in, null, 8).filter((s) => BK_STATUSES.includes(s));
+    const notSt = cleanList(b.status_not_in, null, 8).filter((s) => BK_STATUSES.includes(s));
+    if (inSt.length)  q = q.in("status", inSt);
+    if (notSt.length) q = q.not("status", "in", `(${notSt.join(",")})`);
+    // Карточка клиента: история одного человека у этого кабинета
+    if (b.client_tg) q = q.eq("client_telegram_id", String(b.client_tg).slice(0, 32));
+    else if (b.client_name) q = q.eq("client_name", String(b.client_name).slice(0, 120));
+    /* Порядок дней и порядок времени внутри дня задаются отдельно: в
+       истории дни идут от новых к старым, а визиты внутри дня — с утра. */
+    const asc  = b.order !== "desc";
+    const tasc = b.time_order ? b.time_order !== "desc" : asc;
+    q = q.order("booked_date", { ascending: asc }).order("booked_time", { ascending: tasc })
+         .limit(Math.min(Math.max(+b.limit || 500, 1), 1000));
+
+    const { data, error } = await q;
+    if (error) { console.error("/cabinet/bookings:", error.message); return res.status(500).json({ error: "lookup_failed" }); }
+    res.json({ ok: true, rows: data || [] });
+  } catch (e) {
+    console.error("/cabinet/bookings:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /client/bookings ─────────────────────────────────
+// Свои записи клиента. Telegram id берём из подписи, из запроса — никогда.
+app.post("/client/bookings", async (req, res) => {
+  try {
+    const tgId = needSession(req, res); if (!tgId) return;
+    const b = req.body || {};
+    const asc = b.order !== "desc";
+    const { data, error } = await db.from("bookings").select("*")
+      .eq("client_telegram_id", String(tgId))
+      .order("booked_date", { ascending: asc }).order("booked_time", { ascending: asc })
+      .limit(Math.min(Math.max(+b.limit || 200, 1), 500));
+    if (error) { console.error("/client/bookings:", error.message); return res.status(500).json({ error: "lookup_failed" }); }
+    res.json({ ok: true, rows: data || [] });
+  } catch (e) {
+    console.error("/client/bookings:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /booking ─────────────────────────────────────────
+// Одна запись целиком — своему клиенту или своему кабинету.
+app.post("/booking", async (req, res) => {
+  try {
+    const tgId = needSession(req, res); if (!tgId) return;
+    const id = String(req.body?.id || "");
+    if (!UUID_RE.test(id)) return res.status(400).json({ error: "bad_request" });
+    const { data: row, error } = await db.from("bookings").select("*").eq("id", id).maybeSingle();
+    if (error) { console.error("/booking:", error.message); return res.status(500).json({ error: "lookup_failed" }); }
+    if (!row) return res.json({ ok: true, row: null });
+    if (String(row.client_telegram_id || "") === String(tgId)) return res.json({ ok: true, row });
+    const owners = await ownedCabinets(tgId);
+    const visible = await visibleMasters(owners);
+    if (visible.has(row.master_id) || ownsBooking(owners, row)) return res.json({ ok: true, row });
+    console.warn(`🚫 /booking: сессия ${tgId} просила чужую запись ${id}`);
+    res.status(403).json({ error: "forbidden" });
+  } catch (e) {
+    console.error("/booking:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ── Заметки о клиенте ────────────────────────────────────
+   Самое чувствительное, что есть в базе: аллергии и предпочтения.
+   Владелец карточки — мастер или салон (обе сущности живут в masters),
+   поэтому owner_id обязан быть кабинетом этой сессии.               */
+const noteKey = (q, b) => (b.client_tg
+  ? q.eq("client_tg", String(b.client_tg).slice(0, 32))
+  : q.eq("client_name", String(b.client_name || "").slice(0, 120)));
+
+app.post("/client/note", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const b = req.body || {};
+    if (!UUID_RE.test(String(b.owner_id || "")) || !c.visible.has(b.owner_id)) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    if (!b.client_tg && !b.client_name) return res.status(400).json({ error: "bad_request" });
+    const { data, error } = await noteKey(
+      db.from("client_notes").select("*").eq("owner_id", b.owner_id).limit(1), b);
+    if (error) { console.error("/client/note:", error.message); return res.status(500).json({ error: "lookup_failed" }); }
+    res.json({ ok: true, row: (data || [])[0] || null });
+  } catch (e) {
+    console.error("/client/note:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/client/note/save", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const b = req.body || {};
+    if (!UUID_RE.test(String(b.owner_id || "")) || !c.visible.has(b.owner_id)) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    if (!b.client_tg && !b.client_name) return res.status(400).json({ error: "bad_request" });
+    const text = (v) => { const s = String(v == null ? "" : v).trim().slice(0, 2000); return s || null; };
+    const row = {
+      owner_id: b.owner_id,
+      client_tg: b.client_tg ? String(b.client_tg).slice(0, 32) : null,
+      client_name: b.client_tg ? null : String(b.client_name || "").slice(0, 120),
+      note: text(b.note), allergies: text(b.allergies), preferences: text(b.preferences),
+      updated_at: new Date().toISOString(),
+    };
+    /* Пара «владелец + клиент» уникальна: сначала ищем строку, потом
+       дописываем. Так второй администратор или двойной тап не упираются
+       в 23505, а просто обновляют одну и ту же карточку. */
+    const { data: ex } = await noteKey(
+      db.from("client_notes").select("id").eq("owner_id", b.owner_id).limit(1), b);
+    let out = null, err = null;
+    if (ex && ex[0]) {
+      const r = await db.from("client_notes").update(row).eq("id", ex[0].id).select().maybeSingle();
+      out = r.data; err = r.error;
+    } else {
+      const r = await db.from("client_notes").insert(row).select().maybeSingle();
+      out = r.data; err = r.error;
+      if (err && err.code === "23505") {
+        const { data: again } = await noteKey(
+          db.from("client_notes").select("id").eq("owner_id", b.owner_id).limit(1), b);
+        if (again && again[0]) {
+          const r2 = await db.from("client_notes").update(row).eq("id", again[0].id).select().maybeSingle();
+          out = r2.data; err = r2.error;
+        }
+      }
+    }
+    if (err) { console.error("/client/note/save:", err.message); return res.status(500).json({ error: "save_failed" }); }
+    res.json({ ok: true, row: out });
+  } catch (e) {
+    console.error("/client/note/save:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ── Оценки клиента ───────────────────────────────────────
+   Средняя оценка клиента — для мастера подсказка, для клиента чужое
+   мнение о нём: отдаём только кабинету. Ставит оценку тоже кабинет. */
+app.post("/client/rating", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const tg = String(req.body?.client_tg || "").slice(0, 32);
+    if (!tg) return res.status(400).json({ error: "bad_request" });
+    const { data, error } = await db.from("client_ratings").select("rating").eq("client_telegram_id", tg);
+    if (error) { console.error("/client/rating:", error.message); return res.status(500).json({ error: "lookup_failed" }); }
+    const rows = data || [];
+    const avg = rows.length ? rows.reduce((s, r) => s + (+r.rating || 0), 0) / rows.length : null;
+    res.json({ ok: true, count: rows.length, avg: avg === null ? null : Math.round(avg * 10) / 10 });
+  } catch (e) {
+    console.error("/client/rating:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/client/rating/add", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const b = req.body || {};
+    const tg = String(b.client_tg || "").slice(0, 32);
+    const rating = Math.round(+b.rating || 0);
+    if (!tg || rating < 1 || rating > 5) return res.status(400).json({ error: "bad_request" });
+    if (!UUID_RE.test(String(b.master_id || "")) || !c.visible.has(b.master_id)) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    const bookingId = UUID_RE.test(String(b.booking_id || "")) ? b.booking_id : null;
+    const { error } = await db.from("client_ratings").insert({
+      master_id: b.master_id, client_telegram_id: tg, booking_id: bookingId, rating });
+    if (error) { console.error("/client/rating/add:", error.message); return res.status(500).json({ error: "save_failed" }); }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/client/rating/add:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ── Чёрный список ───────────────────────────────────────
+   Список видит только его хозяин: там имена и telegram id людей.
+   Клиенту о себе отвечаем да/нет — и только про себя.             */
+app.post("/blacklist/list", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const id = String(req.body?.master_id || "");
+    if (!UUID_RE.test(id) || !c.visible.has(id)) return res.status(403).json({ error: "forbidden" });
+    const { data, error } = await db.from("master_blacklist").select("*")
+      .eq("master_id", id).order("created_at", { ascending: false });
+    if (error) { console.error("/blacklist/list:", error.message); return res.status(500).json({ error: "lookup_failed" }); }
+    res.json({ ok: true, rows: data || [] });
+  } catch (e) {
+    console.error("/blacklist/list:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/blacklist/check", async (req, res) => {
+  try {
+    const tgId = needSession(req, res); if (!tgId) return;
+    const id = String(req.body?.master_id || "");
+    if (!UUID_RE.test(id)) return res.status(400).json({ error: "bad_request" });
+    const { data, error } = await db.from("master_blacklist").select("id")
+      .eq("master_id", id).eq("client_telegram_id", String(tgId)).limit(1);
+    if (error) { console.error("/blacklist/check:", error.message); return res.status(500).json({ error: "lookup_failed" }); }
+    res.json({ ok: true, blacklisted: !!(data || []).length });
+  } catch (e) {
+    console.error("/blacklist/check:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/blacklist/add", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const b = req.body || {};
+    const tg = String(b.client_tg || "").slice(0, 32);
+    if (!UUID_RE.test(String(b.master_id || "")) || !c.visible.has(b.master_id)) {
+      return res.status(403).json({ error: "forbidden" });
+    }
+    if (!tg) return res.status(400).json({ error: "bad_request" });
+    const { error } = await db.from("master_blacklist").upsert({
+      master_id: b.master_id, client_telegram_id: tg,
+      client_name: String(b.client_name || "Клиент").slice(0, 120),
+    }, { onConflict: "master_id,client_telegram_id" });
+    if (error) { console.error("/blacklist/add:", error.message); return res.status(500).json({ error: "save_failed" }); }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/blacklist/add:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/blacklist/remove", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const id = String(req.body?.id || "");
+    if (!UUID_RE.test(id)) return res.status(400).json({ error: "bad_request" });
+    const { data: row } = await db.from("master_blacklist").select("id, master_id").eq("id", id).maybeSingle();
+    if (!row) return res.json({ ok: true });
+    if (!c.visible.has(row.master_id)) {
+      console.warn(`🚫 /blacklist/remove: сессия ${c.tgId} просила чужую строку ${id}`);
+      return res.status(403).json({ error: "forbidden" });
+    }
+    const { error } = await db.from("master_blacklist").delete().eq("id", id);
+    if (error) { console.error("/blacklist/remove:", error.message); return res.status(500).json({ error: "save_failed" }); }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/blacklist/remove:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ── Заявка на салон ─────────────────────────────────────
+   В заявке телефон и имя заявителя. Отдаём только его собственную:
+   telegram id берём из подписи, а не из запроса.                  */
+app.post("/salon/application", async (req, res) => {
+  try {
+    const tgId = needSession(req, res); if (!tgId) return;
+    const { data, error } = await db.from("salon_applications").select("*")
+      .eq("telegram_user_id", String(tgId))
+      .order("created_at", { ascending: false }).limit(1);
+    if (error) { console.error("/salon/application:", error.message); return res.status(500).json({ error: "lookup_failed" }); }
+    res.json({ ok: true, row: (data || [])[0] || null });
+  } catch (e) {
+    console.error("/salon/application:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/salon/application/new", async (req, res) => {
+  try {
+    const tgId = needSession(req, res); if (!tgId) return;
+    const b = req.body || {};
+    const salonName = String(b.salon_name || "").trim().slice(0, 120);
+    const contact   = String(b.contact || "").trim().slice(0, 120);
+    if (salonName.length < 2 || contact.length < 3) return res.status(400).json({ error: "bad_request" });
+    const { data, error } = await db.from("salon_applications").insert({
+      telegram_user_id: String(tgId),
+      applicant_name: String(b.applicant_name || "").trim().slice(0, 120) || null,
+      applicant_username: String(b.applicant_username || "").trim().slice(0, 60) || null,
+      salon_name: salonName, contact,
+    }).select().maybeSingle();
+    if (error) { console.error("/salon/application/new:", error.message); return res.status(500).json({ error: "save_failed" }); }
+    res.json({ ok: true, row: data || null });
+  } catch (e) {
+    console.error("/salon/application/new:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── POST /broadcast ───────────────────────────────────────
 // Рассылка по клиентам. Раньше проверка акционера срабатывала только
 // если shareholder_id прислали — не прислал, и проверки не было вовсе;
@@ -3563,6 +3942,40 @@ app.post("/notify_moderation", async (req, res) => {
     const result = await notifyModeration({ ...req.body, dashboardUrl: moderationLink() });
     res.json({ ok: true, ...result });
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ── POST /moderation/salon-apps ─────────────────────────────
+   Заявки на салон для страницы модерации. Раньше страница читала
+   salon_applications публичным ключом — вместе с телефонами заявителей
+   её читал кто угодно. Теперь отдаём по тому же ключу модерации, по
+   которому принимаются решения. */
+app.post("/moderation/salon-apps", async (req, res) => {
+  const { key } = req.body || {};
+  if (!MODERATION_KEY) {
+    return res.status(503).json({ error: "MODERATION_KEY не задан в переменных Railway" });
+  }
+  if (String(key || "") !== MODERATION_KEY) {
+    return res.status(403).json({ error: "Неверный ключ модерации. Откройте страницу по ссылке из чата фаундеров." });
+  }
+  try {
+    const { data, error } = await db.from("salon_applications")
+      .select("*").eq("status", "pending").order("created_at", { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+    const apps = data || [];
+    // Есть ли у заявителя профили в Uspot — это меняет решение
+    const tgs = [...new Set(apps.map((a) => a.telegram_user_id).filter(Boolean))];
+    if (tgs.length) {
+      const { data: owned } = await db.from("masters")
+        .select("id, name, kind, telegram_user_id").in("telegram_user_id", tgs);
+      const byTg = {};
+      (owned || []).forEach((m) => { (byTg[m.telegram_user_id] = byTg[m.telegram_user_id] || []).push(m); });
+      apps.forEach((a) => { a._owned = byTg[a.telegram_user_id] || []; });
+    }
+    res.json({ ok: true, rows: apps });
+  } catch (e) {
+    console.error("/moderation/salon-apps:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
