@@ -4,16 +4,19 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Политика обработки персональных данных — Uspot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet"/>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: #f9f9fb;
-      color: #1a1a2e;
+      color: #111111;
       line-height: 1.75;
     }
     header {
-      background: linear-gradient(135deg, #7C3AED, #06B6D4);
+      background: linear-gradient(135deg, #7B61FF 0%, #5AC8FA 50%, #FBCFE8 100%);
       padding: 40px 24px;
       text-align: center;
       color: #fff;
@@ -29,27 +32,27 @@
       background: #fff;
       border-radius: 16px;
       padding: 28px 32px;
-      box-shadow: 0 2px 16px rgba(124,58,237,0.07);
+      box-shadow: 0 2px 16px rgba(123,97,255,0.07);
       margin-bottom: 20px;
     }
     h2 {
       font-size: 16px;
       font-weight: 700;
-      color: #7C3AED;
+      color: #7B61FF;
       margin-bottom: 12px;
       padding-bottom: 8px;
-      border-bottom: 1px solid #f0eaff;
+      border-bottom: 1px solid rgba(123,97,255,0.12);
     }
     h3 {
       font-size: 14px;
       font-weight: 600;
-      color: #1a1a2e;
+      color: #111111;
       margin: 14px 0 6px;
     }
     p { font-size: 14px; color: #374151; margin-bottom: 10px; }
     ul, ol { margin: 6px 0 12px 22px; }
     ul li, ol li { font-size: 14px; color: #374151; margin-bottom: 5px; }
-    a { color: #7C3AED; text-decoration: none; }
+    a { color: #7B61FF; text-decoration: none; }
     a:hover { text-decoration: underline; }
     .warn {
       background: #FFF7ED;
@@ -71,20 +74,54 @@
     }
     .meta { font-size: 12px; color: #9ca3af; margin-top: 4px; }
     table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 13px; }
-    th { background: #f4f0ff; color: #7C3AED; font-weight: 600; padding: 9px 11px; text-align: left; }
+    th { background: rgba(123,97,255,0.06); color: #7B61FF; font-weight: 600; padding: 9px 11px; text-align: left; }
     td { padding: 8px 11px; border-bottom: 1px solid #f3f4f6; color: #374151; vertical-align: top; }
     tr:last-child td { border-bottom: none; }
     footer { text-align: center; padding: 24px; font-size: 13px; color: #9ca3af; }
-    footer a { color: #7C3AED; }
-    .back-link { display: inline-block; color: #7C3AED; font-size: 14px; margin-bottom: 24px; font-weight: 500; }
-    code { background: #f4f0ff; color: #7C3AED; padding: 1px 6px; border-radius: 4px; font-size: 13px; }
+    footer a { color: #7B61FF; }
+    .back-link { display: inline-block; color: #7B61FF; font-size: 14px; margin-bottom: 24px; font-weight: 500; }
+    code { background: rgba(123,97,255,0.06); color: #7B61FF; padding: 1px 6px; border-radius: 4px; font-size: 13px; }
+    /* ── table scroll wrapper ── */
+    .table-wrap {
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      margin: 12px 0;
+      border-radius: 8px;
+    }
+    .table-wrap table { margin: 0; }
+    .table-wide table { min-width: 560px; }
+    .table-wide::after {
+      display: none;
+      content: "← прокрутите →";
+      font-size: 11px;
+      color: #aaa;
+      text-align: center;
+      padding: 4px 0 2px;
+    }
+    @media (max-width: 520px) {
+      .table-wide::after { display: block; }
+    }
+    /* ── mobile overrides ── */
+    @media (max-width: 520px) {
+      .card { padding: 20px 16px; }
+      main  { padding: 0 12px 60px; margin: 24px auto; }
+      h2    { font-size: 15px; }
+      p, ul li, ol li { font-size: 13px; word-break: break-word; overflow-wrap: break-word; }
+      td { font-size: 12px; padding: 7px 9px; word-break: break-word; overflow-wrap: break-word; }
+      th { font-size: 12px; padding: 7px 9px; white-space: nowrap; }
+      .warn, .ok { font-size: 12px; }
+      code  { font-size: 12px; word-break: break-all; }
+      a     { word-break: break-all; }
+      header h1 { font-size: 20px; }
+      header p  { font-size: 13px; }
+    }
   </style>
 </head>
 <body>
 
 <header>
   <h1>Политика обработки персональных данных</h1>
-  <p>ООО «Юспот» · Редакция от 11 мая 2026 г.</p>
+  <p>ООО «ЮСПОТ» · Редакция от 25 октября 2026 г.</p>
 </header>
 
 <main>
@@ -99,13 +136,14 @@
     </p>
     <p>
       <strong>Оператор персональных данных:</strong><br/>
-      ООО «Юспот»<br/>
-      Адрес: Республика Беларусь, г. Минск, ул. Прушинских, 42<br/>
-      Контактный e-mail: <a href="mailto:2zhukavets@gmail.com">2zhukavets@gmail.com</a>
+      ООО «ЮСПОТ», УНП 194048760<br/>
+      Место нахождения: 220019, Республика Беларусь, г. Минск, ул. Сухаревская, 16, пом. 97<br/>
+      Контактный e-mail: <a href="mailto:uspot@gmail.com">uspot@gmail.com</a><br/>
+      Телефон: +375 25 699-47-15
     </p>
     <p>
       Политика распространяется на обработку данных при использовании Telegram Mini App
-      <strong>Uspot</strong> и сайта <a href="https://uspotbeauty.netlify.app">uspotbeauty.netlify.app</a>.
+      <strong>Uspot</strong> и сайта <a href="https://uspot.by">uspot.by</a>.
     </p>
   </div>
 
@@ -126,22 +164,22 @@
   <div class="card">
     <h2>3. Состав обрабатываемых персональных данных</h2>
     <h3>Данные клиентов</h3>
-    <table>
+    <div class="table-wrap"><table>
       <tr><th>Данные</th><th>Источник</th></tr>
       <tr><td>Telegram User ID, имя, фамилия, username</td><td>Telegram Web App API при запуске</td></tr>
       <tr><td>История записей: мастер, услуга, дата, время, цена, статус</td><td>Действия в приложении</td></tr>
       <tr><td>Комментарии и фото к записи (по желанию)</td><td>Пользователь</td></tr>
       <tr><td>Текст отзывов и оценки (по желанию)</td><td>Пользователь</td></tr>
-    </table>
+    </table></div>
     <h3>Данные мастеров</h3>
-    <table>
+    <div class="table-wrap"><table>
       <tr><th>Данные</th><th>Источник</th></tr>
       <tr><td>Имя, специализация, биография, город, фото профиля</td><td>Мастер при регистрации</td></tr>
       <tr><td>Telegram User ID мастера</td><td>Telegram Web App API</td></tr>
       <tr><td>Рабочее расписание и занятые слоты</td><td>Мастер в личном кабинете</td></tr>
       <tr><td>Фотографии работ (без изображений лиц клиентов)</td><td>Мастер</td></tr>
       <tr><td>Цены на услуги</td><td>Мастер</td></tr>
-    </table>
+    </table></div>
     <div class="warn">
       ⚠️ Специальные категории данных (здоровье, биометрия, расовое происхождение и иные, указанные в ст. 2 Закона)
       <strong>не обрабатываются</strong>. Портфолио содержит только изображения работ мастеров без лиц клиентов.
@@ -151,7 +189,7 @@
   <!-- 4. Правовые основания -->
   <div class="card">
     <h2>4. Правовые основания обработки</h2>
-    <table>
+    <div class="table-wrap"><table>
       <tr><th>Цель обработки</th><th>Основание</th></tr>
       <tr>
         <td>Запись, история посещений</td>
@@ -173,54 +211,87 @@
         <td>Публикация отзывов</td>
         <td>Ст. 6 ч. 2 Закона — согласие (добровольная публикация пользователем)</td>
       </tr>
-    </table>
+    </table></div>
   </div>
 
   <!-- 5. Трансграничная передача -->
   <div class="card">
     <h2>5. Трансграничная передача персональных данных</h2>
-    <table>
-      <tr><th>Получатель</th><th>Страна / регион</th><th>Данные</th><th>Уровень защиты</th></tr>
+
+    <h3>5.1 Уполномоченные лица (обработчики данных)</h3>
+    <p>Следующие организации обрабатывают данные исключительно по поручению ООО «ЮСПОТ»:</p>
+    <div class="table-wrap table-wide"><table>
+      <tr><th>Организация</th><th>Страна</th><th>Данные</th><th>Уровень защиты</th></tr>
       <tr>
-        <td><strong>Telegram Messenger</strong></td>
-        <td>США</td>
-        <td>Telegram ID, имя, уведомления</td>
-        <td>⚠️ Требуется согласие</td>
-      </tr>
-      <tr>
-        <td><strong>Supabase Inc.</strong> (база данных)</td>
-        <td>Германия, ЕС (eu-central-1)</td>
+        <td><strong>Supabase Inc.</strong><br/><small>хранение данных</small></td>
+        <td>Германия 🇩🇪<br/><small>(eu-central-1, Frankfurt)</small></td>
         <td>Все данные приложения</td>
-        <td>✅ Адекватный уровень (ЕС)</td>
+        <td>✅ Адекватный уровень — ЕС/GDPR</td>
       </tr>
       <tr>
-        <td><strong>Railway Technologies Inc.</strong> (бот-сервер)</td>
-        <td>США</td>
+        <td><strong>Railway Technologies Inc.</strong><br/><small>сервер Telegram-бота</small></td>
+        <td>США 🇺🇸</td>
         <td>Telegram ID, данные для уведомлений</td>
-        <td>⚠️ Требуется согласие</td>
+        <td>⚠️ Недостаточный — требуется согласие</td>
       </tr>
-    </table>
-    <p>
-      Согласие на передачу данных в США запрашивается при <strong>первом запуске</strong> приложения.
-      Без принятия условий использование сервиса невозможно.
-    </p>
+    </table></div>
+
+    <h3>5.2 Иные лица (самостоятельные операторы)</h3>
+    <p>Следующие организации получают данные и обрабатывают их самостоятельно, в соответствии со своими политиками:</p>
+    <div class="table-wrap table-wide"><table>
+      <tr><th>Организация</th><th>Страна</th><th>Данные</th><th>Уровень защиты</th></tr>
+      <tr>
+        <td><strong>Telegram Messenger Inc.</strong><br/><small>платформа мини-приложения</small></td>
+        <td>США 🇺🇸</td>
+        <td>Telegram ID, имя, username, уведомления</td>
+        <td>⚠️ Недостаточный — требуется согласие</td>
+      </tr>
+    </table></div>
+
+    <div class="warn">
+      <strong>⚠️ Уведомление о рисках передачи данных в США (ст. 10 ч. 4 Закона №99-З)</strong><br/><br/>
+      Соединённые Штаты Америки не обеспечивают адекватный уровень защиты персональных данных.
+      Передача ваших данных в США сопряжена со следующими рисками:
+      <ul style="margin:8px 0 0 18px;">
+        <li>отсутствие специального законодательства о защите персональных данных, обязательного для частных компаний;</li>
+        <li>отсутствие независимого надзорного органа по защите персональных данных;</li>
+        <li>ограниченные права иностранных граждан в отношении своих персональных данных;</li>
+        <li>возможность доступа государственных органов США к персональным данным без уведомления субъекта.</li>
+      </ul>
+      <br/>
+      Нажимая «Принять и продолжить» при первом запуске приложения, вы даёте свободное,
+      однозначное и информированное согласие на такую передачу данных.
+      Вы вправе отозвать согласие в любой момент, удалив свои данные через раздел «Профиль».
+    </div>
+
     <div class="ok">
-      ✅ Хранение данных в Supabase на серверах в Германии (ЕС) не требует отдельного согласия —
-      Германия обеспечивает адекватный уровень защиты персональных данных.
+      ✅ Данные в Supabase хранятся на серверах в Германии (ЕС). Германия обеспечивает
+      адекватный уровень защиты персональных данных — отдельное согласие не требуется.
     </div>
   </div>
 
-  <!-- 6. Сроки хранения -->
+  <!-- 6. Сроки хранения и удаление -->
   <div class="card">
-    <h2>6. Сроки хранения</h2>
-    <table>
-      <tr><th>Данные</th><th>Срок</th></tr>
-      <tr><td>История записей</td><td>3 года с последней записи (ст. 196 ГК РБ)</td></tr>
-      <tr><td>Профиль пользователя (имя, bio)</td><td>До удаления аккаунта или прекращения деятельности оператора</td></tr>
-      <tr><td>Отзывы</td><td>До удаления пользователем или профиля мастера</td></tr>
-      <tr><td>Портфолио мастера</td><td>До удаления мастером или закрытия профиля</td></tr>
-    </table>
-    <p>По истечении сроков данные удаляются в течение <strong>30 календарных дней</strong>.</p>
+    <h2>6. Сроки хранения и порядок удаления данных</h2>
+    <div class="table-wrap"><table>
+      <tr><th>Данные</th><th>Срок хранения</th></tr>
+      <tr><td>История записей (дата, услуга, цена, статус)</td><td>3 года с даты последней записи (ст. 196 ГК РБ)</td></tr>
+      <tr><td>Профиль клиента (имя, Telegram ID)</td><td>До удаления пользователем или прекращения деятельности оператора</td></tr>
+      <tr><td>Отзывы клиентов</td><td>До удаления пользователем или удаления профиля мастера</td></tr>
+      <tr><td>Профиль мастера и портфолио</td><td>До удаления мастером или закрытия профиля</td></tr>
+    </table></div>
+
+    <h3>Что происходит при удалении данных</h3>
+    <p>При запросе на удаление через раздел <strong>«Профиль → Удалить мои данные»</strong> или по email-обращению:</p>
+    <ul>
+      <li>история записей, профиль и отзывы <strong>удаляются</strong> из базы данных в течение 15 календарных дней;</li>
+      <li>данные удаляются из кэша и локального хранилища устройства немедленно;</li>
+      <li>согласие на обработку считается отозванным с момента удаления.</li>
+    </ul>
+    <p>
+      После удаления повторная регистрация возможна в любое время — данные предыдущего
+      аккаунта при этом не восстанавливаются.
+    </p>
   </div>
 
   <!-- 7. Права субъектов -->
@@ -236,9 +307,9 @@
     </ul>
     <h3>Как подать запрос</h3>
     <p>
-      Напишите на <a href="mailto:2zhukavets@gmail.com">2zhukavets@gmail.com</a>
+      Напишите на <a href="mailto:uspot@gmail.com">uspot@gmail.com</a>
       с темой <code>Запрос по персональным данным</code>, указав Telegram username или ID и суть обращения.
-      Срок рассмотрения — <strong>15 рабочих дней</strong>.
+      Срок рассмотрения — <strong>15 календарных дней</strong>.
     </p>
     <p>
       Быстрое удаление доступно также через раздел
@@ -247,7 +318,7 @@
     <p>
       Вы также вправе обратиться в надзорный орган:
       Национальный центр защиты персональных данных РБ —
-      <a href="https://www.ncpd.by" target="_blank">www.ncpd.by</a>.
+      <a href="https://cpd.by" target="_blank">cpd.by</a>.
     </p>
   </div>
 
@@ -273,24 +344,77 @@
     </p>
   </div>
 
-  <!-- 10. Изменения -->
+  <!-- 10. Google Календарь -->
   <div class="card">
-    <h2>10. Изменения в Политике</h2>
+    <h2>10. Интеграция с Google Календарём</h2>
+    <p>
+      Мастер по собственному желанию может подключить Google Календарь, чтобы подтверждённые
+      записи автоматически появлялись в его расписании. Интеграция <strong>полностью
+      добровольна</strong>: без неё все функции сервиса работают в обычном режиме.
+      Клиентов эта интеграция не затрагивает — их аккаунты Google сервис не запрашивает.
+    </p>
+
+    <h3>Какие данные Google мы получаем</h3>
+    <div class="table-wrap"><table>
+      <tr><th>Данные</th><th>Назначение</th></tr>
+      <tr><td>Разрешение <code>calendar.events</code> — создание и изменение событий в календаре мастера</td><td>Записать подтверждённую бронь в расписание мастера</td></tr>
+      <tr><td>Токены доступа и обновления (access / refresh token)</td><td>Поддерживать связь с календарём без повторной авторизации</td></tr>
+      <tr><td>Идентификатор созданного события</td><td>Обновить или удалить событие при переносе либо отмене записи</td></tr>
+    </table></div>
+
+    <h3>Что мы делаем и чего не делаем</h3>
+    <ul>
+      <li>Мы записываем в основной календарь мастера только те события, которые созданы через Uspot: услуга, имя клиента, время, цена, статус.</li>
+      <li>Мы <strong>не читаем</strong> и не сохраняем личные события мастера, его контакты и другие данные аккаунта Google.</li>
+      <li>Мы <strong>не передаём</strong> данные Google третьим лицам, не используем их для рекламы, профилирования и не продаём их.</li>
+      <li>Данные Google <strong>не применяются</strong> для обучения моделей искусственного интеллекта.</li>
+      <li>Запрашивается минимально необходимое разрешение: доступа ко всему аккаунту Google и к списку календарей сервис не имеет.</li>
+    </ul>
+
+    <h3>Хранение и отзыв доступа</h3>
+    <p>
+      Токены хранятся в защищённой базе данных сервиса (шифрование при хранении на стороне
+      провайдера, доступ — только у серверной части Uspot) и используются исключительно
+      для описанной синхронизации. Мастер может отключить интеграцию в любой момент:
+      <strong>Профиль → Google Календарь → Отключить</strong> — токены удаляются немедленно.
+      Также доступ отзывается на стороне Google на странице
+      <a href="https://myaccount.google.com/permissions" target="_blank" rel="noopener">myaccount.google.com/permissions</a>.
+      После отзыва ранее созданные события остаются в календаре мастера и могут быть удалены им вручную.
+    </p>
+
+    <div class="warn">
+      Использование и передача сервисом Uspot информации, полученной от Google API,
+      осуществляются в соответствии с
+      <a href="https://developers.google.com/terms/api-services-user-data-policy" target="_blank" rel="noopener">Google API Services User Data Policy</a>,
+      включая требования Limited Use.
+      <br/><br/>
+      <em>Uspot’s use and transfer of information received from Google APIs to any other app
+      will adhere to the
+      <a href="https://developers.google.com/terms/api-services-user-data-policy" target="_blank" rel="noopener">Google API Services User Data Policy</a>,
+      including the Limited Use requirements.</em>
+    </div>
+  </div>
+
+  <!-- 11. Изменения -->
+  <div class="card">
+    <h2>11. Изменения в Политике</h2>
     <p>
       Актуальная версия всегда доступна на
-      <a href="https://uspotbeauty.netlify.app/privacy">uspotbeauty.netlify.app/privacy</a>.
+      <a href="https://uspot.by/privacy">uspot.by/privacy</a>.
       При существенных изменениях мы направим уведомление в приложении не позднее чем за 10 дней.
     </p>
     <p class="meta">Дата вступления в силу: 11 мая 2026 г.</p>
   </div>
 
-  <!-- 11. Контакты -->
+  <!-- 12. Контакты -->
   <div class="card">
-    <h2>11. Контакты оператора</h2>
+    <h2>12. Контакты оператора</h2>
     <p>
-      ООО «Юспот»<br/>
-      Республика Беларусь, г. Минск, ул. Прушинских, 42<br/>
-      E-mail: <a href="mailto:2zhukavets@gmail.com">2zhukavets@gmail.com</a><br/>
+      ООО «ЮСПОТ», УНП 194048760<br/>
+      220019, Республика Беларусь, г. Минск, ул. Сухаревская, 16, пом. 97<br/>
+      E-mail: <a href="mailto:uspot@gmail.com">uspot@gmail.com</a><br/>
+      Телефон: +375 25 699-47-15<br/>
+      Директор: Саковский Евгений Альбертович<br/>
       Telegram: <a href="https://t.me/UspotTG_bot">@UspotTG_bot</a>
     </p>
   </div>
@@ -299,7 +423,7 @@
 
 <footer>
   © 2026 ООО «Юспот». Все права защищены. ·
-  <a href="/">Главная</a>
+  <a href="/home">Главная</a>
 </footer>
 
 </body>

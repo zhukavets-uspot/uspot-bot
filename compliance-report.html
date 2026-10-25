@@ -5,14 +5,14 @@
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Uspot — Отчёт по соответствию законодательству о персональных данных</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
   *{box-sizing:border-box;margin:0;padding:0;}
-  body{font-family:'Inter',system-ui,sans-serif;background:#f4f4f8;color:#1a1a2e;line-height:1.65;}
+  body{font-family:'Inter',system-ui,sans-serif;background:#f4f4f8;color:#111111;line-height:1.65;}
 
   /* Cover */
-  .cover{background:linear-gradient(135deg,#7C3AED,#06B6D4);color:white;padding:56px 48px 48px;}
+  .cover{background:linear-gradient(135deg,#7B61FF 0%,#5AC8FA 50%,#FBCFE8 100%);color:white;padding:56px 48px 48px;}
   .cover-tag{font-size:11px;font-weight:700;letter-spacing:1.8px;text-transform:uppercase;opacity:.7;margin-bottom:14px;}
-  .cover h1{font-size:34px;font-weight:800;line-height:1.2;margin-bottom:10px;}
+  .cover h1{font-size:34px;font-weight:700;line-height:1.2;margin-bottom:10px;}
   .cover-sub{font-size:16px;opacity:.85;margin-bottom:32px;}
   .cover-meta{display:flex;gap:16px;flex-wrap:wrap;}
   .cover-meta div{background:rgba(255,255,255,.15);border-radius:10px;padding:10px 18px;font-size:13px;}
@@ -22,15 +22,15 @@
   .content{max-width:960px;margin:0 auto;padding:48px 32px 80px;}
 
   /* Section headings */
-  .section-label{display:inline-block;background:linear-gradient(135deg,#7C3AED,#06B6D4);color:white;
+  .section-label{display:inline-block;background:linear-gradient(135deg,#7B61FF 0%,#5AC8FA 50%,#FBCFE8 100%);color:white;
     font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;
     border-radius:20px;padding:4px 14px;margin-bottom:14px;}
-  h2{font-size:22px;font-weight:800;color:#1a1a2e;margin-bottom:6px;}
-  h3{font-size:15px;font-weight:700;color:#1a1a2e;margin-bottom:10px;}
+  h2{font-size:22px;font-weight:700;color:#111111;margin-bottom:6px;}
+  h3{font-size:15px;font-weight:700;color:#111111;margin-bottom:10px;}
   .section-desc{font-size:14px;color:#555;margin-bottom:28px;line-height:1.6;}
 
   /* Card */
-  .card{background:white;border-radius:18px;box-shadow:0 2px 20px rgba(124,58,237,.07);margin-bottom:20px;overflow:hidden;}
+  .card{background:white;border-radius:18px;box-shadow:0 2px 20px rgba(123,97,255,.07);margin-bottom:20px;overflow:hidden;}
   .card-inner{padding:24px 28px;}
 
   /* Checklist */
@@ -47,14 +47,14 @@
   .item-tag{display:inline-block;font-size:11px;font-weight:600;border-radius:20px;padding:2px 10px;margin-top:6px;margin-right:4px;}
   .tag-done{background:#D1FAE5;color:#065F46;}
   .tag-todo{background:#FEF3C7;color:#92400E;}
-  .tag-law{background:#EDE9FE;color:#5B21B6;}
+  .tag-law{background:rgba(123,97,255,0.08);color:#7B61FF;}
 
   /* Summary box */
-  .summary-box{background:linear-gradient(135deg,#7C3AED,#06B6D4);border-radius:18px;
+  .summary-box{background:linear-gradient(135deg,#7B61FF 0%,#5AC8FA 50%,#FBCFE8 100%);border-radius:18px;
     padding:28px 32px;color:white;display:flex;align-items:center;gap:32px;margin-bottom:40px;flex-wrap:wrap;}
   .summary-nums{display:flex;gap:28px;}
   .summary-num{text-align:center;}
-  .summary-num .big{font-size:44px;font-weight:800;line-height:1;}
+  .summary-num .big{font-size:44px;font-weight:700;line-height:1;}
   .summary-num .label{font-size:12px;opacity:.8;margin-top:4px;}
   .summary-text{flex:1;font-size:14px;opacity:.9;line-height:1.7;min-width:200px;}
 
@@ -62,17 +62,17 @@
   .ss-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:4px;}
   .ss-wide{grid-column:1/-1;}
   .ss-card{background:white;border-radius:14px;box-shadow:0 2px 14px rgba(0,0,0,.08);overflow:hidden;cursor:pointer;transition:transform .15s,box-shadow .15s;}
-  .ss-card:hover{transform:translateY(-3px);box-shadow:0 6px 24px rgba(124,58,237,.18);}
+  .ss-card:hover{transform:translateY(-3px);box-shadow:0 6px 24px rgba(123,97,255,.18);}
   .ss-thumb-wrap{position:relative;overflow:hidden;background:#f4f4f8;}
   .ss-thumb{width:100%;display:block;transition:opacity .2s;}
-  .ss-overlay{position:absolute;inset:0;background:rgba(124,58,237,0);display:flex;align-items:center;
+  .ss-overlay{position:absolute;inset:0;background:rgba(123,97,255,0);display:flex;align-items:center;
     justify-content:center;transition:background .2s;}
-  .ss-card:hover .ss-overlay{background:rgba(124,58,237,.15);}
-  .ss-overlay span{background:white;color:#7C3AED;font-size:12px;font-weight:700;border-radius:20px;
+  .ss-card:hover .ss-overlay{background:rgba(123,97,255,.15);}
+  .ss-overlay span{background:white;color:#7B61FF;font-size:12px;font-weight:700;border-radius:20px;
     padding:6px 14px;opacity:0;transition:opacity .2s;box-shadow:0 2px 8px rgba(0,0,0,.15);}
   .ss-card:hover .ss-overlay span{opacity:1;}
   .ss-label{padding:10px 14px 12px;}
-  .ss-title{font-size:13px;font-weight:600;color:#1a1a2e;}
+  .ss-title{font-size:13px;font-weight:600;color:#111111;}
   .ss-sub{font-size:11px;color:#9ca3af;margin-top:2px;}
 
   /* Lightbox */
@@ -90,14 +90,14 @@
   .lb-open-btn:hover{background:rgba(255,255,255,.15);}
 
   /* Divider */
-  .divider{height:1px;background:linear-gradient(to right,#7C3AED22,#06B6D422,transparent);margin:40px 0;}
+  .divider{height:1px;background:linear-gradient(to right,rgba(123,97,255,0.2),rgba(90,200,250,0.2),transparent);margin:40px 0;}
 
   /* Table */
   table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;}
-  th{background:#f4f0ff;color:#7C3AED;font-weight:600;padding:9px 12px;text-align:left;}
+  th{background:rgba(123,97,255,0.06);color:#7B61FF;font-weight:600;padding:9px 12px;text-align:left;}
   td{padding:8px 12px;border-bottom:1px solid #f3f4f6;color:#374151;vertical-align:top;}
   tr:last-child td{border-bottom:none;}
-  a{color:#7C3AED;}
+  a{color:#7B61FF;}
 
   @media(max-width:700px){
     .ss-grid{grid-template-columns:1fr 1fr;}
@@ -124,7 +124,7 @@
   <h1>Соответствие законодательству<br/>о персональных данных</h1>
   <div class="cover-sub">Uspot — Beauty Booking Mini App · Минск, Беларусь</div>
   <div class="cover-meta">
-    <div><strong>ООО «Юспот»</strong>г. Минск, ул. Прушинских, 42</div>
+    <div><strong>ООО «ЮСПОТ»</strong>УНП 194048760 · 220019, Республика Беларусь, г. Минск, ул. Сухаревская, 16, пом. 97</div>
     <div><strong>Правовая база</strong>Закон РБ №99-З от 07.05.2021</div>
     <div><strong>Дата отчёта</strong>11 мая 2026 г.</div>
     <div><strong>Статус</strong>4 из 7 задач выполнено ✅</div>
@@ -159,7 +159,7 @@
         <div class="item-title">Политика обработки персональных данных</div>
         <div class="item-desc">
           Полная Политика ОПД на русском языке опубликована на
-          <a href="/privacy" target="_blank">uspotbeauty.netlify.app/privacy</a>.
+          <a href="/privacy" target="_blank">uspot.by/privacy</a>.
           Содержит: оператор, цели, состав данных, правовые основания, таблицу трансграничных
           передач (Telegram/Railway США ⚠️, Supabase ЕС ✅), сроки хранения,
           права субъектов, контакт для запросов, надзорный орган (НЦЗПД).
@@ -222,25 +222,14 @@
 
   <div class="ss-grid">
 
-    <div class="ss-card" onclick="openLb('screenshots/consent-top.png','Экран согласия — описание данных')">
+    <div class="ss-card" onclick="openLb('screenshots/consent-sheet.png','Popup «Перед началом» — согласие на обработку ПД')">
       <div class="ss-thumb-wrap">
-        <img class="ss-thumb" src="screenshots/consent-top.png" alt="Экран согласия"/>
+        <img class="ss-thumb" src="screenshots/consent-sheet.png" alt="Popup согласия"/>
         <div class="ss-overlay"><span>🔍 Открыть</span></div>
       </div>
       <div class="ss-label">
-        <div class="ss-title">Экран согласия — сбор данных</div>
-        <div class="ss-sub">Первый запуск мини-приложения</div>
-      </div>
-    </div>
-
-    <div class="ss-card" onclick="openLb('screenshots/consent-button.png','Экран согласия — трансграничная передача + кнопка')">
-      <div class="ss-thumb-wrap">
-        <img class="ss-thumb" src="screenshots/consent-button.png" alt="Кнопка принять"/>
-        <div class="ss-overlay"><span>🔍 Открыть</span></div>
-      </div>
-      <div class="ss-label">
-        <div class="ss-title">Согласие — трансграничная передача</div>
-        <div class="ss-sub">⚠️ блок США + кнопка «Принять и продолжить»</div>
+        <div class="ss-title">Popup «Перед началом»</div>
+        <div class="ss-sub">Нижний лист поверх приложения · сбор данных + ⚠️ США + кнопка «Принять»</div>
       </div>
     </div>
 
@@ -262,7 +251,7 @@
       </div>
       <div class="ss-label">
         <div class="ss-title">Cookie-баннер на сайте</div>
-        <div class="ss-sub">uspotbeauty.netlify.app · home.html</div>
+        <div class="ss-sub">uspot.by · home.html</div>
       </div>
     </div>
 
@@ -273,7 +262,7 @@
       </div>
       <div class="ss-label">
         <div class="ss-title">Политика обработки персональных данных — полная страница</div>
-        <div class="ss-sub">uspotbeauty.netlify.app/privacy · Нажмите чтобы открыть целиком</div>
+        <div class="ss-sub">uspot.by/privacy · Нажмите чтобы открыть целиком</div>
       </div>
     </div>
 
@@ -285,7 +274,7 @@
   <div class="section-label">Осталось сделать</div>
   <h2>Задачи при регистрации ООО</h2>
   <p class="section-desc">
-    Выполняются единоразово в момент регистрации ООО «Юспот».
+    ООО «ЮСПОТ» зарегистрировано, УНП 194048760 — эти задачи стали актуальными.
     До регистрации юрлица — не актуально.
   </p>
 
@@ -296,7 +285,7 @@
       <div class="item-body">
         <div class="item-title">Регистрация в Реестре операторов ПД</div>
         <div class="item-desc">
-          Подать уведомление в НЦЗПД через <a href="https://www.ncpd.by" target="_blank">ncpd.by</a>
+          Подать уведомление в НЦЗПД через <a href="https://cpd.by" target="_blank">cpd.by</a>
           → «Реестр операторов». Регистрация бесплатная, срок — до начала обработки данных как юрлицо.
         </div>
         <span class="item-tag tag-todo">При открытии ООО</span>
@@ -380,11 +369,11 @@
     <div class="card-inner">
       <h3>Контакты оператора</h3>
       <table>
-        <tr><td><strong>Оператор</strong></td><td>ООО «Юспот»</td></tr>
-        <tr><td><strong>Адрес</strong></td><td>г. Минск, ул. Прушинских, 42</td></tr>
-        <tr><td><strong>E-mail для запросов по ПД</strong></td><td><a href="mailto:2zhukavets@gmail.com">2zhukavets@gmail.com</a></td></tr>
-        <tr><td><strong>Политика ОПД</strong></td><td><a href="/privacy" target="_blank">uspotbeauty.netlify.app/privacy</a></td></tr>
-        <tr><td><strong>Надзорный орган</strong></td><td><a href="https://www.ncpd.by" target="_blank">НЦЗПД РБ — ncpd.by</a></td></tr>
+        <tr><td><strong>Оператор</strong></td><td>ООО «ЮСПОТ», УНП 194048760</td></tr>
+        <tr><td><strong>Адрес</strong></td><td>220019, Республика Беларусь, г. Минск, ул. Сухаревская, 16, пом. 97</td></tr>
+        <tr><td><strong>E-mail для запросов по ПД</strong></td><td><a href="mailto:uspot@gmail.com">uspot@gmail.com</a></td></tr>
+        <tr><td><strong>Политика ОПД</strong></td><td><a href="/privacy" target="_blank">uspot.by/privacy</a></td></tr>
+        <tr><td><strong>Надзорный орган</strong></td><td><a href="https://cpd.by" target="_blank">НЦЗПД РБ — cpd.by</a></td></tr>
       </table>
     </div>
   </div>
