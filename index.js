@@ -2991,10 +2991,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Home page — required for Google OAuth branding verification
-app.get("/", (_req, res) => {
-  res.sendFile(path.join(__dirname, "home.html"));
-});
+/* Страницы сайта бот больше не раздаёт своими копиями. Они жили в двух
+   папках сразу, расходились молча и однажды уже разошлись: сайт обновили,
+   а бот месяц отдавал политику со старым адресом и чужой почтой. Теперь
+   источник один — uspot.by, который выкатывается одной командой.
+   Постоянный редирект, чтобы старые ссылки и Google не сломались. */
+app.get("/", (_req, res) => res.redirect(301, "https://uspot.by/home"));
 
 // Serve moderation dashboard from this repo so it's always reachable
 app.get("/moderation", (_req, res) => {
@@ -3002,9 +3004,8 @@ app.get("/moderation", (_req, res) => {
 });
 
 // Privacy policy — required for Google OAuth verification
-app.get("/privacy", (_req, res) => {
-  res.sendFile(path.join(__dirname, "privacy.html"));
-});
+app.get("/privacy", (_req, res) => res.redirect(301, "https://uspot.by/privacy"));
+app.get("/compliance-report", (_req, res) => res.redirect(301, "https://uspot.by/compliance-report"));
 
 // ── Telegram webhook endpoints ────────────────────────────
 app.post("/webhook/main", (req, res) => {
