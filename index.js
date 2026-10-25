@@ -3813,6 +3813,72 @@ app.post("/blacklist/remove", async (req, res) => {
   }
 });
 
+/* ── POST /client/erase ──────────────────────────────────
+   Человек просит удалить свои данные. По статье 13 Закона № 99-З мы
+   обязаны прекратить обработку и удалить данные, а если удалить
+   технически нельзя — заблокировать, и в обоих случаях уведомить
+   человека. Раньше кнопка в приложении слала три delete публичным
+   ключом, RLS их молча не исполнял, и не удалялось ничего.
+
+   Выбран путь обезличивания: по статье 1 это действия, после которых
+   без дополнительной информации нельзя определить, чьи это данные.
+   Обезличенные сведения персональными уже не являются, поэтому визит
+   остаётся в истории мастера как выручка, но связь с человеком рвётся:
+   имя, telegram id, пожелания, фотографии и привязка к его календарю
+   стираются. Всё, что само по себе указывает на человека — профиль,
+   заметки мастера о нём, оценки, строки чёрного списка, — удаляется.   */
+app.post("/client/erase", async (req, res) => {
+  try {
+    const tgId = needSession(req, res); if (!tgId) return;
+    const id = String(tgId);
+    const done = {};
+    const step = async (name, q) => { const { data, error } = await q;
+      if (error) { console.error(`🧹 /client/erase ${name}:`, error.message); throw new Error(name); }
+      done[name] = (data || []).length; };
+
+    // 1. Записи обезличиваем — визит у мастера остаётся, человек из него уходит
+    await step("bookings", db.from("bookings").update({
+      client_name: "Клиент удалил данные", client_telegram_id: null, client_notes: null,
+      client_photo_urls: null, client_gcal_event_id: null, client_gcal_calendar_id: null,
+    }).eq("client_telegram_id", id).select("id"));
+
+    // 2. То, что существует только как сведения о человеке, — удаляем
+    await step("client_notes",     db.from("client_notes").delete().eq("client_tg", id).select("id"));
+    await step("client_ratings",   db.from("client_ratings").delete().eq("client_telegram_id", id).select("id"));
+    await step("master_blacklist", db.from("master_blacklist").delete().eq("client_telegram_id", id).select("id"));
+
+    /* 3. Отзывы остаются мастеру: это его репутация и публичная оценка
+       услуги. Рвём только связь с автором. */
+    await step("reviews", db.from("reviews").update({ client_telegram_id: null, client_name: "Клиент" })
+      .eq("client_telegram_id", id).select("id"));
+
+    // 4. В журнале доставки лежит telegram id — он тоже персональные данные
+    await step("notification_log", db.from("notification_log").update({ chat_id: null })
+      .eq("chat_id", id).select("id"));
+
+    // 5. Профиль удаляем целиком
+    await step("clients", db.from("clients").delete().eq("telegram_user_id", id).select("id"));
+
+    /* Уведомление об исполнении — требование пункта 2 статьи 13. Пишем
+       до того, как забудем id: в базе его уже нет. */
+    await send(id,
+      `🧹 <b>Данные удалены</b>\n\n` +
+      `Профиль, заметки и оценки о вас удалены, а прошедшие визиты обезличены — ` +
+      `по ним больше нельзя понять, что они ваши. Мастер видит их как «Клиент удалил данные».\n\n` +
+      `Согласие на обработку считается отозванным. Записаться снова можно в любой момент — ` +
+      `это будет новая учётная запись.`,
+      [], { kind: "erase", audience: "client" });
+
+    console.log(`🧹 Удаление по заявлению: записей обезличено ${done.bookings}, ` +
+      `заметок ${done.client_notes}, оценок ${done.client_ratings}, строк ЧС ${done.master_blacklist}, ` +
+      `отзывов отвязано ${done.reviews}, строк журнала ${done.notification_log}, профилей ${done.clients}`);
+    res.json({ ok: true, done });
+  } catch (e) {
+    console.error("/client/erase:", e.message);
+    res.status(500).json({ error: "erase_failed", step: e.message });
+  }
+});
+
 /* ── Заявка на салон ─────────────────────────────────────
    В заявке телефон и имя заявителя. Отдаём только его собственную:
    telegram id берём из подписи, а не из запроса.                  */
