@@ -3637,8 +3637,11 @@ app.post("/client/note", async (req, res) => {
       return res.status(403).json({ error: "forbidden" });
     }
     if (!b.client_tg && !b.client_name) return res.status(400).json({ error: "bad_request" });
+    /* Столбцы перечислены поимённо, без allergies: пока патч v29 не удалил
+       его из таблицы, старые значения не должны уезжать в приложение. */
     const { data, error } = await noteKey(
-      db.from("client_notes").select("*").eq("owner_id", b.owner_id).limit(1), b);
+      db.from("client_notes").select("id, owner_id, client_tg, client_name, note, preferences, created_at, updated_at")
+        .eq("owner_id", b.owner_id).limit(1), b);
     if (error) { console.error("/client/note:", error.message); return res.status(500).json({ error: "lookup_failed" }); }
     res.json({ ok: true, row: (data || [])[0] || null });
   } catch (e) {
@@ -3660,7 +3663,11 @@ app.post("/client/note/save", async (req, res) => {
       owner_id: b.owner_id,
       client_tg: b.client_tg ? String(b.client_tg).slice(0, 32) : null,
       client_name: b.client_tg ? null : String(b.client_name || "").slice(0, 120),
-      note: text(b.note), allergies: text(b.allergies), preferences: text(b.preferences),
+      /* Поля allergies здесь нет намеренно: сведения о здоровье — специальные
+         персональные данные (ст. 1 Закона № 99-З), обрабатывать их без согласия
+         субъекта запрещено (ст. 8 п. 1), а заметку пишет мастер о клиенте.
+         Если старый фронт всё-таки пришлёт allergies — молча игнорируем. */
+      note: text(b.note), preferences: text(b.preferences),
       updated_at: new Date().toISOString(),
     };
     /* Пара «владелец + клиент» уникальна: сначала ищем строку, потом
@@ -3670,16 +3677,16 @@ app.post("/client/note/save", async (req, res) => {
       db.from("client_notes").select("id").eq("owner_id", b.owner_id).limit(1), b);
     let out = null, err = null;
     if (ex && ex[0]) {
-      const r = await db.from("client_notes").update(row).eq("id", ex[0].id).select().maybeSingle();
+      const r = await db.from("client_notes").update(row).eq("id", ex[0].id).select("id, owner_id, client_tg, client_name, note, preferences, created_at, updated_at").maybeSingle();
       out = r.data; err = r.error;
     } else {
-      const r = await db.from("client_notes").insert(row).select().maybeSingle();
+      const r = await db.from("client_notes").insert(row).select("id, owner_id, client_tg, client_name, note, preferences, created_at, updated_at").maybeSingle();
       out = r.data; err = r.error;
       if (err && err.code === "23505") {
         const { data: again } = await noteKey(
           db.from("client_notes").select("id").eq("owner_id", b.owner_id).limit(1), b);
         if (again && again[0]) {
-          const r2 = await db.from("client_notes").update(row).eq("id", again[0].id).select().maybeSingle();
+          const r2 = await db.from("client_notes").update(row).eq("id", again[0].id).select("id, owner_id, client_tg, client_name, note, preferences, created_at, updated_at").maybeSingle();
           out = r2.data; err = r2.error;
         }
       }
