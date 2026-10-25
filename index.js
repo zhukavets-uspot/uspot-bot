@@ -1761,6 +1761,15 @@ const runReminders = async () => {
       `длительность ${+b.duration_min || 60} мин, конец ${new Date(endMs).toISOString()}, ` +
       `${finishedAt ? "завершено вручную " + new Date(finishedAt).toISOString() : "вручную не завершали"}, ` +
       `сейчас ${new Date(nowMs).toISOString()}, прошло ${minsSince.toFixed(1)} мин, порог ${waitMin}`);
+    /* Опрос — отдельная цель, на которую человек даёт отдельное согласие.
+       Отказался — молча не спрашиваем; отметку всё равно ставим, иначе
+       цикл будет возвращаться к этой записи каждые пять минут. */
+    const cons = await consentsOf(b.client_telegram_id);
+    if (cons.survey.asked && !cons.survey.granted) {
+      await claimOnce(b.id, "review_asked_at");
+      console.log(`⏰ Опрос по записи ${b.id} не отправлен: клиент отказался от опросов`);
+      continue;
+    }
     if (!(await claimOnce(b.id, "review_asked_at"))) continue;
     askedThisRun.add(String(b.client_telegram_id));
     const reviewStartapp = `review_${b.id}_${b.master_id}`;
@@ -3573,7 +3582,11 @@ app.post("/cabinet/bookings", async (req, res) => {
 
     const { data, error } = await q;
     if (error) { console.error("/cabinet/bookings:", error.message); return res.status(500).json({ error: "lookup_failed" }); }
-    res.json({ ok: true, rows: data || [] });
+    /* Клиент мог отказаться передавать свои данные мастеру — тогда кабинет
+       видит время и услугу, но не имя и телефон. */
+    const rows = data || [];
+    const masked = await maskedClients(rows.map((r) => r.client_telegram_id));
+    res.json({ ok: true, rows: rows.map((r) => (masked.has(String(r.client_telegram_id)) ? maskBooking(r) : r)) });
   } catch (e) {
     console.error("/cabinet/bookings:", e.message);
     res.status(500).json({ error: e.message });
@@ -3612,7 +3625,10 @@ app.post("/booking", async (req, res) => {
     if (String(row.client_telegram_id || "") === String(tgId)) return res.json({ ok: true, row });
     const owners = await ownedCabinets(tgId);
     const visible = await visibleMasters(owners);
-    if (visible.has(row.master_id) || ownsBooking(owners, row)) return res.json({ ok: true, row });
+    if (visible.has(row.master_id) || ownsBooking(owners, row)) {
+      const masked = await maskedClients([row.client_telegram_id]);
+      return res.json({ ok: true, row: masked.has(String(row.client_telegram_id)) ? maskBooking(row) : row });
+    }
     console.warn(`🚫 /booking: сессия ${tgId} просила чужую запись ${id}`);
     res.status(403).json({ error: "forbidden" });
   } catch (e) {
@@ -3813,6 +3829,126 @@ app.post("/blacklist/remove", async (req, res) => {
   }
 });
 
+/* ── Согласия по целям ───────────────────────────────────
+   Пояснения НЦЗПД к форме согласия: общее согласие на все цели сразу не
+   допускается, по каждой цели — отдельно, и человек должен иметь
+   возможность согласиться с одной и отказать в другой. Пункт 7 статьи 5
+   кладёт на оператора обязанность доказать, что согласие было, поэтому
+   храним не только «да/нет», но и дату и версию показанного текста.
+
+   Срок задан критерием, а не датой: «до отзыва согласия» НЦЗПД прямо не
+   допускает. Критерий привязан к последней записи — пока человек
+   пользуется сервисом, согласие живёт; перестал — истекает само.        */
+const CONSENT_TEXT_VERSION = "2026-10-25";
+const CONSENT_PURPOSES = {
+  share_with_master: { months: 36, rule: "3 года с даты последней записи" },
+  survey:            { months: 12, rule: "1 год с даты последней записи" },
+  promo:             { months: 12, rule: "1 год с даты последней записи" },
+};
+
+// Дата последней записи клиента — от неё считается срок каждого согласия
+const lastBookingAt = async (tgId) => {
+  const { data } = await db.from("bookings").select("created_at")
+    .eq("client_telegram_id", String(tgId)).order("created_at", { ascending: false }).limit(1);
+  return data?.[0]?.created_at ? new Date(data[0].created_at).getTime() : null;
+};
+
+const consentExpiry = (months, lastMs, grantedMs) => {
+  const base = lastMs || grantedMs;
+  if (!base) return null;
+  const d = new Date(base);
+  d.setMonth(d.getMonth() + months);
+  return d.getTime();
+};
+
+/* Действует ли согласие сейчас. Истёкшее согласие — это не согласие:
+   иначе срок, который мы показали человеку, ничего не значил бы. */
+const consentsOf = async (tgId) => {
+  const { data } = await db.from("client_consents").select("*").eq("client_tg", String(tgId));
+  const lastMs = await lastBookingAt(tgId);
+  const out = {};
+  for (const [purpose, cfg] of Object.entries(CONSENT_PURPOSES)) {
+    const row = (data || []).find((r) => r.purpose === purpose);
+    const grantedMs = row?.granted_at ? new Date(row.granted_at).getTime() : null;
+    const expires = row?.granted ? consentExpiry(cfg.months, lastMs, grantedMs) : null;
+    out[purpose] = {
+      asked: !!row,
+      granted: !!row?.granted && (!expires || expires > Date.now()),
+      granted_at: row?.granted_at || null,
+      revoked_at: row?.revoked_at || null,
+      expires_at: expires ? new Date(expires).toISOString() : null,
+      term_rule: cfg.rule,
+    };
+  }
+  return out;
+};
+
+// POST /client/consents — что человек уже решил
+app.post("/client/consents", async (req, res) => {
+  try {
+    const tgId = needSession(req, res); if (!tgId) return;
+    res.json({ ok: true, version: CONSENT_TEXT_VERSION, consents: await consentsOf(tgId) });
+  } catch (e) {
+    console.error("/client/consents:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* POST /client/consents/save — ответ с экрана согласий.
+   Принимаем только известные цели: лишнее в теле запроса игнорируем,
+   чтобы нельзя было завести «согласие» на то, чего мы не показывали. */
+app.post("/client/consents/save", async (req, res) => {
+  try {
+    const tgId = needSession(req, res); if (!tgId) return;
+    const asked = req.body?.consents;
+    if (!asked || typeof asked !== "object") return res.status(400).json({ error: "bad_request" });
+    const now = new Date().toISOString();
+    const rows = [];
+    for (const [purpose, cfg] of Object.entries(CONSENT_PURPOSES)) {
+      if (!(purpose in asked)) continue;
+      const granted = asked[purpose] === true;
+      rows.push({
+        client_tg: String(tgId), purpose, granted,
+        granted_at: granted ? now : null,
+        revoked_at: granted ? null : now,
+        term_rule: cfg.rule, text_version: CONSENT_TEXT_VERSION, updated_at: now,
+      });
+    }
+    if (!rows.length) return res.status(400).json({ error: "bad_request" });
+    const { error } = await db.from("client_consents").upsert(rows, { onConflict: "client_tg,purpose" });
+    if (error) { console.error("/client/consents/save:", error.message); return res.status(500).json({ error: "save_failed" }); }
+    console.log(`📝 Согласия ${tgId}: ` + rows.map((r) => `${r.purpose}=${r.granted ? "да" : "нет"}`).join(", "));
+    res.json({ ok: true, version: CONSENT_TEXT_VERSION, consents: await consentsOf(tgId) });
+  } catch (e) {
+    console.error("/client/consents/save:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* Кому из клиентов нельзя показывать имя и телефон мастеру.
+   Отказ должен работать по-настоящему, а не лежать флажком в базе.
+   Важно: отсутствие записи — это «ещё не спрашивали», а не отказ.
+   Согласие не имеет обратной силы и в обратную сторону тоже: данные,
+   собранные до появления экрана, мастер уже законно видит.            */
+const maskedClients = async (tgIds) => {
+  const ids = [...new Set(tgIds.filter(Boolean).map(String))];
+  if (!ids.length) return new Set();
+  const { data } = await db.from("client_consents").select("client_tg, granted, granted_at")
+    .eq("purpose", "share_with_master").in("client_tg", ids);
+  const masked = new Set();
+  for (const r of data || []) {
+    if (r.granted) continue;                       // согласился — показываем
+    masked.add(String(r.client_tg));               // отказался или отозвал
+  }
+  return masked;
+};
+
+// Обезличиваем строку записи для кабинета, если клиент отказался от передачи
+const maskBooking = (b) => ({
+  ...b, client_name: "Клиент", client_telegram_id: null,
+  client_notes: null, client_photo_urls: null, client_masked: true,
+});
+
 /* ── POST /client/erase ──────────────────────────────────
    Человек просит удалить свои данные. По статье 13 Закона № 99-З мы
    обязаны прекратить обработку и удалить данные, а если удалить
@@ -3947,7 +4083,18 @@ app.post("/broadcast", async (req, res) => {
       return res.status(500).json({ error: e.message });
     }
 
-    console.log(`📣 Рассылка: акционер ${tgId} → ${clientIds.length} клиент(ов)${master_id ? ` (мастер ${master_id})` : ""}`);
+    /* Рассылка — это реклама, а на неё нужно отдельное согласие. Пишем
+       только тем, кто его дал и у кого оно не истекло. Молчание согласием
+       не считается: нет ответа — нет рассылки. */
+    const all = clientIds.length;
+    const allowed = [];
+    for (const chatId of clientIds) {
+      const c = await consentsOf(chatId);
+      if (c.promo.granted) allowed.push(chatId);
+    }
+    clientIds = allowed;
+    console.log(`📣 Рассылка: акционер ${tgId} → ${clientIds.length} из ${all} клиент(ов) ` +
+      `(остальные не давали согласия на акции)${master_id ? `, мастер ${master_id}` : ""}`);
     let sent = 0;
     for (const chatId of clientIds) {
       if (await send(chatId, text)) sent++;
