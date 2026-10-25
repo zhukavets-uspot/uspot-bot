@@ -1796,7 +1796,7 @@ const runReminders = async () => {
    проход повторит, пока окно открыто; постоянный отказ (бот заблокирован,
    чата нет) — отметку оставляем, повтор бесполезен, а в журнале доставки
    остаётся ошибка: её увидит проверка и утренний отчёт. */
-const lastPass = { reminders: null, pending: null, audit: null, report: null };
+const lastPass = { reminders: null, pending: null, audit: null, report: null, retention: null };
 const reminderOutcome = (res, bookingId, claimCol, label, key) => {
   if (res.msg) {
     sentReminders.add(key);
@@ -2501,6 +2501,55 @@ const runDailyReport = async () => {
 if (setReportProvider) setReportProvider((dayIso) => buildDeliveryReport(dayIso));
 setTimeout(() => { runDeliveryAudit(); runDailyReport(); }, 90 * 1000);
 setInterval(() => { runDeliveryAudit(); runDailyReport(); }, 5 * 60 * 1000);
+
+/* ── Срок хранения исполняется сам ───────────────────────────
+   Политика обещает: история визитов живёт 3 года с даты последней
+   записи, потом обезличивается, а профиль удаляется. Пока это была
+   только бумага — в базе не удалялось ничего. Статья 4 требует не
+   хранить данные дольше, чем нужно для цели, а алгоритм НЦЗПД прямо
+   говорит: при превышении срока хранения данные подлежат удалению.
+
+   Проходим раз в сутки. Берём тех, у кого последняя запись старше трёх
+   лет, и прогоняем ту же процедуру, что по заявлению человека, только
+   без уведомления: уведомлять некого — срок истёк сам по себе.        */
+const RETENTION_YEARS = 3;
+let retentionRunning = false;
+const runRetention = async () => {
+  if (retentionRunning) return;
+  retentionRunning = true;
+  try {
+    const edge = new Date();
+    edge.setFullYear(edge.getFullYear() - RETENTION_YEARS);
+    const edgeIso = edge.toISOString();
+
+    // Кто ещё числится клиентом и когда записывался в последний раз
+    const { data: rows, error } = await db.from("bookings")
+      .select("client_telegram_id, created_at").not("client_telegram_id", "is", null);
+    if (error) { console.error("🗓 Срок хранения: не прочитать записи —", error.message); return; }
+    const last = {};
+    for (const r of rows || []) {
+      const t = r.created_at || "";
+      if (!last[r.client_telegram_id] || t > last[r.client_telegram_id]) last[r.client_telegram_id] = t;
+    }
+    const stale = Object.entries(last).filter(([, t]) => t && t < edgeIso).map(([tg]) => tg);
+    if (!stale.length) { lastPass.retention = new Date().toISOString(); return; }
+
+    console.log(`🗓 Срок хранения: ${stale.length} клиент(ов) без записей больше ${RETENTION_YEARS} лет — обезличиваем`);
+    for (const tg of stale) {
+      try {
+        const done = await eraseClient(tg, "истёк срок хранения");
+        eraseLog("истёк срок хранения", done);
+      } catch (e) { console.error(`🗓 Срок хранения: клиент ${tg} —`, e.message); }
+    }
+    lastPass.retention = new Date().toISOString();
+  } catch (e) {
+    console.error("🗓 Срок хранения:", e.message);
+  } finally {
+    retentionRunning = false;
+  }
+};
+setTimeout(runRetention, 3 * 60 * 1000);
+setInterval(runRetention, 24 * 60 * 60 * 1000);
 
 // ════════════════════════════════════════════════════════════
 // GOOGLE CALENDAR INTEGRATION  — Bug #5
@@ -3964,51 +4013,61 @@ const maskBooking = (b) => ({
    имя, telegram id, пожелания, фотографии и привязка к его календарю
    стираются. Всё, что само по себе указывает на человека — профиль,
    заметки мастера о нём, оценки, строки чёрного списка, — удаляется.   */
+const eraseClient = async (tgId, reason) => {
+  const id = String(tgId);
+  const done = {};
+  const step = async (name, q) => { const { data, error } = await q;
+    if (error) { console.error(`🧹 удаление (${reason}) ${name}:`, error.message); throw new Error(name); }
+    done[name] = (data || []).length; };
+
+  // 1. Записи обезличиваем — визит у мастера остаётся, человек из него уходит
+  await step("bookings", db.from("bookings").update({
+    client_name: "Клиент удалил данные", client_telegram_id: null, client_notes: null,
+    client_photo_urls: null, client_gcal_event_id: null, client_gcal_calendar_id: null,
+  }).eq("client_telegram_id", id).select("id"));
+
+  // 2. То, что существует только как сведения о человеке, — удаляем
+  await step("client_notes",     db.from("client_notes").delete().eq("client_tg", id).select("id"));
+  await step("client_ratings",   db.from("client_ratings").delete().eq("client_telegram_id", id).select("id"));
+  await step("master_blacklist", db.from("master_blacklist").delete().eq("client_telegram_id", id).select("id"));
+  await step("client_consents",  db.from("client_consents").delete().eq("client_tg", id).select("client_tg"));
+
+  /* 3. Отзывы остаются мастеру: это его репутация и публичная оценка
+     услуги. Рвём только связь с автором. */
+  await step("reviews", db.from("reviews").update({ client_telegram_id: null, client_name: "Клиент" })
+    .eq("client_telegram_id", id).select("id"));
+
+  // 4. В журнале доставки лежит telegram id — он тоже персональные данные
+  await step("notification_log", db.from("notification_log").update({ chat_id: null })
+    .eq("chat_id", id).select("id"));
+
+  // 5. Профиль удаляем целиком
+  await step("clients", db.from("clients").delete().eq("telegram_user_id", id).select("id"));
+
+  return done;
+};
+
+/* Уведомление об исполнении — требование пункта 2 статьи 13. */
+const eraseNotice = async (id) => {
+  await send(id,
+    `🧹 <b>Данные удалены</b>\n\n` +
+    `Профиль, заметки и оценки о вас удалены, а прошедшие визиты обезличены — ` +
+    `по ним больше нельзя понять, что они ваши. Мастер видит их как «Клиент удалил данные».\n\n` +
+    `Согласие на обработку считается отозванным. Записаться снова можно в любой момент — ` +
+    `это будет новая учётная запись.`,
+    [], { kind: "erase", audience: "client" });
+};
+
+const eraseLog = (reason, done) => console.log(`🧹 Удаление (${reason}): записей обезличено ${done.bookings}, ` +
+  `заметок ${done.client_notes}, оценок ${done.client_ratings}, строк ЧС ${done.master_blacklist}, ` +
+  `отзывов отвязано ${done.reviews}, строк журнала ${done.notification_log}, профилей ${done.clients}`);
+
 app.post("/client/erase", async (req, res) => {
   try {
     const tgId = needSession(req, res); if (!tgId) return;
-    const id = String(tgId);
-    const done = {};
-    const step = async (name, q) => { const { data, error } = await q;
-      if (error) { console.error(`🧹 /client/erase ${name}:`, error.message); throw new Error(name); }
-      done[name] = (data || []).length; };
-
-    // 1. Записи обезличиваем — визит у мастера остаётся, человек из него уходит
-    await step("bookings", db.from("bookings").update({
-      client_name: "Клиент удалил данные", client_telegram_id: null, client_notes: null,
-      client_photo_urls: null, client_gcal_event_id: null, client_gcal_calendar_id: null,
-    }).eq("client_telegram_id", id).select("id"));
-
-    // 2. То, что существует только как сведения о человеке, — удаляем
-    await step("client_notes",     db.from("client_notes").delete().eq("client_tg", id).select("id"));
-    await step("client_ratings",   db.from("client_ratings").delete().eq("client_telegram_id", id).select("id"));
-    await step("master_blacklist", db.from("master_blacklist").delete().eq("client_telegram_id", id).select("id"));
-
-    /* 3. Отзывы остаются мастеру: это его репутация и публичная оценка
-       услуги. Рвём только связь с автором. */
-    await step("reviews", db.from("reviews").update({ client_telegram_id: null, client_name: "Клиент" })
-      .eq("client_telegram_id", id).select("id"));
-
-    // 4. В журнале доставки лежит telegram id — он тоже персональные данные
-    await step("notification_log", db.from("notification_log").update({ chat_id: null })
-      .eq("chat_id", id).select("id"));
-
-    // 5. Профиль удаляем целиком
-    await step("clients", db.from("clients").delete().eq("telegram_user_id", id).select("id"));
-
-    /* Уведомление об исполнении — требование пункта 2 статьи 13. Пишем
-       до того, как забудем id: в базе его уже нет. */
-    await send(id,
-      `🧹 <b>Данные удалены</b>\n\n` +
-      `Профиль, заметки и оценки о вас удалены, а прошедшие визиты обезличены — ` +
-      `по ним больше нельзя понять, что они ваши. Мастер видит их как «Клиент удалил данные».\n\n` +
-      `Согласие на обработку считается отозванным. Записаться снова можно в любой момент — ` +
-      `это будет новая учётная запись.`,
-      [], { kind: "erase", audience: "client" });
-
-    console.log(`🧹 Удаление по заявлению: записей обезличено ${done.bookings}, ` +
-      `заметок ${done.client_notes}, оценок ${done.client_ratings}, строк ЧС ${done.master_blacklist}, ` +
-      `отзывов отвязано ${done.reviews}, строк журнала ${done.notification_log}, профилей ${done.clients}`);
+    const done = await eraseClient(tgId, "заявление клиента");
+    await eraseNotice(String(tgId));
+    eraseLog("заявление клиента", done);
     res.json({ ok: true, done });
   } catch (e) {
     console.error("/client/erase:", e.message);
