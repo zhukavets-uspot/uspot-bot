@@ -87,6 +87,16 @@ const broadcast = async (text, opts) => {
 };
 
 const M = ["янв","фев","мар","апр","май","июн","июл","авг","сен","окт","ноя","дек"];
+/* Цена со скидкой: если при записи сработала акция, показываем и
+   процент, и прежнюю цену. Иначе по сумме не отличить скидку от
+   дешёвой услуги. Колонки заполняет бот мастера при создании записи. */
+const priceTag = (b) => {
+  const now = +(b && b.total_price) || 0;
+  if (!now) return "—";
+  const was = +(b && b.orig_price) || 0, pct = +(b && b.promo_pct) || 0;
+  return `${now} BYN` + (pct > 0 && was > now ? ` · −${pct}% (было ${was})` : "");
+};
+
 const dateRu = (iso) => {
   if (!iso) return "—";
   const d = new Date(iso + "T12:00:00");
@@ -221,7 +231,7 @@ bot.onText(/\/today/, async (msg) => {
     const who = b.client_name || "—";
     const to  = m?.name || b.master_name || "—";
     const svc = b.service_name ? ` · ${b.service_name}` : "";
-    const prc = b.total_price  ? ` · ${b.total_price} BYN` : "";
+    const prc = b.total_price ? ` · ${priceTag(b)}` : "";
     return `${s} <b>${t5(b.booked_time)}</b> ${who} → ${to}${svc}${prc}`;
   });
 
@@ -258,7 +268,7 @@ bot.onText(/\/recent/, async (msg) => {
   const lines = data.map((b) => {
     const m   = Array.isArray(b.masters) ? b.masters[0] : b.masters;
     const s   = statusIcon(b);
-    const prc = b.total_price ? `${b.total_price} BYN` : "—";
+    const prc = priceTag(b);
     return (
       `${s} ${dateRu(b.booked_date)} ${t5(b.booked_time)} · ` +
       `<b>${b.client_name || "—"}</b> → ${m?.name || b.master_name || "—"}\n` +
@@ -402,7 +412,7 @@ db.channel("uspot-founders-inserts")
       if (m?.name) masterName = m.name;
     }
 
-    const price = b.total_price ? `${b.total_price} BYN` : "—";
+    const price = priceTag(b);
 
     await broadcast(
       `📅 <b>Новая запись!</b>\n\n` +
@@ -450,7 +460,7 @@ db.channel("uspot-founders-cancellations")
       `👩‍🎨 ${masterName}\n` +
       `💇 ${b.service_name || "Услуга"}\n` +
       `📆 ${dateRu(b.booked_date)}, ${t5(b.booked_time)}\n` +
-      `💳 ${b.total_price ? b.total_price + " BYN" : "—"}`
+      `💳 ${priceTag(b)}`
     );
   })
   .subscribe((status) => {

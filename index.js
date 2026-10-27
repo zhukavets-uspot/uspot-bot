@@ -147,6 +147,17 @@ const sendEx = async (chatId, text, inlineRows = [], meta = null) => {
 const send = async (chatId, text, inlineRows = [], meta = null) =>
   (await sendEx(chatId, text, inlineRows, meta)).msg || undefined;
 
+/* Цена в сообщениях. Пока в записи лежала одна цифра, мастер видел
+   «48 BYN» и не знал, что это 60 со скидкой: акция могла быть на
+   услугу, а могла — на конкретное окно, и по сумме их не отличить.
+   Теперь, если скидка была, показываем и её, и прежнюю цену. */
+const priceTag = (b) => {
+  const now = +(b && b.total_price) || 0;
+  if (!now) return "—";
+  const was = +(b && b.orig_price) || 0, pct = +(b && b.promo_pct) || 0;
+  return `${now} BYN` + (pct > 0 && was > now ? ` · −${pct}% (было ${was})` : "");
+};
+
 // ── Alias kept for call-sites that pass action rows explicitly ───────────
 const sendWithKeyboard = async (chatId, text, actionRows = [], meta = null) => {
   return send(chatId, text, actionRows, meta);
@@ -278,7 +289,7 @@ const bookingCard = (bk, masterName = null) =>
   `👤 ${bk.client_name || "Клиент"}\n` +
   `💇 ${bk.service_name || "Услуга"}\n` +
   `📆 ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n` +
-  `💳 ${bk.total_price ? bk.total_price + " BYN" : "—"}` +
+  `💳 ${priceTag(bk)}` +
   (masterName ? `\n👩‍🎨 ${masterName}` : "");
 
 /* ─── Кто может подтвердить запись ────────────────────────────────
@@ -367,7 +378,7 @@ const sendConfirmationToClient = async (b, masterName = null) => {
     `👩‍🎨 ${masterName || mFull?.name || b.master_name || "Мастер"}\n` +
     `💇 ${b.service_name || "Услуга"}\n` +
     `📆 ${dateRu(b.booked_date)}, ${timeShort(b.booked_time)}\n` +
-    `💳 ${b.total_price ? b.total_price + " BYN" : "—"}\n` +
+    `💳 ${priceTag(b)}\n` +
     addrBlock(mFull) +
     (b.reschedule_of ? `\nЖдём вас в новое время! 💜` : `\nЖдём вас в Uspot! 💜`),
     [[
@@ -758,7 +769,7 @@ const subNewBookings = () => {
 
     const date  = dateRu(b.booked_date);
     const time  = timeShort(b.booked_time);
-    const price = b.total_price ? `${b.total_price} BYN` : "—";
+    const price = priceTag(b);
 
     // Resolve master Telegram ID
     let masterTgId = null, masterName = b.master_name || "Мастер";
@@ -919,7 +930,7 @@ const subBookingUpdates = () => {
             `Стало: <b>${newM?.name || "мастер"}</b>\n\n` +
             `💇 ${b.service_name || "Услуга"}\n` +
             `📆 ${d}, ${t} — время прежнее\n` +
-            `💳 ${b.total_price ? b.total_price + " BYN" : "—"}\n\n` +
+            `💳 ${priceTag(b)}\n\n` +
             `Если так не подходит — выберите другое время, мы всё сохраним.`,
             [[
               { text: "✅ Подходит",           callback_data: `keep_${b.id}` },
@@ -966,7 +977,7 @@ const subBookingUpdates = () => {
 
     const date  = dateRu(b.booked_date);
     const time  = timeShort(b.booked_time);
-    const price = b.total_price ? `${b.total_price} BYN` : "—";
+    const price = priceTag(b);
 
     let masterName = b.master_name || "Мастер";
     let masterTgId = null;
@@ -1384,7 +1395,7 @@ bot.on("callback_query", async (query) => {
         `👩‍🎨 ${mFull?.name || "Мастер"}\n` +
         `💇 ${bk.service_name || "Услуга"}\n` +
         `📆 <b>${dateRu(iso)}, ${time}</b>\n` +
-        (bk.total_price ? `💳 ${bk.total_price} BYN\n` : "") +
+        (bk.total_price ? `💳 ${priceTag(bk)}\n` : "") +
         addrBlock(mFull) +
         `\nЖдём вас! 💜`,
         [[{ text: "📅 Перенести", callback_data: `reschedule_${bookingId}` },
@@ -1668,7 +1679,7 @@ const runReminders = async () => {
       `💇 ${b.service_name || "Услуга"}\n` +
       `👩‍🎨 ${master?.name || "Мастер"}\n` +
       addrBlock(master) +
-      (b.total_price ? `💳 ${b.total_price} BYN\n` : "") +
+      (b.total_price ? `💳 ${priceTag(b)}\n` : "") +
       `\nДо встречи в Uspot! 💜`,
       [], { booking_id: b.id, kind: "remind_24h" }
     );
@@ -1973,7 +1984,7 @@ const pwFoundersItem = async (b, nowMs, to, { expired = false, clientTold = fals
       (contact(m?.telegram_user_id, m?.phone) ? ` · ${contact(m?.telegram_user_id, m?.phone)}` : "") + `\n`;
   }
   s += `👤 ${esc(b.client_name || "Клиент")}` + (cl?.phone ? ` · 📞 ${esc(tel(cl.phone))}` : "") + `\n`;
-  s += `💇 ${esc(b.service_name || "Услуга")}` + (b.total_price ? ` · ${b.total_price} BYN` : "") + `\n`;
+  s += `💇 ${esc(b.service_name || "Услуга")}` + (b.total_price ? ` · ${priceTag(b)}` : "") + `\n`;
   s += `📆 ${dateRu(b.booked_date)}, ${timeShort(b.booked_time)}` +
     (expired ? "" : ` — через ${pwHuman((deadline - nowMs) / 60000)}`) + `\n`;
   s += (expired ? `⏳ Ждала подтверждения ${pwHuman(ageMin)}` : `⏳ Ждёт ответа ${pwHuman(ageMin)}`) +
@@ -2684,7 +2695,7 @@ const pushToGcal = async (booking, masterTgId, masterName, isPending = false, ta
       `Клиент: ${booking.client_name || "—"}\n` +
       (target === "salon" ? `Мастер: ${masterName || "—"}\n` : "") +
       `Услуга: ${booking.service_name || "—"}\n` +
-      `Цена: ${booking.total_price ? booking.total_price + " BYN" : "—"}\n` +
+      `Цена: ${priceTag(booking)}\n` +
       (booking.client_notes ? `Пожелания: ${booking.client_notes}\n` : "") +
       `Статус: ${isPending ? "Ожидает подтверждения" : "Подтверждено"}\n` +
       `\nUspot Booking ID: ${booking.id}`,
@@ -2742,7 +2753,7 @@ const clientEventBody = (booking, masterName, isPending, masterAddr = "") => {
     description:
       `Мастер: ${masterName}\n` +
       `Услуга: ${booking.service_name || "—"}\n` +
-      `Стоимость: ${booking.total_price ? booking.total_price + " BYN" : "—"}\n` +
+      `Стоимость: ${priceTag(booking)}\n` +
       `Статус: ${isPending ? "Ожидает подтверждения мастера" : "Подтверждено"}\n` +
       `\nЗапись через Uspot · ${MINI_APP_URL}`,
     // Адрес в отдельном поле: календарь сам делает из него карту и маршрут
@@ -3006,7 +3017,7 @@ const reconcileBookings = async () => {
             `👤 ${b.client_name || "Клиент"}\n` +
             `💇 ${b.service_name || "Услуга"}\n` +
             `📆 ${dateRu(b.booked_date)}, ${timeShort(b.booked_time)}\n` +
-            `💳 ${b.total_price ? b.total_price + " BYN" : "—"}\n` +
+            `💳 ${priceTag(b)}\n` +
             (b.salon_id ? `👩‍🎨 ${m.name || b.master_name || "Мастер"}\n` : "") +
             `\nПодтвердите или предложите другое время:`
           );
@@ -3436,6 +3447,13 @@ app.post("/bookings", async (req, res) => {
       booked_date: date, booked_time: time + ":00", duration_min: dur,
       service_name: isBlock ? (b.service_name || "Перерыв") : svc.name,
       total_price: price,
+      /* Скидку запоминаем в самой записи: акция на окно сгорает вместе
+         с окном, и задним числом её уже не восстановить. */
+      orig_price: promo ? (+svc.price || 0) : null,
+      promo_pct:  promo
+        ? (+promo.discount_pct || ((+svc.price || 0) > 0
+            ? Math.round((1 - price / (+svc.price || 1)) * 100) : 0))
+        : null,
       client_name: clientName, client_telegram_id: clientTg,
       client_notes: b.client_notes ? String(b.client_notes).slice(0, 1000) : null,
       client_photo_urls: Array.isArray(b.client_photo_urls) ? b.client_photo_urls.slice(0, 6) : null,

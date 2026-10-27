@@ -51,21 +51,52 @@ const inkOf = (t) => (t.onCard ? { ink: "#111111", muted: "#6B7280", slot: "#F4F
 
 const cardWrap = (t, y, h) => (t.onCard ? rect({ x: PAD, y, w: CW, h, r: 40, fill: t.card }) : "");
 
-/* ── Макет 1. Свободные окошки ──────────────────────────────── */
+/* ── Макет 1. Свободные окошки ──────────────────────────────
+   Окно со скидкой рисуем отдельной плашкой: акцентная обводка плюс
+   процент цветом. Без этого скидка была просто длинной подписью
+   внутри такой же плашки и терялась в ряду одинаковых времён.   */
+const SLOT_H = 104, SLOT_GAP = 16, SLOT_PAD = 32, SLOT_S = 44, OFF_S = 30, OFF_GAP = 11;
+const VIOLET_TEXT = "#7B61FF";
+
+const slotItem = (v) => (typeof v === "string" ? { t: v, off: 0 } : { t: v.t, off: +v.off || 0 });
+const offLabel = (off) => `−${off}%`;
+const slotWidth = (it) =>
+  measure(it.t, SLOT_S, 700) + (it.off ? OFF_GAP + measure(offLabel(it.off), OFF_S, 800) : 0) + SLOT_PAD * 2;
+
+const slotChip = (it, x, y, c) => {
+  const w = slotWidth(it);
+  const tw = measure(it.t, SLOT_S, 700);
+  const ow = it.off ? OFF_GAP + measure(offLabel(it.off), OFF_S, 800) : 0;
+  const sx = x + (w - tw - ow) / 2, by = y + SLOT_H / 2 + SLOT_S * 0.35;
+  return rect({ x, y, w, h: SLOT_H, r: SLOT_H / 2, fill: c.slot,
+                stroke: it.off ? VIOLET_TEXT : c.stroke, sw: it.off ? 3 : 1 }) +
+    text({ x: sx, y: by, s: SLOT_S, w: 700, fill: c.ink, str: it.t }) +
+    (it.off ? text({ x: sx + tw + OFF_GAP, y: by, s: OFF_S, w: 800, fill: VIOLET_TEXT, str: offLabel(it.off) }) : "");
+};
+
+/* Раскладка плашек по рядам. Считаем отдельно от рисования: высота
+   блока нужна раньше, чем известно, куда его класть. */
+const slotRows = (items, maxW) => {
+  const rows = [[]];
+  let w = 0;
+  for (const raw of items) {
+    const it = slotItem(raw), iw = slotWidth(it);
+    if (rows[rows.length - 1].length && w + SLOT_GAP + iw > maxW) { rows.push([]); w = 0; }
+    else if (rows[rows.length - 1].length) w += SLOT_GAP;
+    rows[rows.length - 1].push(it); w += iw;
+  }
+  return rows;
+};
+
 const slotsLayout = (d, t) => {
   const c = inkOf(t);
   const pad = t.onCard ? 46 : 0;
   const innerW = CW - pad * 2;
-  const SLOT_H = 104, SLOT_GAP = 16, LABEL_H = 30, LABEL_GAP = 18, GROUP_GAP = 34;
-
-  const flowOf = (times, x, y) => flowChips({
-    x, y, maxW: innerW, gap: SLOT_GAP, items: times,
-    h: SLOT_H, padX: 32, s: 44, w: 700, fill: c.slot, color: c.ink, stroke: c.stroke,
-  });
+  const LABEL_H = 30, LABEL_GAP = 18, GROUP_GAP = 34;
 
   const measured = d.groups.map((g) => {
-    const f = flowOf(g.times, 0, 0);
-    return { g, h: LABEL_H + LABEL_GAP + f.height };
+    const rows = slotRows(g.times, innerW);
+    return { g, rows, h: LABEL_H + LABEL_GAP + rows.length * SLOT_H + (rows.length - 1) * SLOT_GAP };
   });
   const blockH = measured.reduce((a, m) => a + m.h, 0) + GROUP_GAP * (measured.length - 1);
 
@@ -78,8 +109,7 @@ const slotsLayout = (d, t) => {
   let top = title.svg;
   cy += title.height + 22;
   if (d.priceLine) { top += text({ x: PAD, y: cy + 26, s: 30, w: 600, fill: t.muted, str: d.priceLine }); cy += 56; }
-  const dc = accentChip({ x: PAD, y: cy + 8, str: d.dateLabel });
-  top += dc.svg;
+  top += accentChip({ x: PAD, y: cy + 8, str: d.dateLabel }).svg;
   const topEnd = cy + 8 + 72;
 
   const { y: blockY } = place(topEnd, blockH + pad * 2);
@@ -88,8 +118,12 @@ const slotsLayout = (d, t) => {
   for (const m of measured) {
     body += text({ x: PAD + pad, y: y + 24, s: 23, w: 800, fill: c.muted, ls: 3.4, str: m.g.label.toUpperCase() });
     y += LABEL_H + LABEL_GAP;
-    body += flowOf(m.g.times, PAD + pad, y).svg;
-    y += (m.h - LABEL_H - LABEL_GAP) + GROUP_GAP;
+    for (const row of m.rows) {
+      let x = PAD + pad;
+      for (const it of row) { body += slotChip(it, x, y, c); x += slotWidth(it) + SLOT_GAP; }
+      y += SLOT_H + SLOT_GAP;
+    }
+    y += GROUP_GAP - SLOT_GAP;
   }
   return top + body;
 };

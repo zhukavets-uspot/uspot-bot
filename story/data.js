@@ -121,8 +121,7 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     const g = { "Утро": [], "День": [], "Вечер": [] };
     for (const m of mins) {
       const t = hhmm(m);
-      const pct = +off[t] || 0;
-      (m < 12 * 60 ? g["Утро"] : m < 17 * 60 ? g["День"] : g["Вечер"]).push(pct ? `${t} −${pct}%` : t);
+      (m < 12 * 60 ? g["Утро"] : m < 17 * 60 ? g["День"] : g["Вечер"]).push({ t, off: +off[t] || 0 });
     }
     return Object.entries(g).filter(([, v]) => v.length).map(([label, times]) => ({ label, times }));
   };
