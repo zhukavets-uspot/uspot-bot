@@ -215,6 +215,21 @@ const fmtAddr = (raw = "") => {
 };
 
 // Адрес + маршрут одной строкой. Пусто, если адреса нет — лишней строки не будет.
+/* Где состоится визит. У салона несколько точек, и адрес мастера —
+   не всегда тот, куда едет клиент. Поэтому адрес из самой записи
+   важнее: он зафиксирован в момент бронирования и не поедет, если
+   салон потом переименует точку. */
+const visitPlace = (b, m) => (b && b.address)
+  ? { location: b.address, lat: b.address_lat ?? null, lng: b.address_lng ?? null }
+  : m;
+
+/* Короткая строка с местом — там, где карта ещё не нужна: запись
+   только отправлена, мастер её не подтвердил. */
+const addrShort = (b) => {
+  const a = fmtAddr(b?.address || "");
+  return a ? `📍 ${a}\n` : "";
+};
+
 const addrBlock = (m) => {
   const a = fmtAddr(m?.location || "");
   if (!a) return "";
@@ -379,7 +394,7 @@ const sendConfirmationToClient = async (b, masterName = null) => {
     `💇 ${b.service_name || "Услуга"}\n` +
     `📆 ${dateRu(b.booked_date)}, ${timeShort(b.booked_time)}\n` +
     `💳 ${priceTag(b)}\n` +
-    addrBlock(mFull) +
+    addrBlock(visitPlace(b, mFull)) +
     (b.reschedule_of ? `\nЖдём вас в новое время! 💜` : `\nЖдём вас в Uspot! 💜`),
     [[
       { text: "📅 Перенести", callback_data: `reschedule_${b.id}` },
@@ -799,6 +814,7 @@ const subNewBookings = () => {
         `💇 ${b.service_name || "Услуга"}\n` +
         wasLine +
         `${b.reschedule_of ? "📅 Стало: " : "📆 "}${date}, ${time}\n` +
+        addrShort(b) +
         `💳 ${price}\n` +
         (b.salon_id ? `👩‍🎨 ${masterName}\n` : "") +
         `\n` +
@@ -816,6 +832,7 @@ const subNewBookings = () => {
           `👩‍🎨 ${masterName}\n` +
           `💇 ${b.service_name || "Услуга"}\n` +
           `📆 ${date}, ${time}\n` +
+          addrShort(b) +
           `💳 ${price}\n\n` +
           `Мастер подтвердит запись в ближайшее время. Мы сразу сообщим вам! 💜`,
           [], { booking_id: b.id, kind: "created" }
@@ -829,6 +846,7 @@ const subNewBookings = () => {
           `👤 ${b.client_name || "Клиент"}\n` +
           `💇 ${b.service_name || "Услуга"}\n` +
           `📆 ${date}, ${time}\n` +
+          addrShort(b) +
           `💳 ${price}`,
           [], { booking_id: b.id, kind: "master_new", audience: "master" }
         );
@@ -842,7 +860,9 @@ const subNewBookings = () => {
           `👩‍🎨 ${masterName}\n` +
           `💇 ${b.service_name || "Услуга"}\n` +
           `📆 ${date}, ${time}\n` +
-          `💳 ${price}\n\n` +
+          `💳 ${price}\n` +
+          addrBlock(visitPlace(b, null)) +
+          `\n` +
           `До встречи в Uspot! 💜`,
           [[
             { text: "📅 Перенести", callback_data: `reschedule_${b.id}` },
@@ -1332,7 +1352,7 @@ bot.on("callback_query", async (query) => {
           `💇 ${bk.service_name || "Услуга"}\n` +
           `📅 Вы просили: ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n` +
           `📅 Мастер предлагает: <b>${dateRu(iso)}, ${time}</b>\n` +
-          addrBlock(mFull) +
+          addrBlock(visitPlace(b, mFull)) +
           `\nПодходит новое время?`,
           [[{ text: "✅ Подтвердить", callback_data: `sok_${bookingId}_${iso}_${hm}` }],
            [{ text: "📅 Выбрать другое время", callback_data: `reschedule_${bookingId}` }]],
@@ -1396,7 +1416,7 @@ bot.on("callback_query", async (query) => {
         `💇 ${bk.service_name || "Услуга"}\n` +
         `📆 <b>${dateRu(iso)}, ${time}</b>\n` +
         (bk.total_price ? `💳 ${priceTag(bk)}\n` : "") +
-        addrBlock(mFull) +
+        addrBlock(visitPlace(b, mFull)) +
         `\nЖдём вас! 💜`,
         [[{ text: "📅 Перенести", callback_data: `reschedule_${bookingId}` },
           { text: "❌ Отменить",  callback_data: `client_cancel_${bookingId}` }]],
@@ -1650,7 +1670,7 @@ const runReminders = async () => {
       `🔔 <b>Через час ваша запись!</b>\n\n` +
       `💇 ${b.service_name || "Услуга"}\n` +
       `👩‍🎨 ${master?.name || "Мастер"}\n` +
-      addrBlock(master) +
+      addrBlock(visitPlace(b, master)) +
       `\nВремя: <b>${timeShort(b.booked_time)}</b> — ждём вас! 💜`,
       [], { booking_id: b.id, kind: "remind_1h" }
     );
@@ -1678,7 +1698,7 @@ const runReminders = async () => {
       `Завтра в <b>${timeShort(b.booked_time)}</b> у вас запись:\n` +
       `💇 ${b.service_name || "Услуга"}\n` +
       `👩‍🎨 ${master?.name || "Мастер"}\n` +
-      addrBlock(master) +
+      addrBlock(visitPlace(b, master)) +
       (b.total_price ? `💳 ${priceTag(b)}\n` : "") +
       `\nДо встречи в Uspot! 💜`,
       [], { booking_id: b.id, kind: "remind_24h" }
@@ -3327,7 +3347,7 @@ app.post("/bookings", async (req, res) => {
     if (date < todayIso) return res.status(400).json({ error: "past_date" });
 
     const { data: master } = await db.from("masters")
-      .select("id, name, kind, salon_id, telegram_user_id, is_active, works_from, works_until")
+      .select("id, name, kind, salon_id, telegram_user_id, is_active, works_from, works_until, address_id, location")
       .eq("id", masterId).single();
     if (!master || master.is_active === false) return res.status(404).json({ error: "master_not_found" });
     if (master.works_until && master.works_until < date) return res.status(409).json({ error: "master_left" });
@@ -3408,6 +3428,27 @@ app.post("/bookings", async (req, res) => {
       }
     }
 
+    /* Где состоится визит. Берём с сервера, а не из запроса: клиент
+       может прислать любую строку, а в записи должен оказаться тот
+       адрес, который салон действительно указал. Текст сохраняем
+       рядом с идентификатором — салон потом переименует точку, а в
+       истории и в старых сообщениях должно остаться то место, куда
+       человек ездил. */
+    let addressId = null, addressText = null, addressLat = null, addressLng = null;
+    try {
+      if (master.salon_id) {
+        const { data: sal } = await db.from("masters")
+          .select("addresses, location").eq("id", master.salon_id).maybeSingle();
+        const list = Array.isArray(sal?.addresses) ? sal.addresses : [];
+        const pick = (master.address_id && list.find((a) => a.id === master.address_id)) || list[0] || null;
+        addressId = pick?.id || null;
+        addressText = pick?.address || sal?.location || null;
+        addressLat = pick?.lat ?? null; addressLng = pick?.lng ?? null;
+      } else {
+        addressText = master.location || null;      // соло-мастер: его собственный адрес
+      }
+    } catch (e) { console.warn("Адрес записи:", e.message); }
+
     // Клиент: сам записывающийся или тот, кого вписал администратор
     let clientName, clientTg = null;
     if (isBlock) {
@@ -3454,6 +3495,8 @@ app.post("/bookings", async (req, res) => {
         ? (+promo.discount_pct || ((+svc.price || 0) > 0
             ? Math.round((1 - price / (+svc.price || 1)) * 100) : 0))
         : null,
+      address_id: addressId, address: addressText,
+      address_lat: addressLat, address_lng: addressLng,
       client_name: clientName, client_telegram_id: clientTg,
       client_notes: b.client_notes ? String(b.client_notes).slice(0, 1000) : null,
       client_photo_urls: Array.isArray(b.client_photo_urls) ? b.client_photo_urls.slice(0, 6) : null,
