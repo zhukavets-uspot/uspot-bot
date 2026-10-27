@@ -1802,7 +1802,7 @@ const runReminders = async () => {
    проход повторит, пока окно открыто; постоянный отказ (бот заблокирован,
    чата нет) — отметку оставляем, повтор бесполезен, а в журнале доставки
    остаётся ошибка: её увидит проверка и утренний отчёт. */
-const lastPass = { reminders: null, pending: null, audit: null, report: null, retention: null };
+const lastPass = { reminders: null, pending: null, audit: null, report: null, retention: null, storyNudge: null };
 const reminderOutcome = (res, bookingId, claimCol, label, key) => {
   if (res.msg) {
     sentReminders.add(key);
@@ -3234,6 +3234,20 @@ const activePromoFor = async (master, serviceName, todayIso) => {
   return live.find((p) => p.master_id === master.id) || live[0] || null;
 };
 
+/* Акция на окно. Отличается от обычной тем, что привязана не к услуге,
+   а к одному времени: «сегодня в 16:00 минус 20%». Ищем точным
+   совпадением мастера, даты и времени — скидка сгорает вместе с окном,
+   отдельного срока ей не нужно. Своя акция мастера важнее салонной. */
+const slotPromoFor = async (master, date, time) => {
+  const owners = [master.id, master.salon_id].filter(Boolean);
+  const { data, error } = await db.from("promos").select("*")
+    .in("master_id", owners).eq("is_active", true)
+    .eq("slot_date", date).eq("slot_time", String(time).slice(0, 5) + ":00");
+  if (error) { console.error("Акция на окно: запрос не выполнен —", error.message); return null; }
+  const live = (data || []).filter((p) => !(+p.total_slots > 0) || (+p.slots_left || 0) > 0);
+  return live.find((p) => p.master_id === master.id) || live[0] || null;
+};
+
 // Процент считается от цены мастера, фиксированная цена — как задана
 const promoPriceFor = (base, p) => {
   if (!p) return null;
@@ -3390,7 +3404,11 @@ app.post("/bookings", async (req, res) => {
        Стоит после всех проверок: отказ ниже по коду не должен съесть место. */
     let promo = null;
     if (!isBlock) {
-      promo = await activePromoFor(master, svc.name, todayIso);
+      /* Акция на окно конкретнее акции на услугу: мастер вешает её
+         именно на это время, чтобы его забрали. Если есть обе —
+         действует та, что на окно. */
+      promo = (await slotPromoFor(master, date, time))
+           || (await activePromoFor(master, svc.name, todayIso));
       const pp = promoPriceFor(price, promo);
       if (pp != null && pp < price && await takePromoSlot(promo)) price = pp;
       else promo = null;
@@ -4392,6 +4410,70 @@ app.post("/moderation/resubmit", async (req, res) => {
   }
 });
 
+// ── POST /promo/slot ───────────────────────────────────────
+// Скидка на конкретное окно прямо из «Продвижения». Нужна, чтобы
+// горящее окно не просто показывали, а давали повод его забрать.
+// Цену при записи всё равно считает сервер (см. /bookings) — здесь
+// только условие, не цена.
+app.post("/promo/slot", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const b = req.body || {};
+    const masterId = typeof b.master_id === "string" && UUID_RE.test(b.master_id) ? b.master_id : null;
+    if (!masterId || !c.visible.has(masterId)) return res.status(403).json({ error: "forbidden" });
+
+    const date = String(b.date || "");
+    const time = String(b.time || "").slice(0, 5);
+    if (!DATE_RE.test(date) || !/^\d{2}:\d{2}$/.test(time)) return res.status(400).json({ error: "bad_request" });
+    const todayIso = minskDateStr(0);
+    if (date < todayIso || date > minskDateStr(14)) return res.status(400).json({ error: "bad_date" });
+
+    const pct = Math.round(+b.pct || 0);
+    /* Ноль — это «снять скидку». Потолок в 70% не из вредности:
+       процент приходит из браузера, а цену по нему считает сервер. */
+    if (pct !== 0 && (pct < 5 || pct > 70)) return res.status(400).json({ error: "bad_pct" });
+
+    const { data: existing } = await db.from("promos").select("id")
+      .eq("master_id", masterId).eq("slot_date", date).eq("slot_time", time + ":00").limit(1);
+    const prev = (existing || [])[0];
+
+    if (pct === 0) {
+      if (prev) await db.from("promos").delete().eq("id", prev.id);
+      return res.json({ ok: true, removed: true });
+    }
+
+    // Скидка на уже занятое окно — деньги на ветер: отдавать нечего
+    const { data: busy } = await db.from("bookings")
+      .select("booked_time, duration_min").eq("master_id", masterId).eq("booked_date", date)
+      .not("status", "in", "(cancelled,declined)");
+    const start = toMinutes(time);
+    if ((busy || []).some((x) => {
+      const s2 = toMinutes(String(x.booked_time || "").slice(0, 5)), d2 = +x.duration_min || 60;
+      return s2 < start + 30 && s2 + d2 > start;
+    })) return res.status(409).json({ error: "slot_taken" });
+
+    const row = {
+      master_id: masterId, service_name: null, discount_pct: pct,
+      orig_price: null, promo_price: null,
+      title: `Горящее окно ${time}`,
+      description: `Скидка ${pct}% на запись в ${time}`,
+      valid_from: date, valid_until: date,          // сгорает вместе с окном
+      total_slots: 1, slots_left: 1,                // одно окно — одна запись
+      slot_date: date, slot_time: time + ":00",
+      is_active: true,
+    };
+    const q = prev
+      ? db.from("promos").update(row).eq("id", prev.id).select("id")
+      : db.from("promos").insert([row]).select("id");
+    const { data: saved, error } = await q;
+    if (error) { console.error("Скидка на окно:", error.message); return res.status(500).json({ error: "save_failed" }); }
+    res.json({ ok: true, id: (saved || [])[0]?.id || prev?.id || null, pct });
+  } catch (e) {
+    console.error("Скидка на окно:", e.message);
+    res.status(500).json({ error: "save_failed" });
+  }
+});
+
 /* ═══ ПРОДВИЖЕНИЕ: сторис для мастера ═══════════════════════════
    Опубликовать за мастера в инстаграм нельзя, и дело не в том, что
    нам лень. Публикация через Graph API требует бизнес-аккаунта с
@@ -4478,7 +4560,8 @@ app.post("/story/make", async (req, res) => {
     const built =
       format === "week"   ? await storyData.weekStory(masterId, opts) :
       format === "hot"    ? await storyData.hotStory(masterId,
-                              { ...opts, findPromo: activePromoFor, promoPrice: promoPriceFor }) :
+                              { ...opts, findPromo: activePromoFor, promoPrice: promoPriceFor,
+                                findSlotPromo: slotPromoFor }) :
       format === "review" ? await storyData.reviewStory(masterId, opts) :
                             await storyData.slotsStory(masterId, b.scope === "today" ? "today" : "tomorrow", opts);
     if (built.error) return res.status(409).json({ error: built.error });
@@ -4526,6 +4609,112 @@ app.post("/story/send", async (req, res) => {
     res.status(502).json({ error: "send_failed" });
   }
 });
+
+/* ─── Вечерний сигнал: завтра почти пусто ──────────────────────
+   Экран «Продвижение» работает только если в него зашли, а заходят
+   в него редко. Поэтому вечером бот сам смотрит завтрашний день
+   каждого кабинета и, если он почти свободен, предлагает собрать
+   сторис — пока окна ещё можно продать.
+
+   Отметку в базе ставим ДО отправки и по первичному ключу: кто
+   первым вставил строку (кабинет + дата), тот и шлёт. Проверять
+   «а не слали ли уже» и потом слать нельзя — между проверкой и
+   отправкой успевает влезть второй проход.
+
+   Разбираем кабинет один раз за вечер, даже если решили не слать:
+   так проход не перечитывает расписание каждые четверть часа. День,
+   который опустеет позже, закроет сигнал об отмене — он приходит
+   сразу и с той же кнопкой.                                      */
+const NUDGE_FROM_MIN = 19 * 60;        // окно отправки по Минску
+const NUDGE_TO_MIN   = 21 * 60;
+const NUDGE_MIN_FREE = 3;              // ради двух окон будить не стоит
+const NUDGE_COOLDOWN_DAYS = 3;         // не чаще раза в три дня на кабинет
+const NUDGE_KEEP_DAYS = 30;            // сколько держим отметки
+
+const minskMinutesNow = () => {
+  const d = new Date(Date.now() + MINSK_OFFSET_MS);
+  return d.getUTCHours() * 60 + d.getUTCMinutes();
+};
+
+let nudgeRunning = false;
+
+const runStoryNudges = async () => {
+  if (nudgeRunning) return;
+  const mins = minskMinutesNow();
+  if (mins < NUDGE_FROM_MIN || mins >= NUDGE_TO_MIN) return;
+  nudgeRunning = true;
+  const target = minskDateStr(1);
+  try {
+    /* Кабинеты, у которых есть куда писать и кого показывать:
+       непрошедший модерацию профиль в поиске не виден, звать его
+       рекламировать свободные окна незачем. */
+    const { data: cabs, error } = await db.from("masters")
+      .select("id, name, kind, telegram_user_id")
+      .not("telegram_user_id", "is", null)
+      .eq("is_active", true)
+      .eq("moderation_status", "approved");
+    if (error) { console.error("🪟 Вечерний сигнал: не прочитать кабинеты —", error.message); return; }
+
+    /* Пауза между сигналами. У мастера, к которому пока не ходят,
+       свободен каждый вечер — без паузы он получал бы это письмо
+       ежедневно и очень быстро перестал бы его открывать. */
+    const { data: recent } = await db.from("story_nudges")
+      .select("master_id").eq("sent", true).gte("target_date", minskDateStr(1 - NUDGE_COOLDOWN_DAYS));
+    const cooling = new Set((recent || []).map((r) => r.master_id));
+
+    let claimed = 0, sent = 0;
+    for (const m of cabs || []) {
+      // Захват: дубликат первичного ключа означает «этот вечер уже разобран»
+      const { error: clash } = await db.from("story_nudges")
+        .insert([{ master_id: m.id, target_date: target }]);
+      if (clash) continue;
+      claimed += 1;
+
+      let why = "";
+      try {
+        if (cooling.has(m.id)) {
+          why = "недавно уже писали";
+        } else {
+          const built = await storyData.slotsStory(m.id, "tomorrow");
+          if (built.error) why = built.error;
+          else if (!built.meta.open) why = "день занят";
+          else if (built.meta.free < NUDGE_MIN_FREE) why = "мало окон";
+          else {
+            const n = built.meta.free;
+            const word = n % 10 === 1 && n % 100 !== 11 ? "окно"
+              : (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20)) ? "окна" : "окон";
+            const res = await sendEx(m.telegram_user_id,
+              `🪟 <b>Завтра почти пусто</b>\n\n` +
+              `${built.data.dateLabel.replace(/^Завтра, /, "")} — свободно ${n} ${word}.\n` +
+              `Расскажите о них в сторис: картинка соберётся за минуту.`,
+              [[{ text: "📣 Рассказать про окна",
+                  web_app: { url: `${MINI_APP_URL}?startapp=story` } }]],
+              { kind: "story_nudge", audience: "master" });
+            if (res.msg) { sent += 1; why = "отправлено"; }
+            else why = `не доставлено: ${res.error}`;
+          }
+        }
+      } catch (e) {
+        why = `сбой: ${e.message}`;
+        console.error(`🪟 Вечерний сигнал: кабинет ${m.id} —`, e.message);
+      }
+      await db.from("story_nudges")
+        .update({ sent: why === "отправлено", reason: why.slice(0, 200) })
+        .eq("master_id", m.id).eq("target_date", target);
+    }
+    if (claimed) console.log(`🪟 Вечерний сигнал на ${target}: разобрано ${claimed}, отправлено ${sent}`);
+
+    // Старые отметки не нужны: они только про «уже разбирали этот вечер»
+    const edge = minskDateStr(-NUDGE_KEEP_DAYS);
+    await db.from("story_nudges").delete().lt("target_date", edge);
+    lastPass.storyNudge = new Date().toISOString();
+  } catch (e) {
+    console.error("🪟 Вечерний сигнал:", e.message);
+  } finally {
+    nudgeRunning = false;
+  }
+};
+setInterval(runStoryNudges, 15 * 60 * 1000);
 
 // ── POST /feedback ─────────────────────────────────────────
 app.post("/feedback", async (req, res) => {
