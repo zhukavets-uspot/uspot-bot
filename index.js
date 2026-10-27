@@ -1068,8 +1068,14 @@ const subBookingUpdates = () => {
             `💳 ${price}\n` +
             (b.salon_id ? `👩‍🎨 ${masterName}\n` : "") +
             (reasonText === "Причина не указана" ? `💬 Причина не указана` : `💬 Причина: ${reasonText}`) +
-            (isReschedule ? `\n\nОжидайте новую запись от клиента.` : ""),
-            [], { booking_id: b.id, kind: "cancel_by_client", audience: "master" }
+            (isReschedule ? `\n\nОжидайте новую запись от клиента.` : `\n\nОкно снова свободно — его ещё можно продать.`),
+            /* Самое ценное в этом сообщении — не факт отмены, а то, что
+               окно освободилось и его ещё можно занять. Экран «Продвижение»
+               соберёт сторис за один тап. При переносе кнопки нет: клиент
+               вернётся сам, и звать на это окно других незачем. */
+            isReschedule ? [] : [[{ text: "📣 Рассказать про окно",
+              web_app: { url: `${MINI_APP_URL}?startapp=story` } }]],
+            { booking_id: b.id, kind: "cancel_by_client", audience: "master" }
           );
         }
         closeMasterCard(b.id, isReschedule
@@ -4383,6 +4389,141 @@ app.post("/moderation/resubmit", async (req, res) => {
   } catch (e) {
     console.error("moderation/resubmit:", e.message);
     res.status(500).json({ error: e.message });
+  }
+});
+
+/* ═══ ПРОДВИЖЕНИЕ: сторис для мастера ═══════════════════════════
+   Опубликовать за мастера в инстаграм нельзя, и дело не в том, что
+   нам лень. Публикация через Graph API требует бизнес-аккаунта с
+   привязанной страницей Facebook и ревью Meta, а главное — стикеры,
+   включая стикер «Ссылка», через API не ставятся. Сторис без
+   кликабельной ссылки хуже той, что мастер выложил руками. Поэтому
+   бот не публикует, а отдаёт готовую картинку: в Telegram — одним
+   тапом через shareToStory, в инстаграм — сохранением в галерею.
+
+   Картинки нигде не храним. И shareToStory, и downloadFile требуют
+   HTTPS-адрес, поэтому свежие PNG лежат в памяти процесса и
+   отдаются по одноразовому адресу полчаса — ровно пока мастер
+   смотрит превью и жмёт «Поделиться». Заводить под это хранилище
+   незачем: не нужно ни чистить его, ни раздавать на него права.
+   Адрес открыт без сессии, иначе Telegram не смог бы забрать файл;
+   защита — в неугадываемом токене и в том, что персональных данных
+   на картинке нет по построению.                                 */
+
+const storyData = require("./story/data")({ db, BOOK_LEAD_MIN });
+const { render: renderStory } = require("./story");
+
+const STORY_TTL_MS = 30 * 60 * 1000;
+const STORY_MAX    = 24;                    /* верхняя граница памяти под кэш: тема
+                                               «с фото» весит около мегабайта, значит
+                                               худший случай — порядка 24 МБ. */
+/* Насколько громко звучит площадка на картинке: "sign" — только подпись
+   в подвале, "mark" — плюс знак в фоне, "bold" — плюс фирменный градиент
+   на подвале. Выбор мастеру не отдаём: это наш фирменный стиль, а не
+   настройка. Меняется здесь одной строкой.                          */
+const STORY_BRAND = "mark";
+/* Строка под названием в углу картинки. Пусто — только «Uspot». */
+const STORY_TAGLINE = "ЛУЧШИЙ МАСТЕР РЯДОМ";
+const STORY_FORMATS = ["slots", "week", "hot", "review"];
+const STORY_THEMES  = ["dark", "light", "photo"];
+const storyCache = new Map();               // токен → { png, at, tgId }
+
+const storySweep = () => {
+  const now = Date.now();
+  for (const [k, v] of storyCache) if (now - v.at > STORY_TTL_MS) storyCache.delete(k);
+  // Map хранит порядок вставки, поэтому первым уходит самый старый
+  while (storyCache.size > STORY_MAX) storyCache.delete(storyCache.keys().next().value);
+};
+setInterval(storySweep, 5 * 60 * 1000);
+
+/* Рендер стоит процессорного времени, а процесс у нас один на всё.
+   Двадцать картинок в минуту — это сильно больше, чем нужно живому
+   мастеру, и сильно меньше, чем нужно, чтобы положить бота.      */
+const storyRate = new Map();
+const storyTooOften = (tgId) => {
+  const now = Date.now();
+  const r = storyRate.get(tgId) || { n: 0, at: now };
+  if (now - r.at > 60000) { r.n = 0; r.at = now; }
+  r.n += 1; storyRate.set(tgId, r);
+  return r.n > 20;
+};
+
+// ── GET /story/:file ───────────────────────────────────────
+// Картинка по одноразовому адресу. Отдаём и Telegram, и браузеру.
+app.get("/story/:file", (req, res) => {
+  const tok = String(req.params.file || "").replace(/\.png$/i, "");
+  const hit = storyCache.get(tok);
+  if (!hit || Date.now() - hit.at > STORY_TTL_MS) return res.status(404).send("not found");
+  res.set("Content-Type", "image/png");
+  res.set("Cache-Control", "private, max-age=600");
+  res.send(hit.png);
+});
+
+// ── POST /story/make ───────────────────────────────────────
+// Собрать сторис. master_id из запроса — просьба, а не право:
+// пересекаем с теми, кого видит эта сессия.
+app.post("/story/make", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const b = req.body || {};
+    const masterId = typeof b.master_id === "string" && UUID_RE.test(b.master_id) ? b.master_id : null;
+    if (!masterId || !c.visible.has(masterId)) return res.status(403).json({ error: "forbidden" });
+    if (storyTooOften(c.tgId)) return res.status(429).json({ error: "too_often" });
+
+    const format = STORY_FORMATS.includes(b.format) ? b.format : "slots";
+    const theme  = STORY_THEMES.includes(b.theme)   ? b.theme  : "dark";
+    const title  = typeof b.title === "string" ? b.title.trim().slice(0, 24) : "";
+    const opts   = { title: title || undefined, showPrice: b.show_price !== false };
+
+    const built =
+      format === "week"   ? await storyData.weekStory(masterId, opts) :
+      format === "hot"    ? await storyData.hotStory(masterId,
+                              { ...opts, findPromo: activePromoFor, promoPrice: promoPriceFor }) :
+      format === "review" ? await storyData.reviewStory(masterId, opts) :
+                            await storyData.slotsStory(masterId, b.scope === "today" ? "today" : "tomorrow", opts);
+    if (built.error) return res.status(409).json({ error: built.error });
+
+    const t0 = Date.now();
+    const { png } = renderStory({ format: built.format, theme, data: built.data,
+      brand: STORY_BRAND, tagline: STORY_TAGLINE });
+    const tok = crypto.randomBytes(16).toString("hex");
+    storyCache.set(tok, { png, at: Date.now(), tgId: c.tgId });
+    storySweep();
+
+    res.json({
+      ok: true, token: tok,
+      url: `${BOT_WEBHOOK_BASE}/story/${tok}.png`,
+      link: `https://${built.data.master.link}`,
+      meta: built.meta, bytes: png.length, ms: Date.now() - t0,
+    });
+  } catch (e) {
+    console.error("Сторис: сборка не удалась —", e.message);
+    res.status(500).json({ error: "render_failed" });
+  }
+});
+
+// ── POST /story/send ───────────────────────────────────────
+// Прислать картинку в чат. Это запасной путь к инстаграму для тех,
+// у кого клиент Telegram старее downloadFile, и одновременно самый
+// надёжный: из чата картинку сохраняют удержанием пальца.
+app.post("/story/send", async (req, res) => {
+  const tgId = needSession(req, res); if (!tgId) return;
+  const hit = storyCache.get(String(req.body?.story_token || ""));
+  if (!hit || hit.tgId !== tgId || Date.now() - hit.at > STORY_TTL_MS) {
+    return res.status(404).json({ error: "expired" });
+  }
+  const link = String(req.body?.link || "").slice(0, 120);
+  try {
+    await bot.sendPhoto(tgId, hit.png, {
+      caption: `Готово. Сохраните картинку и выложите в сторис.\n\n` +
+        `В инстаграме добавьте стикер <b>«Ссылка»</b> и вставьте адрес — он уже скопирован:\n` +
+        `<code>${link || "uspot.by"}</code>`,
+      parse_mode: "HTML",
+    }, { filename: "uspot-story.png", contentType: "image/png" });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Сторис: отправка в чат не удалась —", e.message);
+    res.status(502).json({ error: "send_failed" });
   }
 });
 
