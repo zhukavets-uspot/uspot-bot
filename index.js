@@ -3234,6 +3234,22 @@ const activePromoFor = async (master, serviceName, todayIso) => {
   return live.find((p) => p.master_id === master.id) || live[0] || null;
 };
 
+/* Какие окна дня идут со скидкой: время → процент. Нужно и сторис
+   (подписать скидку прямо к времени), и кабинету. */
+const slotDiscountsFor = async (masterIds, date) => {
+  const ids = (Array.isArray(masterIds) ? masterIds : [masterIds]).filter(Boolean);
+  if (!ids.length) return {};
+  const { data } = await db.from("promos").select("slot_time, discount_pct, total_slots, slots_left")
+    .in("master_id", ids).eq("slot_date", date).eq("is_active", true);
+  const out = {};
+  for (const p of data || []) {
+    if (+p.total_slots > 0 && !(+p.slots_left > 0)) continue;
+    const t = String(p.slot_time).slice(0, 5);
+    out[t] = Math.max(out[t] || 0, +p.discount_pct || 0);
+  }
+  return out;
+};
+
 /* Акция на окно. Отличается от обычной тем, что привязана не к услуге,
    а к одному времени: «сегодня в 16:00 минус 20%». Ищем точным
    совпадением мастера, даты и времени — скидка сгорает вместе с окном,
@@ -4474,6 +4490,29 @@ app.post("/promo/slot", async (req, res) => {
   }
 });
 
+// ── POST /promo/slot/list ──────────────────────────────────
+// Какие окна этого дня уже со скидкой. Нужен кабинету, чтобы
+// показать поставленные скидки и дать их снять.
+app.post("/promo/slot/list", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const b = req.body || {};
+    const masterId = typeof b.master_id === "string" && UUID_RE.test(b.master_id) ? b.master_id : null;
+    if (!masterId || !c.visible.has(masterId)) return res.status(403).json({ error: "forbidden" });
+    const date = String(b.date || "");
+    if (!DATE_RE.test(date)) return res.status(400).json({ error: "bad_request" });
+    const { data } = await db.from("promos")
+      .select("slot_time, discount_pct").eq("master_id", masterId)
+      .eq("slot_date", date).eq("is_active", true).not("slot_date", "is", null);
+    const out = {};
+    (data || []).forEach((p) => { out[String(p.slot_time).slice(0, 5)] = +p.discount_pct || 0; });
+    res.json({ ok: true, discounts: out });
+  } catch (e) {
+    console.error("Скидки на окна:", e.message);
+    res.status(500).json({ error: "read_failed" });
+  }
+});
+
 /* ═══ ПРОДВИЖЕНИЕ: сторис для мастера ═══════════════════════════
    Опубликовать за мастера в инстаграм нельзя, и дело не в том, что
    нам лень. Публикация через Graph API требует бизнес-аккаунта с
@@ -4563,7 +4602,8 @@ app.post("/story/make", async (req, res) => {
                               { ...opts, findPromo: activePromoFor, promoPrice: promoPriceFor,
                                 findSlotPromo: slotPromoFor }) :
       format === "review" ? await storyData.reviewStory(masterId, opts) :
-                            await storyData.slotsStory(masterId, b.scope === "today" ? "today" : "tomorrow", opts);
+                            await storyData.slotsStory(masterId, b.scope === "today" ? "today" : "tomorrow",
+                              { ...opts, findSlotDiscounts: slotDiscountsFor });
     if (built.error) return res.status(409).json({ error: built.error });
 
     const t0 = Date.now();

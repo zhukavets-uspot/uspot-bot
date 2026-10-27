@@ -114,9 +114,16 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     return { times: [...new Set(picked)], open };
   };
 
-  const groupTimes = (mins) => {
+  /* Скидку на окно подписываем прямо к времени. Без этого мастер
+     вешает её в кабинете, а на картинке — обычное окно, и никто про
+     скидку не узнаёт. */
+  const groupTimes = (mins, off = {}) => {
     const g = { "Утро": [], "День": [], "Вечер": [] };
-    for (const m of mins) (m < 12 * 60 ? g["Утро"] : m < 17 * 60 ? g["День"] : g["Вечер"]).push(hhmm(m));
+    for (const m of mins) {
+      const t = hhmm(m);
+      const pct = +off[t] || 0;
+      (m < 12 * 60 ? g["Утро"] : m < 17 * 60 ? g["День"] : g["Вечер"]).push(pct ? `${t} −${pct}%` : t);
+    }
     return Object.entries(g).filter(([, v]) => v.length).map(([label, times]) => ({ label, times }));
   };
 
@@ -217,6 +224,8 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     if (!starts.length) return { error: "no_slots" };
     const { times, open } = pickTimes(starts, capacity > 0 ? free / capacity : 0);
     const dur = gridDurationOf(members);
+    const off = typeof opts.findSlotDiscounts === "function"
+      ? await opts.findSlotDiscounts(e.memberIds, iso) : {};
 
     return {
       format: "slots",
@@ -224,10 +233,13 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
         title: opts.title || (open ? "Записываю на приём" : "Свободные окошки"),
         dateLabel: `${scope === "today" ? "Сегодня" : "Завтра"}, ${ruWeekday(iso)} · ${ruDayMonth(iso)}`,
         priceLine: opts.showPrice === false ? "" : priceLineOf(services, dur),
-        groups: groupTimes(times),
+        groups: groupTimes(times, off),
         master: await cardOf(e.entity),
       },
-      meta: { date: iso, free: starts.length, capacity, shown: times.length, open, masters: members.length },
+      /* times отдаём наружу: кабинет по ним предлагает повесить скидку
+         ровно на те окна, которые попали на картинку. */
+      meta: { date: iso, free: starts.length, capacity, shown: times.length, open,
+              times: times.map(hhmm), masters: members.length },
     };
   };
 
@@ -286,11 +298,17 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     if (!services.length) return { error: "no_services" };
 
     const isSalon = e.entity.kind === "salon";
-    /* Акцию ищем первой: если она есть, горящее окно продаёт именно
-       её. Без акции берём самую дорогую услугу — у соло-мастера это
-       верх прайса, у салона цена всё равно пойдёт «от».           */
+    const time = hhmm(starts[0]);
+
+    /* Порядок поиска скидки: сначала акция на само окно — мастер
+       повесил её именно на это время, чтобы его забрали; потом акция
+       на услугу. Без скидки берём самую дорогую услугу: горящее окно
+       продаёт верх прайса, а у салона цена всё равно пойдёт «от».  */
     let svc = null, promo = null;
-    if (typeof opts.findPromo === "function") {
+    if (typeof opts.findSlotPromo === "function") {
+      promo = await opts.findSlotPromo(e.entity, iso, time);
+    }
+    if (!promo && typeof opts.findPromo === "function") {
       const names = [...new Set(services.map((s) => s.name))];
       for (const name of names) {
         const p = await opts.findPromo(e.entity, name, iso);
@@ -312,7 +330,7 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
         badge: "Горящее окно",
         title: opts.title || "Освободилось окно",
         when: `Сегодня, ${ruWeekday(iso)} · ${ruDayMonth(iso)}`,
-        time: hhmm(starts[0]),
+        time,
         service: svc.name,
         price, priceFrom: isSalon && promoPrice == null,
         oldPrice: promoPrice != null && promoPrice < base ? base : null,
@@ -320,7 +338,7 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
         note: `Запись закроется за ${BOOK_LEAD_MIN === 60 ? "час" : BOOK_LEAD_MIN + " минут"} до начала`,
         master: await cardOf(e.entity),
       },
-      meta: { date: iso, time: hhmm(starts[0]), promo: !!promo, masters: members.length },
+      meta: { date: iso, time, promo: !!promo, slotPromo: !!(promo && promo.slot_date), masters: members.length },
     };
   };
 
