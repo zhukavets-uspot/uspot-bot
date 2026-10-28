@@ -204,6 +204,30 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
   const gridDurationOf = (members) =>
     members.length ? Math.min(...members.map((m) => m.durMin)) : 60;
 
+  /* Окна считаются под длительность услуги: дырка в 45 минут годится
+     под маникюр и не годится под наращивание. Без выбора берём самую
+     короткую услугу — тогда окон больше всего, но часть из них под
+     длинную процедуру не подойдёт, и это надо было как-то сказать.
+     Теперь мастер может назвать услугу прямо, и сетка считается под
+     неё, а мастера, которые её не делают, из расчёта выпадают. */
+  const forService = (members, name) => {
+    if (!name) return members;
+    const fit = members
+      .map((m) => {
+        const svc = m.services.find((s) => s.name === name);
+        return svc ? { ...m, durMin: Math.max(30, +svc.duration_min || 60) } : null;
+      })
+      .filter(Boolean);
+    return fit.length ? fit : members;        // услугу убрали из прайса — считаем как раньше
+  };
+
+  const serviceLine = (services, name, durMin) => {
+    const own = name ? services.filter((s) => s.name === name) : [];
+    if (!own.length) return priceLineOf(services, durMin);
+    const min = Math.min(...own.map((s) => +s.price || 0));
+    return `${name} · ${durMin} мин` + (min > 0 ? ` · от ${min} руб` : "");
+  };
+
   const priceLineOf = (services, durMin) => {
     if (!services.length) return `${durMin} минут`;
     const min = Math.min(...services.map((s) => +s.price || 0));
@@ -216,7 +240,9 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     if (!e) return { error: "master_not_found" };
     if (!e.memberIds.length) return { error: "no_masters" };
     const iso = minskDateStr(scope === "today" ? 0 : 1);
-    const { members, services } = await loadBundle(e.memberIds, iso, iso);
+    const all = await loadBundle(e.memberIds, iso, iso);
+    const services = all.services;
+    const members = forService(all.members, opts.service);
     const notBefore = scope === "today" ? minskMinutes() + BOOK_LEAD_MIN : null;
     const { starts, capacity, free, working } = freeOnDate(members, iso, notBefore);
     if (!working) return { error: "day_off" };
@@ -231,14 +257,14 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
       data: {
         title: opts.title || (open ? "Записываю на приём" : "Свободные окошки"),
         dateLabel: `${scope === "today" ? "Сегодня" : "Завтра"}, ${ruWeekday(iso)} · ${ruDayMonth(iso)}`,
-        priceLine: opts.showPrice === false ? "" : priceLineOf(services, dur),
+        priceLine: opts.showPrice === false ? "" : serviceLine(services, opts.service, dur),
         groups: groupTimes(times, off),
         master: await cardOf(e.entity),
       },
       /* times отдаём наружу: кабинет по ним предлагает повесить скидку
          ровно на те окна, которые попали на картинку. */
       meta: { date: iso, free: starts.length, capacity, shown: times.length, open,
-              times: times.map(hhmm), masters: members.length },
+              times: times.map(hhmm), masters: members.length, service: opts.service || null },
     };
   };
 
@@ -250,7 +276,9 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     if (!e) return { error: "master_not_found" };
     if (!e.memberIds.length) return { error: "no_masters" };
     const from = minskDateStr(0), to = minskDateStr(7);
-    const { members, services } = await loadBundle(e.memberIds, from, to);
+    const allW = await loadBundle(e.memberIds, from, to);
+    const services = allW.services;
+    const members = forService(allW.members, opts.service);
     const nowMin = minskMinutes();
     const days = [];
     for (let d = 0; d <= 7 && days.length < 5; d++) {
@@ -273,7 +301,7 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
       data: {
         title: opts.title || "Свободные окошки",
         dateLabel: "На ближайшую неделю",
-        priceLine: opts.showPrice === false ? "" : priceLineOf(services, gridDurationOf(members)),
+        priceLine: opts.showPrice === false ? "" : serviceLine(services, opts.service, gridDurationOf(members)),
         days,
         master: await cardOf(e.entity),
       },

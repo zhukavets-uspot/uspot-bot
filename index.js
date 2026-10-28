@@ -4655,7 +4655,11 @@ app.post("/story/make", async (req, res) => {
     const format = STORY_FORMATS.includes(b.format) ? b.format : "slots";
     const theme  = STORY_THEMES.includes(b.theme)   ? b.theme  : "dark";
     const title  = typeof b.title === "string" ? b.title.trim().slice(0, 24) : "";
-    const opts   = { title: title || undefined, showPrice: b.show_price !== false };
+    /* Услуга, под которую считаются окна. Имя из запроса не доверяем
+       как есть — просто ищем его в прайсе; чужого там не найдётся. */
+    const service = typeof b.service === "string" ? b.service.trim().slice(0, 120) : "";
+    const opts   = { title: title || undefined, showPrice: b.show_price !== false,
+                     service: service || undefined };
 
     const built =
       format === "week"   ? await storyData.weekStory(masterId, opts) :
