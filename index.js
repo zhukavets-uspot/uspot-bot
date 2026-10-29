@@ -84,6 +84,24 @@ const isPermanentSendError = (e) => {
     /chat not found|user not found|bot was blocked|user is deactivated|PEER_ID_INVALID|can't initiate conversation/i.test(text);
 };
 let ledgerBroken = false;
+
+/* Сообщение, которого не должно было быть. 29 октября клиент отказался
+   от опросов, бот честно промолчал — а сверка не нашла строки в журнале
+   и подняла фаундеров сигналом «сбой у нас: напишите Claude». Молчание
+   по решению человека и молчание из-за поломки выглядели одинаково.
+   Теперь намеренный пропуск тоже оставляет след, с пометкой причины. */
+const SKIP_MARK = "skip:";
+const logSkip = (bookingId, kind, reason, audience = "client") =>
+  Promise.resolve(db.from("notification_log").insert({
+    booking_id: bookingId || null, kind, audience, ok: false,
+    error: SKIP_MARK + reason,
+  })).then(({ error } = {}) => {
+    if (error && !ledgerBroken) {
+      ledgerBroken = true;
+      console.error("📒 Журнал доставки не пишется (патч v26 применён?):", error.message);
+    }
+  });
+
 const logDelivery = (meta, chatId, res) => {
   if (!meta || !meta.kind) return;
   Promise.resolve(db.from("notification_log").insert({
@@ -1825,6 +1843,7 @@ const runReminders = async () => {
     const cons = await consentsOf(b.client_telegram_id);
     if (cons.survey.asked && !cons.survey.granted) {
       await claimOnce(b.id, "review_asked_at");
+      await logSkip(b.id, "review", "no-consent");
       console.log(`⏰ Опрос по записи ${b.id} не отправлен: клиент отказался от опросов`);
       continue;
     }
@@ -2336,6 +2355,10 @@ const expectedMessages = (b) => {
 const deliveryState = (exp, logRows) => {
   const mine = (logRows || []).filter((r) => r.kind === exp.kind && new Date(r.created_at).getTime() >= exp.fromMs);
   if (mine.some((r) => r.ok)) return { state: "delivered" };
+  /* Пропуск по решению человека — раньше настоящей ошибки: строка у него
+     тоже ok=false, и без этой проверки он читался бы как отказ Telegram. */
+  const skip = mine.filter((r) => String(r.error || "").startsWith(SKIP_MARK)).pop();
+  if (skip) return { state: "skipped", reason: String(skip.error).slice(SKIP_MARK.length) };
   const fail = mine.filter((r) => !r.ok).pop();
   return fail ? { state: "failed", error: fail.error || "" } : { state: "missing" };
 };
@@ -2395,7 +2418,7 @@ const runDeliveryAudit = async () => {
       for (const exp of expectedMessages(b)) {
         if (exp.dueMs > nowMs || exp.dueMs < ledgerSinceMs) continue;
         const st = deliveryState(exp, logs[b.id]);
-        if (st.state === "delivered") continue;
+        if (st.state === "delivered" || st.state === "skipped") continue;
 
         /* Подтверждение, которое не ушло вовсе (Realtime пропустил), досылаем
            сами — пока визит впереди. Захват той же отметкой, что у Realtime и
@@ -2484,13 +2507,17 @@ const buildDeliveryReport = async (dayIso, nowMs = Date.now()) => {
 
   // Сколько сообщений нужно было, сколько дошло, что не так
   const tally = (rows, kinds) => {
-    const s = { need: 0, ok: 0, unknown: 0, bad: [] };
+    const s = { need: 0, ok: 0, unknown: 0, skipped: 0, bad: [] };
     for (const b of rows) {
       for (const e of expectedMessages(b)) {
         if (!kinds.includes(e.kind) || e.dueMs > nowMs) continue;
+        const stPre = deliveryState(e, logs[b.id]);
+        /* Отказ от опросов — не недоставка: такое сообщение и не
+           полагалось. Считаем отдельно, в «сколько из скольких» не берём. */
+        if (stPre.state === "skipped") { s.skipped++; continue; }
         s.need++;
         if (!ledgerSinceMs || e.dueMs < ledgerSinceMs) { s.unknown++; continue; }
-        const st = deliveryState(e, logs[b.id]);
+        const st = stPre;
         if (st.state === "delivered") { s.ok++; continue; }
         s.bad.push(`${esc((b.client_name || "Клиент").trim())} → ${esc((b.master_name || "мастер").trim())}, ${timeShort(b.booked_time)}: ` +
           (st.state === "failed" ? humanSendError(st.error) : "бот не отправил"));
@@ -2499,10 +2526,11 @@ const buildDeliveryReport = async (dayIso, nowMs = Date.now()) => {
     return s;
   };
   const row = (title, s) => {
-    if (!s.need) return [];
+    if (!s.need && !s.skipped) return [];
     const known = s.need - s.unknown;
     const icon = s.bad.length ? "⚠️" : known ? "✅" : "▫️";
     return [`${icon} ${title}: ${known ? `${s.ok} из ${known}` : "—"}` +
+      (s.skipped ? ` · ${s.skipped} не спрашивали — клиент отказался` : "") +
       (s.unknown ? ` · ещё ${s.unknown} до включения журнала — проверить нельзя` : ""),
       ...s.bad.map((l) => `   ✗ ${l}`)];
   };
@@ -4011,7 +4039,10 @@ app.post("/blacklist/remove", async (req, res) => {
    Срок задан критерием, а не датой: «до отзыва согласия» НЦЗПД прямо не
    допускает. Критерий привязан к последней записи — пока человек
    пользуется сервисом, согласие живёт; перестал — истекает само.        */
-const CONSENT_TEXT_VERSION = "2026-10-25";
+/* Поднята 29.10.2026 вместе с экраном: сам текст не менялся, но кнопка
+   под ним собирала отказ под словом «Принять». Новая версия отделяет
+   ответы, данные осознанно, от собранных прежним экраном. */
+const CONSENT_TEXT_VERSION = "2026-10-29";
 const CONSENT_PURPOSES = {
   share_with_master: { months: 36, rule: "3 года с даты последней записи" },
   survey:            { months: 12, rule: "1 год с даты последней записи" },
