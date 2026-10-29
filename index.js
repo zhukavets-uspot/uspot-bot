@@ -622,28 +622,21 @@ const greetOnce = (chatId) => {
 // ════════════════════════════════════════════════════════════
 // /start — keyboard + welcome
 // ════════════════════════════════════════════════════════════
-bot.onText(/\/start notify/, async (msg) => {
+/* Один обработчик на все виды «старта». Раньше их было два, и оба
+   с узкими шаблонами: `/start` с хвостом (так приходит любая ссылка
+   вида t.me/бот?start=…) и `/start@UspotTG_bot` не подходили ни под
+   один — бот молчал, и человек видел, что «ничего не происходит».  */
+bot.onText(/^\/start(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
   const chatId = msg.chat.id;
   const name   = msg.from?.first_name || "друг";
-  console.log(`🔔 /start notify from ${chatId} (${name})`);
-  if (!greetOnce(chatId)) { console.log(`↩️  Повторное /start notify от ${chatId} — не отвечаем`); return; }
-  await send(chatId,
-    `👋 Привет, ${name}!\n\n` +
-    `Теперь вы будете получать уведомления от <b>Uspot</b>:\n\n` +
-    `✅ Подтверждение записей\n` +
-    `⏰ Напоминания за 24 ч и за 1 ч\n` +
-    `✨ Статус после сеанса\n\n` +
-    `Возвращайтесь в приложение — всё готово! 💜`
-  );
-});
+  const payload = String((match && match[1]) || "").trim();
+  console.log(`👋 /start from ${chatId} (${name})${payload ? ` payload=${payload}` : ""}`);
 
-bot.onText(/\/start$/, async (msg) => {
-  const chatId = msg.chat.id;
-  const name   = msg.from?.first_name || "друг";
-  console.log(`👋 /start from ${chatId} (${name})`);
-  if (!greetOnce(chatId)) { console.log(`↩️  Повторное /start от ${chatId} — не отвечаем`); return; }
-
-  // Set the native Menu button for this chat — stays in the bottom bar permanently
+  /* Кнопку меню ставим ДО защиты от повтора. Она и есть постоянный вход
+     в приложение, ставится идемпотентно, и именно её отсутствие читается
+     как «бот сломался»: человек жмёт на меню внизу — и ничего. Раньше
+     повторный /start в ту же минуту выходил из обработчика раньше, чем
+     до неё доходило. */
   try {
     await bot.setChatMenuButton({
       chat_id: chatId,
@@ -653,6 +646,25 @@ bot.onText(/\/start$/, async (msg) => {
     console.warn("⚠️  setChatMenuButton failed:", e.message);
   }
 
+  /* А вот приветствие — один раз в минуту: человек нажимает «старт»
+     дважды подряд, и два одинаковых письма выглядят глупо. */
+  if (!greetOnce(chatId)) { console.log(`↩️  Повторное /start от ${chatId} — приветствие не шлём`); return; }
+
+  if (payload === "notify") {
+    await send(chatId,
+      `👋 Привет, ${name}!\n\n` +
+      `Теперь вы будете получать уведомления от <b>Uspot</b>:\n\n` +
+      `✅ Подтверждение записей\n` +
+      `⏰ Напоминания за 24 ч и за 1 ч\n` +
+      `✨ Статус после сеанса\n\n` +
+      `Возвращайтесь в приложение — всё готово! 💜`
+    );
+    return;
+  }
+
+  /* Хвост ссылки передаём в приложение: человек пришёл по ссылке
+     мастера и должен попасть к нему, а не в общий каталог. */
+  const appUrl = payload ? `${MINI_APP_URL}?startapp=${encodeURIComponent(payload)}` : MINI_APP_URL;
   try {
     await bot.sendMessage(chatId,
       `👋 Привет, ${name}! Добро пожаловать в <b>Uspot</b> — сервис записи к мастерам красоты Минска.\n\n` +
@@ -661,7 +673,7 @@ bot.onText(/\/start$/, async (msg) => {
         parse_mode: "HTML",
         reply_markup: {
           inline_keyboard: [
-            [{ text: "📅 Записаться к мастеру", web_app: { url: MINI_APP_URL } }],
+            [{ text: "📅 Записаться к мастеру", web_app: { url: appUrl } }],
             [{ text: "💼 Вход для Мастера Uspot", web_app: { url: MINI_APP_URL + "?startapp=master" } }],
           ],
         },
