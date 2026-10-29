@@ -15,7 +15,7 @@ const LAYOUTS = { slots: slotsLayout, hot: hotLayout, review: reviewLayout, week
    "bold" — плюс фирменный градиент на подвале.                     */
 const BRANDS = ["sign", "mark", "bold"];
 
-const buildSvg = ({ format, theme, data, brand = "mark", tagline = "" }) => {
+const buildSvg = ({ format, theme, data, brand = "mark", tagline = "", footerStyle = "bare" }) => {
   const t = THEMES[theme] || THEMES.light;
   const layout = LAYOUTS[format];
   if (!layout) throw new Error(`неизвестный формат: ${format}`);
@@ -28,7 +28,7 @@ const buildSvg = ({ format, theme, data, brand = "mark", tagline = "" }) => {
     header({ t, name: data.master.name, role: data.master.role,
              photoHref: data.master.photoHref, tagline }) +
     layout(data, t) +
-    footer({ t, link: data.master.link, logoHref: data.master.logoHref, brand: b }) +
+    footer({ t, link: data.master.link, logoHref: data.master.logoHref, brand: b, style: footerStyle }) +
     `</svg>`;
 };
 

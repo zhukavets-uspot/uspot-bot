@@ -611,8 +611,13 @@ const getShareholderIds = async (field = "notify_bookings") => {
    за четыре секунды нажала «Включить уведомления» (кнопка на экране не
    менялась после нажатия) и получила семь одинаковых «Привет». */
 const greetedAt = new Map();
-const greetOnce = (chatId) => {
-  const now = Date.now(), key = String(chatId);
+/* Ограничитель приветствий. Ключ — чат И вид приветствия: служебное
+   «уведомления включены» и обычное «добро пожаловать» это разные
+   письма, и одно не должно глушить другое. 28 октября ровно так и
+   вышло: из приложения прилетел /start notify, израсходовал минуту,
+   и четыре живых /start подряд остались без ответа. */
+const greetOnce = (chatId, kind = "main") => {
+  const now = Date.now(), key = `${chatId}:${kind}`;
   for (const [k, t] of greetedAt) if (now - t > 60 * 1000) greetedAt.delete(k);
   if (greetedAt.has(key)) return false;
   greetedAt.set(key, now);
@@ -648,7 +653,11 @@ bot.onText(/^\/start(?:@\w+)?(?:\s+(.+))?$/, async (msg, match) => {
 
   /* А вот приветствие — один раз в минуту: человек нажимает «старт»
      дважды подряд, и два одинаковых письма выглядят глупо. */
-  if (!greetOnce(chatId)) { console.log(`↩️  Повторное /start от ${chatId} — приветствие не шлём`); return; }
+  const kind = payload === "notify" ? "notify" : "main";
+  if (!greetOnce(chatId, kind)) {
+    console.log(`↩️  Повторное /start (${kind}) от ${chatId} — приветствие не шлём`);
+    return;
+  }
 
   if (payload === "notify") {
     await send(chatId,

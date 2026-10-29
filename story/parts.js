@@ -95,47 +95,42 @@ const header = ({ t, name, role, photoHref, tagline = "", y = SAFE_TOP }) => {
     text({ x: tx, y: cy + 34, s: 27, w: 500, fill: t.muted, str: (role || "").trim() });
 };
 
-/* Подвал прибит к низу безопасной зоны и одинаков во всех макетах:
-   человек, увидевший вторую сторис мастера, уже знает, куда смотреть.
+/* Подвал прибит к низу безопасной зоны и одинаков во всех макетах.
 
-   Внутри плашки две строки: кнопка и под ней адрес со знаком. Код
-   лежит на той же плашке — на светлой теме она белая, и собственная
-   подложка кода с ней сливается, поэтому лишней рамки не видно.
-   Кнопку рисуем настоящей кнопкой, хотя нажать её в сторис нельзя:
-   она объясняет, что делать дальше, а адрес под ней и ведёт человека,
-   и работает как имя площадки.                                    */
-const FOOTER_H = 206;
+   QR отсюда убран: сторис смотрят с телефона, а собственный экран не
+   отсканируешь. Место отдано адресу — его набирают руками и вставляют
+   в стикер «Ссылка». Рисовальщик кода оставлен для будущей визитки.
 
-const footer = ({ t, link, logoHref, brand = "mark" }) => {
-  const h = FOOTER_H, y = SAFE_BOTTOM - h, box = 164;
+   Вложенности здесь быть не должно. Плашка, внутри неё кнопка, а под
+   кнопкой текст — это три поверхности одна в другой, и выглядит это
+   как кнопка, не поместившаяся в свою коробку. Поэтому поверхность
+   одна: либо сама кнопка и есть подвал, либо подвала нет совсем.
+
+   style: "solid" — одна плашка, внутри две строки;
+          "grad"  — то же, но залитая акцентом;
+          "bare"  — без плашки, прямо на фоне.              */
+const FOOTER_H = 176;
+
+const footer = ({ t, link, logoHref, brand = "mark", style = "bare" }) => {
+  const h = FOOTER_H, y = SAFE_BOTTOM - h;
   const bold = brand === "bold";
-  const qrX = W - PAD - 24 - box, qrY = y + (h - box) / 2;
-  const tx = PAD + 34;
+  const bare = style === "bare";
+  const grad = style === "grad" || bold;
+  const x = PAD + (bare ? 4 : 40);
 
-  /* В «ярком» варианте плашка сама становится фирменным пятном.
-     Градиент берём горизонтальный: слева он фиолетовый, и белая
-     кнопка на нём читается лучше, чем на голубом конце. */
-  const cardFill  = bold ? "url(#accentFlat)" : t.footerFill;
-  const linkColor = bold ? "rgba(255,255,255,0.86)" : t.footerSub;
-  const btnFill   = bold ? "#FFFFFF" : "url(#accentFlat)";
-  const btnText   = bold ? "#111111" : "#FFFFFF";
+  const fill = grad ? "url(#accentFlat)" : t.footerFill;
+  const face = bare ? t.ink   : grad ? "#FFFFFF" : t.footerText;
+  const sub  = bare ? t.muted : grad ? "rgba(255,255,255,0.82)" : t.footerSub;
+  const markOn = bare ? t.ink : grad ? "#FFFFFF" : null;
 
-  const btn = chip({
-    x: tx, y: y + 30, h: 78, padX: 34, s: 31, w: 700,
-    str: "Записаться  →", fill: btnFill, color: btnText, minW: 430,
-  });
-
-  return rect({ x: PAD, y, w: CW, h, r: 40, fill: cardFill }) +
-    btn.svg +
-    /* На градиентной плашке цветной глянцевый знак тонет — там белая
-       векторная скоба. На белой и чёрной остаётся сам логотип. */
-    (bold
-      ? uMark({ cx: tx + 20, cy: y + 152, size: 40, color: "#FFFFFF", opacity: 1 })
+  return (bare ? "" : rect({ x: PAD, y, w: CW, h, r: 40, fill })) +
+    text({ x, y: y + (bare ? 62 : 74), s: 40, w: 800, ls: -0.8, fill: face, str: "Записаться  →" }) +
+    (markOn
+      ? uMark({ cx: x + 17, cy: y + (bare ? 104 : 118), size: 34, color: markOn, opacity: 0.95 })
       : logoHref
-        ? `<image href="${logoHref}" x="${n(tx)}" y="${n(y + 132)}" width="40" height="40" preserveAspectRatio="xMidYMid meet"/>`
+        ? `<image href="${logoHref}" x="${n(x)}" y="${n(y + (bare ? 87 : 101))}" width="34" height="34" preserveAspectRatio="xMidYMid meet"/>`
         : "") +
-    text({ x: tx + 54, y: y + 162, s: 30, w: 600, fill: linkColor, str: link }) +
-    qrBlock({ x: qrX, y: qrY, box, data: link, fg: "#111111" });
+    text({ x: x + 46, y: y + (bare ? 114 : 128), s: 31, w: 600, ls: -0.3, fill: sub, str: link });
 };
 
 /* Пятиконечная звезда — для формата «Отзыв». */
