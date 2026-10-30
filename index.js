@@ -4906,6 +4906,184 @@ app.post("/story/send", async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════
+// КАНАЛ МАСТЕРА — пост с настоящей кнопкой «Записаться»
+// ════════════════════════════════════════════════════════════
+/* По сторис в инстаграме нажать нельзя, по превью ссылки — можно, но
+   это всё ещё ссылка. Пост в Telegram-канале — единственное место, где
+   под картинкой стоит настоящая кнопка.
+
+   Важная частность: в канале работает только кнопка-ссылка. Кнопки
+   web_app Telegram разрешает лишь в личной переписке, и пост с такой
+   кнопкой канал просто не примет. Поэтому ведём на тот же адрес
+   t.me/…?startapp=, что и везде, — он открывает мини-апп сам. */
+
+const channelLinkOf = async (masterId) => {
+  const { data } = await db.from("master_channels").select("*").eq("master_id", masterId).maybeSingle();
+  return data || null;
+};
+
+/* Можно ли этому человеку привязать этот канал. Две проверки, и обе
+   обязательны: бот должен уметь там публиковать, а человек — владеть
+   каналом. Без второй любой мастер привязал бы себе чужой канал, в
+   который нас когда-то добавили администратором. */
+const checkChannel = async (raw, userTgId) => {
+  const asked = String(raw || "").trim().replace(/^https?:\/\/t\.me\//i, "").replace(/^@/, "");
+  if (!asked) return { error: "empty" };
+  const chatRef = /^-?\d+$/.test(asked) ? asked : `@${asked}`;
+
+  let chat;
+  try {
+    chat = await bot.getChat(chatRef);
+  } catch (e) {
+    return { error: "chat_not_found" };
+  }
+  if (chat.type !== "channel") return { error: "not_a_channel" };
+
+  let me, him;
+  try {
+    const self = await bot.getMe();
+    me  = await bot.getChatMember(chat.id, self.id);
+    him = await bot.getChatMember(chat.id, Number(userTgId));
+  } catch (e) {
+    return { error: "cannot_read_members" };
+  }
+  if (me.status !== "administrator" || me.can_post_messages === false) return { error: "bot_not_admin" };
+  if (!["creator", "administrator"].includes(him.status)) return { error: "not_your_channel" };
+
+  return { chat_id: String(chat.id), title: chat.title || "", username: chat.username || "" };
+};
+
+const CHANNEL_PROBLEM = {
+  empty:              "Не вижу адреса канала.",
+  chat_not_found:     "Такого канала нет или бот его не видит. Проверьте адрес и добавьте @UspotTG_bot в администраторы.",
+  not_a_channel:      "Это не канал, а чат или группа. Пост с кнопкой можно опубликовать только в канале.",
+  cannot_read_members: "Не удалось проверить права. Добавьте @UspotTG_bot в администраторы канала.",
+  bot_not_admin:      "Бот не администратор канала или ему не разрешено публиковать. Дайте право «Публикация сообщений».",
+  not_your_channel:   "Вы не администратор этого канала — привязать его может только владелец.",
+};
+
+// ── POST /channel/status ───────────────────────────────────
+app.post("/channel/status", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const masterId = String(req.body?.master_id || "");
+    if (!UUID_RE.test(masterId) || !c.visible.has(masterId)) return res.status(403).json({ error: "forbidden" });
+    const row = await channelLinkOf(masterId);
+    res.json({ ok: true, channel: row && { title: row.title, username: row.username,
+                                            posts: row.posts, last_post_at: row.last_post_at } });
+  } catch (e) {
+    console.error("/channel/status:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /channel/link ─────────────────────────────────────
+app.post("/channel/link", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const masterId = String(req.body?.master_id || "");
+    if (!UUID_RE.test(masterId) || !c.visible.has(masterId)) return res.status(403).json({ error: "forbidden" });
+
+    const r = await checkChannel(req.body?.channel, c.tgId);
+    if (r.error) return res.status(400).json({ error: r.error, message: CHANNEL_PROBLEM[r.error] || "Не вышло." });
+
+    /* Один канал — одному кабинету. Иначе двое мастеров постили бы в
+       общий канал, и каждый думал бы, что он там один. */
+    const { data: taken } = await db.from("master_channels")
+      .select("master_id").eq("chat_id", r.chat_id).neq("master_id", masterId).limit(1);
+    if (taken && taken.length) {
+      return res.status(409).json({ error: "channel_taken",
+        message: "Этот канал уже привязан к другому кабинету." });
+    }
+
+    const { error } = await db.from("master_channels").upsert({
+      master_id: masterId, chat_id: r.chat_id, title: r.title, username: r.username,
+      linked_by: String(c.tgId), linked_at: new Date().toISOString(),
+    }, { onConflict: "master_id" });
+    if (error) { console.error("/channel/link:", error.message); return res.status(500).json({ error: "save_failed" }); }
+
+    console.log(`📣 Канал привязан: кабинет ${masterId} → ${r.title} (${r.chat_id})`);
+    res.json({ ok: true, channel: { title: r.title, username: r.username } });
+  } catch (e) {
+    console.error("/channel/link:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /channel/unlink ───────────────────────────────────
+app.post("/channel/unlink", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const masterId = String(req.body?.master_id || "");
+    if (!UUID_RE.test(masterId) || !c.visible.has(masterId)) return res.status(403).json({ error: "forbidden" });
+    await db.from("master_channels").delete().eq("master_id", masterId);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("/channel/unlink:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /channel/post ─────────────────────────────────────
+// Публикация собранной картинки в канал мастера, с кнопкой под ней.
+app.post("/channel/post", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const masterId = String(req.body?.master_id || "");
+    if (!UUID_RE.test(masterId) || !c.visible.has(masterId)) return res.status(403).json({ error: "forbidden" });
+
+    const hit = storyCache.get(String(req.body?.story_token || ""));
+    if (!hit || hit.tgId !== c.tgId || Date.now() - hit.at > STORY_TTL_MS) {
+      return res.status(404).json({ error: "expired", message: "Картинка устарела — соберите заново." });
+    }
+    const row = await channelLinkOf(masterId);
+    if (!row) return res.status(400).json({ error: "no_channel", message: "Канал не привязан." });
+
+    /* Права могли отобрать после привязки — проверяем перед каждой
+       публикацией, иначе мастер увидит «опубликовано», а поста нет. */
+    let self;
+    try {
+      self = await bot.getMe();
+      const me = await bot.getChatMember(row.chat_id, self.id);
+      if (me.status !== "administrator" || me.can_post_messages === false) {
+        return res.status(400).json({ error: "bot_not_admin", message: CHANNEL_PROBLEM.bot_not_admin });
+      }
+    } catch (e) {
+      return res.status(400).json({ error: "cannot_read_members", message: CHANNEL_PROBLEM.cannot_read_members });
+    }
+
+    const caption = String(req.body?.caption || "").trim().slice(0, 900);
+    const slug = storyData.toSlug(String(req.body?.name || ""));
+    const url = `https://t.me/UspotTG_bot/Uspot_BY?startapp=Uspot-${encodeURIComponent(slug || "")}`;
+
+    let msg;
+    try {
+      msg = await bot.sendPhoto(row.chat_id, hit.png, {
+        caption: caption || undefined,
+        parse_mode: caption ? "HTML" : undefined,
+        reply_markup: { inline_keyboard: [[{ text: "Записаться", url }]] },
+      }, { filename: "uspot.png", contentType: "image/png" });
+    } catch (e) {
+      console.error("📣 Пост в канал не ушёл:", e.message);
+      return res.status(502).json({ error: "post_failed",
+        message: "Telegram не принял пост. Проверьте, что бот всё ещё администратор." });
+    }
+
+    await db.from("master_channels").update({
+      last_post_at: new Date().toISOString(), posts: (+row.posts || 0) + 1,
+    }).eq("master_id", masterId);
+
+    const link = row.username && msg?.message_id
+      ? `https://t.me/${row.username}/${msg.message_id}` : null;
+    console.log(`📣 Пост в канал ${row.title} (${row.chat_id}) от кабинета ${masterId}`);
+    res.json({ ok: true, link });
+  } catch (e) {
+    console.error("/channel/post:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 /* ─── Вечерний сигнал: завтра почти пусто ──────────────────────
    Экран «Продвижение» работает только если в него зашли, а заходят
    в него редко. Поэтому вечером бот сам смотрит завтрашний день
