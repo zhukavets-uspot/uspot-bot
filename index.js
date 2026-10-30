@@ -4790,7 +4790,11 @@ app.get("/m/:slug/meta", async (req, res) => {
       description: c.times.length
         ? `Свободные окошки ${c.when}: ${c.times.map((t) => t.t).join(", ")}. Запись за минуту, без звонков.`
         : "Запись за минуту, без звонков. Посмотрите свободное время и выберите удобное.",
-      image: `${BOT_WEBHOOK_BASE}/m/${encodeURIComponent(slug)}/card.png`,
+      /* Метка дня в адресе. Telegram кэширует превью по ссылке и держит
+         его долго: без метки однажды показанная карточка застыла бы на
+         этом дне навсегда, а окошки на ней меняются. С меткой адрес
+         меняется раз в сутки, и превью обновляется само. */
+      image: `${BOT_WEBHOOK_BASE}/m/${encodeURIComponent(slug)}/card.png?d=${storyData.minskDateStr(0)}`,
       deeplink: `https://t.me/UspotTG_bot/Uspot_BY?startapp=Uspot-${encodeURIComponent(slug)}`,
       free: c.free,
     });

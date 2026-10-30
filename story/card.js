@@ -77,23 +77,20 @@ const slotRow = ({ x, y, items }) => {
 /* Заголовок в одну-две строки. Размер подбираем под длину: «Свободные
    окошки» и «Записываю на приём» не должны ломать одну и ту же вёрстку. */
 const bigTitle = ({ str, yTop, maxW, maxH }) => {
-  for (const s of [60, 54, 48, 42]) {
-    const lines = wrap(str, maxW, s, 800);
-    const h = lines.length * s * 1.1;
-    if (lines.length <= 2 && h <= maxH) {
-      return {
-        svg: lines.map((l, i) => text({ x: PAD, y: yTop + s * 0.86 + i * s * 1.1,
-                                        s, w: 800, ls: -1.2, fill: T.ink, str: l })).join(""),
-        height: h,
-      };
-    }
-  }
-  const s = 42, lines = wrap(str, maxW, s, 800).slice(0, 2);
-  return {
+  const draw = (lines, s) => ({
     svg: lines.map((l, i) => text({ x: PAD, y: yTop + s * 0.86 + i * s * 1.1,
                                     s, w: 800, ls: -1.2, fill: T.ink, str: l })).join(""),
     height: lines.length * s * 1.1,
-  };
+  });
+  for (const s of [60, 54, 48, 42]) {
+    const lines = wrap(str, s, 800, maxW);
+    if (lines.length <= 2 && lines.length * s * 1.1 <= maxH) return draw(lines, s);
+  }
+  /* Не влезло даже мелким — отдаём wrap право обрезать самому: он
+     поставит многоточие. Молча отрезать строку нельзя: именно так
+     «Записываю на приём» превратилось в «Записываю на». */
+  const s = 42;
+  return draw(wrap(str, s, 800, maxW, 2), s);
 };
 
 /* story — то, что вернул slotsStory, либо null, если окон нет совсем.
