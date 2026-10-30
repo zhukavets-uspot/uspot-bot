@@ -4660,6 +4660,14 @@ const STORY_BRAND = "mark";
 /* Строка под названием в углу картинки. Пусто — только «Uspot». */
 const STORY_TAGLINE = "ЛУЧШИЙ МАСТЕР РЯДОМ";
 const STORY_FORMATS = ["slots", "week", "hot", "review"];
+/* Какой день просит кабинет: слово или прямая дата. Дату не доверяем
+   как есть — отдаём дальше только то, что похоже на дату; какой день
+   за ней стоит и влезает ли он в горизонт, решает story/data. */
+const askedScope = (v, fallback) => {
+  const s = String(v || "");
+  if (s === "today" || s === "tomorrow") return s;
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : fallback;
+};
 const STORY_THEMES  = ["dark", "light", "photo"];
 const storyCache = new Map();               // токен → { png, at, tgId }
 
@@ -4854,11 +4862,12 @@ app.post("/story/make", async (req, res) => {
 
     const built =
       format === "week"   ? await storyData.weekStory(masterId, opts) :
-      format === "hot"    ? await storyData.hotStory(masterId,
+      format === "hot"    ? await storyData.hotStory(masterId, askedScope(b.scope, "today"),
                               { ...opts, findPromo: activePromoFor, promoPrice: promoPriceFor,
                                 findSlotPromo: slotPromoFor }) :
-      format === "review" ? await storyData.reviewStory(masterId, opts) :
-                            await storyData.slotsStory(masterId, b.scope === "today" ? "today" : "tomorrow",
+      format === "review" ? await storyData.reviewStory(masterId,
+                              { ...opts, reviewId: typeof b.review_id === "string" ? b.review_id : undefined }) :
+                            await storyData.slotsStory(masterId, askedScope(b.scope, "tomorrow"),
                               { ...opts, findSlotDiscounts: slotDiscountsFor });
     if (built.error) return res.status(409).json({ error: built.error });
 
@@ -4878,6 +4887,39 @@ app.post("/story/make", async (req, res) => {
   } catch (e) {
     console.error("Сторис: сборка не удалась —", e.message);
     res.status(500).json({ error: "render_failed" });
+  }
+});
+
+// ── POST /story/reviews ────────────────────────────────────
+// Отзывы, из которых мастер выбирает, какой положить на картинку.
+app.post("/story/reviews", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const masterId = String(req.body?.master_id || "");
+    if (!UUID_RE.test(masterId) || !c.visible.has(masterId)) return res.status(403).json({ error: "forbidden" });
+    const r = await storyData.pickableReviews(masterId);
+    if (r.error) return res.status(409).json({ error: r.error });
+    res.json({ ok: true, reviews: r.reviews });
+  } catch (e) {
+    console.error("/story/reviews:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /story/days ───────────────────────────────────────
+// Дни со свободным временем — по ним кабинет рисует выбор дня.
+app.post("/story/days", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const masterId = String(req.body?.master_id || "");
+    if (!UUID_RE.test(masterId) || !c.visible.has(masterId)) return res.status(403).json({ error: "forbidden" });
+    const service = typeof req.body?.service === "string" ? req.body.service.trim().slice(0, 120) : "";
+    const r = await storyData.freeDays(masterId, { service: service || undefined });
+    if (r.error) return res.status(409).json({ error: r.error });
+    res.json({ ok: true, days: r.days });
+  } catch (e) {
+    console.error("/story/days:", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 

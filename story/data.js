@@ -234,17 +234,32 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     return min > 0 ? `${durMin} минут · от ${min} руб` : `${durMin} минут`;
   };
 
-  /* ── Формат «Окошки» на сегодня или завтра ─────────────────── */
-  /* scope — "today", "tomorrow" или число дней вперёд. Число нужно
-     публичной странице мастера: её ссылка живёт в шапке профиля
-     неделями, и в пятницу вечером «сегодня и завтра» пусты у всех, у
-     кого суббота выходная. Сторис и вечерний сигнал про числа не знают
-     и работают как раньше. */
+  /* Какой день просят. Понимаем три записи: слова «today»/«tomorrow»,
+     число дней вперёд и прямую дату «2026-11-02».
+
+     Прямая дата появилась после случая, который описал Ilya: вечер
+     пятницы, сегодня записывать уже поздно, суббота выходная — и
+     сделать картинку на понедельник было нечем. «Сегодня, завтра,
+     неделя» покрывают не все дни недели, а мастер планирует не по
+     этим трём словам. */
+  const DAY_HORIZON = 14;
+  const dayOffsetOf = (scope) => {
+    if (typeof scope === "number") return Math.max(0, Math.min(DAY_HORIZON, scope));
+    const str = String(scope || "");
+    if (/^\d{4}-\d{2}-\d{2}$/.test(str)) {
+      for (let d = 0; d <= DAY_HORIZON; d++) if (minskDateStr(d) === str) return d;
+      return null;                      // дата вне горизонта — не наше дело
+    }
+    return str === "today" ? 0 : 1;
+  };
+
+  /* ── Формат «Окошки» на выбранный день ─────────────────────── */
   const slotsStory = async (entityId, scope = "tomorrow", opts = {}) => {
     const e = await loadEntity(entityId);
     if (!e) return { error: "master_not_found" };
     if (!e.memberIds.length) return { error: "no_masters" };
-    const dayOff = typeof scope === "number" ? scope : scope === "today" ? 0 : 1;
+    const dayOff = dayOffsetOf(scope);
+    if (dayOff === null) return { error: "bad_date" };
     const iso = minskDateStr(dayOff);
     const all = await loadBundle(e.memberIds, iso, iso);
     const services = all.services;
@@ -321,13 +336,23 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
      Ближайшее свободное окно сегодня плюс акция, если она на эту
      услугу есть: скидка и есть причина забрать окно сейчас.
      У салона цена идёт «от» — у разных мастеров она разная.     */
-  const hotStory = async (entityId, opts = {}) => {
+  /* scope — "today" или "tomorrow". Горящим бывает и завтрашнее окно:
+     мастер узнаёт об отмене вечером, и продавать его надо тогда же, а
+     не ждать утра. Раньше формат молча считал только сегодняшний день,
+     и вечером после закрытия отвечал «окон нет» — хотя назавтра их
+     полный день. */
+  const hotStory = async (entityId, scope = "today", opts = {}) => {
     const e = await loadEntity(entityId);
     if (!e) return { error: "master_not_found" };
     if (!e.memberIds.length) return { error: "no_masters" };
-    const iso = minskDateStr(0);
+    const dayOff = scope === "tomorrow" ? 1 : dayOffsetOf(scope === "today" ? "today" : scope);
+    if (dayOff === null) return { error: "bad_date" };
+    const todayHot = dayOff === 0;
+    const iso = minskDateStr(dayOff);
     const { members, services } = await loadBundle(e.memberIds, iso, iso);
-    const { starts, working } = freeOnDate(members, iso, minskMinutes() + BOOK_LEAD_MIN);
+    /* Запас в час — правило сегодняшнего дня: на завтрашнее утро он
+       ничего не отсекает, и применять его там незачем. */
+    const { starts, working } = freeOnDate(members, iso, todayHot ? minskMinutes() + BOOK_LEAD_MIN : null);
     if (!working) return { error: "day_off" };
     if (!starts.length) return { error: "no_slots" };
     if (!services.length) return { error: "no_services" };
@@ -364,7 +389,7 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
       data: {
         badge: "Горящее окно",
         title: opts.title || "Освободилось окно",
-        when: `Сегодня, ${ruWeekday(iso)} · ${ruDayMonth(iso)}`,
+        when: `${dayOff === 0 ? "Сегодня" : dayOff === 1 ? "Завтра" : cap(ruWeekday(iso))}, ${ruDayMonth(iso)}`,
         time,
         service: svc.name,
         price, priceFrom: isSalon && promoPrice == null,
@@ -373,7 +398,8 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
         note: `Запись закроется за ${BOOK_LEAD_MIN === 60 ? "час" : BOOK_LEAD_MIN + " минут"} до начала`,
         master: await cardOf(e.entity),
       },
-      meta: { date: iso, time, promo: !!promo, slotPromo: !!(promo && promo.slot_date), masters: members.length },
+      meta: { date: iso, time, dayOffset: dayOff, scope: todayHot ? "today" : "tomorrow", promo: !!promo,
+              slotPromo: !!(promo && promo.slot_date), masters: members.length },
     };
   };
 
@@ -386,12 +412,19 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     if (!e) return { error: "master_not_found" };
     const ids = e.memberIds.length ? e.memberIds : [entityId];
     const { data: rows } = await db.from("reviews")
-      .select("rating, review_text, text, client_name, created_at, status")
+      .select("id, master_id, rating, review_text, text, client_name, created_at, status")
       .in("master_id", ids).eq("status", "approved").order("created_at", { ascending: false }).limit(50);
     const all = rows || [];
     const withText = all.filter((r) => String(r.review_text || r.text || "").trim().length > 10);
-    const pick = opts.index != null ? withText[opts.index] : withText[0];
-    if (!pick) return { error: "no_reviews" };
+    /* Какой отзыв показать — решает мастер, а не порядок в базе. Без
+       выбора на картинку всегда уезжал самый свежий, и выглядело это
+       как случайный: свежий не значит лучший. Не нашли по id (отзыв
+       сняли с публикации, пока экран был открыт) — берём свежий, но
+       молча не подменяем выбранный на соседний. */
+    const pick = opts.reviewId
+      ? withText.find((r) => String(r.id) === String(opts.reviewId))
+      : opts.index != null ? withText[opts.index] : withText[0];
+    if (!pick) return { error: opts.reviewId ? "review_gone" : "no_reviews" };
     const avg = all.length ? all.reduce((a, r) => a + (+r.rating || 0), 0) / all.length : (+e.entity.rating || 5);
 
     return {
@@ -404,8 +437,36 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
         author: String(pick.client_name || "Клиент").trim().split(/\s+/)[0],
         master: await cardOf(e.entity),
       },
-      meta: { total: all.length, withText: withText.length },
+      meta: { total: all.length, withText: withText.length, reviewId: pick.id },
     };
+  };
+
+  /* Отзывы, из которых есть что выбрать: одобренные и с текстом. Тем же
+     фильтром, что и у сборки картинки, — иначе кабинет предложит отзыв,
+     который картинкой не станет. */
+  const pickableReviews = async (entityId) => {
+    const e = await loadEntity(entityId);
+    if (!e) return { error: "master_not_found" };
+    const ids = e.memberIds.length ? e.memberIds : [entityId];
+    const { data: rows } = await db.from("reviews")
+      .select("id, master_id, rating, review_text, text, client_name, created_at")
+      .in("master_id", ids).eq("status", "approved").order("created_at", { ascending: false }).limit(50);
+    const names = {};
+    if (e.entity.kind === "salon" && ids.length > 1) {
+      const { data: ms } = await db.from("masters").select("id, name").in("id", ids);
+      for (const m of ms || []) names[m.id] = m.name;
+    }
+    const list = (rows || [])
+      .filter((r) => String(r.review_text || r.text || "").trim().length > 10)
+      .map((r) => ({
+        id: r.id,
+        rating: Math.round(+r.rating || 5),
+        text: String(r.review_text || r.text).trim().replace(/\s+/g, " ").slice(0, 400),
+        author: String(r.client_name || "Клиент").trim().split(/\s+/)[0],
+        date: r.created_at ? String(r.created_at).slice(0, 10) : null,
+        master: names[r.master_id] || null,
+      }));
+    return { reviews: list };
   };
 
   /* Карточка без привязки ко дню — запасной вариант для публичной
@@ -421,5 +482,28 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     return { ...card, meta: priceLineOf(all.services, 60) };
   };
 
-  return { slotsStory, weekStory, hotStory, reviewStory, loadPublicCard, toSlug, minskDateStr };
+  /* Ближайшие дни со свободным временем. Кабинет рисует по этому
+     списку выбор дня: мастер сразу видит, где окна есть, и не тычется
+     в выходные наугад. Нерабочие дни и забитые просто не попадают. */
+  const freeDays = async (entityId, opts = {}) => {
+    const e = await loadEntity(entityId);
+    if (!e) return { error: "master_not_found" };
+    if (!e.memberIds.length) return { error: "no_masters" };
+    const from = minskDateStr(0), to = minskDateStr(DAY_HORIZON);
+    const all = await loadBundle(e.memberIds, from, to);
+    const members = forService(all.members, opts.service);
+    const nowMin = minskMinutes();
+    const days = [];
+    for (let d = 0; d <= DAY_HORIZON; d++) {
+      const iso = minskDateStr(d);
+      const { starts, working } = freeOnDate(members, iso, d === 0 ? nowMin + BOOK_LEAD_MIN : null);
+      if (!working || !starts.length) continue;
+      days.push({ date: iso, offset: d, free: starts.length,
+                  weekday: ruWeekday(iso), dayMonth: ruDayMonth(iso) });
+    }
+    return { days };
+  };
+
+  return { slotsStory, weekStory, hotStory, reviewStory, pickableReviews, loadPublicCard,
+           freeDays, toSlug, minskDateStr };
 };
