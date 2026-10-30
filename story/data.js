@@ -24,10 +24,19 @@ const toSlug = (s = "") => String(s).toLowerCase().split("").map((c) => RU_MAP[c
   .replace(/[^a-z0-9_]/g, "").replace(/_+/g, "_").replace(/^_|_$/g, "");
 
 const cap = (s) => (s ? s[0].toUpperCase() + s.slice(1) : s);
-const ruWeekday = (iso) => cap(new Intl.DateTimeFormat("ru-RU", { weekday: "long", timeZone: "Europe/Minsk" })
-  .format(new Date(iso + "T12:00:00")));
+const ruWeekdayRaw = (iso) => new Intl.DateTimeFormat("ru-RU", { weekday: "long", timeZone: "Europe/Minsk" })
+  .format(new Date(iso + "T12:00:00"));
+const ruWeekday = (iso) => cap(ruWeekdayRaw(iso));
 const ruDayMonth = (iso) => new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "long", timeZone: "Europe/Minsk" })
   .format(new Date(iso + "T12:00:00"));
+
+const { suggestTitles, defaultTitle } = require("./phrases");
+
+/* Как назвать день внутри фразы: «на сегодня», «на завтра», «на
+   понедельник». Для первых двух — наречия, дальше — название дня. */
+const dayWordOf = (iso, offset) => offset === 0 ? "сегодня"
+  : offset === 1 ? "завтра"
+  : String(ruWeekdayRaw(iso)).toLowerCase();
 
 const plural = (n, one, few, many) => {
   const a = Math.abs(n) % 100, b = a % 10;
@@ -276,7 +285,11 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     return {
       format: "slots",
       data: {
-        title: opts.title || (open ? "Записываю на приём" : "Свободные окошки"),
+        /* Заголовок — из набора фраз, а не одна строка навсегда:
+           подписчики у мастера одни и те же, и неизменная подпись им
+           приедается быстрее, чем кончаются клиенты. */
+        title: opts.title || defaultTitle({ format: "slots", day: dayWordOf(iso, dayOff),
+                                            free: starts.length, open }),
         dateLabel: dayOff <= 1
           ? `${dayOff === 0 ? "Сегодня" : "Завтра"}, ${ruWeekday(iso)} · ${ruDayMonth(iso)}`
           : `${ruWeekday(iso)} · ${ruDayMonth(iso)}`,
@@ -322,7 +335,7 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     return {
       format: "week",
       data: {
-        title: opts.title || "Свободные окошки",
+        title: opts.title || defaultTitle({ format: "week" }),
         dateLabel: "На ближайшую неделю",
         priceLine: opts.showPrice === false ? "" : serviceLine(services, opts.service, gridDurationOf(members)),
         days,
@@ -388,7 +401,7 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
       format: "hot",
       data: {
         badge: "Горящее окно",
-        title: opts.title || "Освободилось окно",
+        title: opts.title || defaultTitle({ format: "hot", day: dayWordOf(iso, dayOff) }),
         when: `${dayOff === 0 ? "Сегодня" : dayOff === 1 ? "Завтра" : cap(ruWeekday(iso))}, ${ruDayMonth(iso)}`,
         time,
         service: svc.name,
@@ -430,7 +443,7 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     return {
       format: "review",
       data: {
-        title: opts.title || "Спасибо за отзыв",
+        title: opts.title || defaultTitle({ format: "review" }),
         summary: `${avg.toFixed(1).replace(".", ",")} из 5 · ${all.length} ${plural(all.length, "отзыв", "отзыва", "отзывов")}`,
         rating: Math.round(+pick.rating || 5),
         text: String(pick.review_text || pick.text).trim().replace(/\s+/g, " ").slice(0, 400),
@@ -504,6 +517,24 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     return { days };
   };
 
+  /* Что предложить мастеру в качестве заголовка. Обстановку считаем
+     сами: по числу окон того дня, который он выбрал. */
+  const titleOptions = async (entityId, { format = "slots", scope, service } = {}) => {
+    if (format === "review" || format === "week") return { titles: suggestTitles({ format }) };
+    const dayOff = dayOffsetOf(scope);
+    if (dayOff === null) return { titles: suggestTitles({ format }) };
+    const iso = minskDateStr(dayOff);
+    const e = await loadEntity(entityId);
+    if (!e || !e.memberIds.length) return { error: "master_not_found" };
+    const all = await loadBundle(e.memberIds, iso, iso);
+    const members = forService(all.members, service);
+    const { starts, capacity } = freeOnDate(members, iso,
+      dayOff === 0 ? minskMinutes() + BOOK_LEAD_MIN : null);
+    const open = capacity > 0 && starts.length / capacity > OPEN_DAY_DENSITY;
+    return { titles: suggestTitles({ format, day: dayWordOf(iso, dayOff),
+                                     free: starts.length, open }) };
+  };
+
   return { slotsStory, weekStory, hotStory, reviewStory, pickableReviews, loadPublicCard,
-           freeDays, toSlug, minskDateStr };
+           freeDays, titleOptions, toSlug, minskDateStr };
 };

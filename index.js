@@ -4859,7 +4859,10 @@ app.post("/story/make", async (req, res) => {
 
     const format = STORY_FORMATS.includes(b.format) ? b.format : "slots";
     const theme  = STORY_THEMES.includes(b.theme)   ? b.theme  : "dark";
-    const title  = typeof b.title === "string" ? b.title.trim().slice(0, 24) : "";
+    /* 24 знака хватало на «Свободные окошки», но не на «На понедельник
+       много свободного времени». Заголовок на картинке переносится в
+       две строки и подбирает кегль, так что предел можно поднять. */
+    const title  = typeof b.title === "string" ? b.title.trim().slice(0, 48) : "";
     /* Услуга, под которую считаются окна. Имя из запроса не доверяем
        как есть — просто ищем его в прайсе; чужого там не найдётся. */
     const service = typeof b.service === "string" ? b.service.trim().slice(0, 120) : "";
@@ -4892,11 +4895,33 @@ app.post("/story/make", async (req, res) => {
       ok: true, token: tok,
       url: `${BOT_WEBHOOK_BASE}/story/${tok}.png`,
       link: `https://${built.data.master.link}`,
+      /* Какая фраза уехала на картинку: кабинет её показывает, чтобы
+         мастер видел, что именно опубликует, и мог взять другую. */
+      title: built.data.title || "",
       meta: built.meta, bytes: png.length, ms: Date.now() - t0,
     });
   } catch (e) {
     console.error("Сторис: сборка не удалась —", e.message);
     res.status(500).json({ error: "render_failed" });
+  }
+});
+
+// ── POST /story/titles ─────────────────────────────────────
+// Варианты заголовка под выбранный формат и день.
+app.post("/story/titles", async (req, res) => {
+  try {
+    const c = await needCabinet(req, res); if (!c) return;
+    const masterId = String(req.body?.master_id || "");
+    if (!UUID_RE.test(masterId) || !c.visible.has(masterId)) return res.status(403).json({ error: "forbidden" });
+    const format = STORY_FORMATS.includes(req.body?.format) ? req.body.format : "slots";
+    const service = typeof req.body?.service === "string" ? req.body.service.trim().slice(0, 120) : "";
+    const r = await storyData.titleOptions(masterId, {
+      format, scope: askedScope(req.body?.scope, "tomorrow"), service: service || undefined });
+    if (r.error) return res.status(409).json({ error: r.error });
+    res.json({ ok: true, titles: r.titles });
+  } catch (e) {
+    console.error("/story/titles:", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 

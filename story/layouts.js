@@ -14,12 +14,21 @@ const footerTop = () => SAFE_BOTTOM - FOOTER_H;
    свой, до 24 символов, и «Горящие окна на выходные» не должно
    вылезти за поля. Трекинг отрицательный — на таком кегле Inter
    без него рассыпается.                                          */
+/* Подбор кегля. Тонкость: wrap с ограничением в две строки сам
+   дописывает многоточие, и обрезанный заголовок проходит проверку по
+   ширине наравне с целым. Из-за этого крупный огрызок побеждал
+   умещающуюся целиком строку помельче — «На понедельник много…»
+   вместо «На понедельник много свободного времени». Поэтому сначала
+   ищем кегль, при котором текст влезает ЦЕЛИКОМ, и только если такого
+   нет во всём диапазоне — обрезаем, на самом мелком. */
 const bigTitle = ({ str, yTop, max = 104, min = 44, color, maxH = Infinity }) => {
-  let s = max, lines = [];
-  for (; s >= min; s -= 2) {
-    lines = wrap(str, s, 800, CW, 2);
-    const fitsW = lines.every((l) => measure(l, s, 800, -s * 0.02) <= CW);
-    if (fitsW && lines.length * s * 1.02 <= maxH) break;
+  const widthOk = (ls, sz) => ls.every((l) => measure(l, sz, 800, -sz * 0.02) <= CW);
+  let s = min, lines = wrap(str, min, 800, CW, 2);
+  for (let t = max; t >= min; t -= 2) {
+    const whole = wrap(str, t, 800, CW, 99);
+    if (whole.length <= 2 && widthOk(whole, t) && whole.length * t * 1.02 <= maxH) {
+      s = t; lines = whole; break;
+    }
   }
   const lh = s * 1.02;
   let out = "";
