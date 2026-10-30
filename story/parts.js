@@ -111,7 +111,20 @@ const header = ({ t, name, role, photoHref, tagline = "", y = SAFE_TOP }) => {
           "bare"  — без плашки, прямо на фоне.              */
 const FOOTER_H = 176;
 
-const footer = ({ t, link, logoHref, brand = "mark", style = "bare" }) => {
+/* «Запись в шапке профиля» длиннее «Записаться →» и в 40 пунктах
+   вылезает за поле. Кегль подбираем под строку, а не режем текст. */
+const ctaSize = (str) => {
+  for (const s of [40, 36, 33, 30]) if (measure(str, s, 800, -0.8) <= CW - 8) return s;
+  return 30;
+};
+
+/* cta — строка над адресом. В инстаграме сторис не нажимается ни в
+   каком виде, и «Записаться →» там обещает нажатие, которого нет:
+   человек тыкает в картинку, ничего не происходит, и он уходит.
+   Поэтому туда уезжает инструкция «Запись в шапке профиля» — там
+   ссылка живая. В канале Telegram под постом стоит настоящая кнопка,
+   и уместно обратное. */
+const footer = ({ t, link, logoHref, brand = "mark", style = "bare", cta = "Записаться  →" }) => {
   const h = FOOTER_H, y = SAFE_BOTTOM - h;
   const bold = brand === "bold";
   const bare = style === "bare";
@@ -124,7 +137,7 @@ const footer = ({ t, link, logoHref, brand = "mark", style = "bare" }) => {
   const markOn = bare ? t.ink : grad ? "#FFFFFF" : null;
 
   return (bare ? "" : rect({ x: PAD, y, w: CW, h, r: 40, fill })) +
-    text({ x, y: y + (bare ? 62 : 74), s: 40, w: 800, ls: -0.8, fill: face, str: "Записаться  →" }) +
+    text({ x, y: y + (bare ? 62 : 74), s: ctaSize(cta), w: 800, ls: -0.8, fill: face, str: cta }) +
     (markOn
       ? uMark({ cx: x + 17, cy: y + (bare ? 104 : 118), size: 34, color: markOn, opacity: 0.95 })
       : logoHref

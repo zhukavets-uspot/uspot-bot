@@ -4659,6 +4659,12 @@ const STORY_MAX    = 24;                    /* верхняя граница п�
 const STORY_BRAND = "mark";
 /* Строка под названием в углу картинки. Пусто — только «Uspot». */
 const STORY_TAGLINE = "ЛУЧШИЙ МАСТЕР РЯДОМ";
+/* Призыв в подвале зависит от того, куда уедет картинка. В инстаграме
+   сторис не нажимается ни в каком виде — там нужна инструкция, где
+   лежит живая ссылка. В канале Telegram под постом стоит настоящая
+   кнопка, и звать надо прямо. */
+const STORY_CTA_IG = "Запись в шапке профиля";
+const STORY_CTA_TG = "Записаться  →";
 const STORY_FORMATS = ["slots", "week", "hot", "review"];
 /* Какой день просит кабинет: слово или прямая дата. Дату не доверяем
    как есть — отдаём дальше только то, что похоже на дату; какой день
@@ -4872,10 +4878,14 @@ app.post("/story/make", async (req, res) => {
     if (built.error) return res.status(409).json({ error: built.error });
 
     const t0 = Date.now();
-    const { png } = renderStory({ format: built.format, theme, data: built.data,
-      brand: STORY_BRAND, tagline: STORY_TAGLINE });
+    const shot = { format: built.format, theme, data: built.data,
+                   brand: STORY_BRAND, tagline: STORY_TAGLINE };
+    const { png } = renderStory({ ...shot, cta: STORY_CTA_IG });
     const tok = crypto.randomBytes(16).toString("hex");
-    storyCache.set(tok, { png, at: Date.now(), tgId: c.tgId });
+    /* Держим и исходные доводы: для поста в канал ту же картинку
+       пересобираем с другим призывом, чтобы мастер не выбирал заранее,
+       куда именно он её денет. */
+    storyCache.set(tok, { png, at: Date.now(), tgId: c.tgId, shot });
     storySweep();
 
     res.json({
@@ -5095,13 +5105,22 @@ app.post("/channel/post", async (req, res) => {
       return res.status(400).json({ error: "cannot_read_members", message: CHANNEL_PROBLEM.cannot_read_members });
     }
 
+    /* В канале под постом живая кнопка — пересобираем картинку с прямым
+       призывом вместо инструкции про шапку профиля. Не вышло (картинка
+       старая, доводов не осталось) — отправляем ту, что есть. */
+    let png = hit.png;
+    if (hit.shot) {
+      try { png = renderStory({ ...hit.shot, cta: STORY_CTA_TG }).png; }
+      catch (e) { console.error("📣 Пересборка под канал не удалась:", e.message); }
+    }
+
     const caption = String(req.body?.caption || "").trim().slice(0, 900);
     const slug = storyData.toSlug(String(req.body?.name || ""));
     const url = `https://t.me/UspotTG_bot/Uspot_BY?startapp=Uspot-${encodeURIComponent(slug || "")}`;
 
     let msg;
     try {
-      msg = await bot.sendPhoto(row.chat_id, hit.png, {
+      msg = await bot.sendPhoto(row.chat_id, png, {
         caption: caption || undefined,
         parse_mode: caption ? "HTML" : undefined,
         reply_markup: { inline_keyboard: [[{ text: "Записаться", url }]] },
