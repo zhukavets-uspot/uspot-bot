@@ -4738,19 +4738,34 @@ const resolveSlug = async (slug) => {
   return slugCache.map.get(key) || null;
 };
 
-/* Что показать на карточке: ближайший день, где есть окна. Завтра —
-   основной случай, сегодня — если завтра выходной, иначе общий текст.
-   Пустую карточку не отдаём никогда: ссылка висит неделями, и выходной
-   у мастера не повод отдать пустоту. */
+/* Когда именно, словами для предложения: «свободные окошки <когда>». */
+const WHEN_WEEKDAY = ["в воскресенье", "в понедельник", "во вторник", "в среду",
+                      "в четверг", "в пятницу", "в субботу"];
+const whenWord = (iso, dayOffset) => {
+  if (dayOffset === 0) return "сегодня";
+  if (dayOffset === 1) return "завтра";
+  return WHEN_WEEKDAY[new Date(iso + "T12:00:00Z").getUTCDay()] || "на днях";
+};
+
+/* Что показать на карточке: ближайший день, где есть окна. Сначала
+   завтра, потом сегодня, потом вся неделя вперёд.
+
+   Неделя здесь не роскошь. Ссылка висит в шапке профиля неделями, а
+   «сегодня и завтра» в пятницу вечером пусты у каждого, у кого суббота
+   выходная, — и карточка обезличивалась ровно на выходные, когда люди
+   и листают. Окон нет нигде — отдаём имя, услуги и призыв: пустую
+   карточку не показываем никогда. */
 const cardContent = async (masterId) => {
-  for (const scope of ["tomorrow", "today"]) {
+  for (const scope of [1, 0, 2, 3, 4, 5, 6, 7]) {
     const built = await storyData.slotsStory(masterId, scope,
       { findSlotDiscounts: slotDiscountsFor });
     if (built.error) continue;
     const d = built.data;
     const times = (d.groups || []).flatMap((g) => g.times || []);
+    if (!times.length) continue;
     return { master: d.master, title: d.title, dateLabel: d.dateLabel,
-             priceLine: d.priceLine, times, free: built.meta.free };
+             priceLine: d.priceLine, times, free: built.meta.free,
+             when: whenWord(built.meta.date, built.meta.dayOffset) };
   }
   const e = await storyData.loadPublicCard(masterId);
   return e && { master: e, title: "Запись онлайн", dateLabel: "", priceLine: e.meta || "",
@@ -4766,7 +4781,6 @@ app.get("/m/:slug/meta", async (req, res) => {
     const c = await cardContent(id);
     if (!c) return res.status(404).json({ ok: false, error: "not_found" });
     const slug = String(req.params.slug).toLowerCase();
-    const when = c.dateLabel ? c.dateLabel.replace(/ ·.*$/, "").toLowerCase() : "";
     res.set("Cache-Control", "public, max-age=300");
     res.json({
       ok: true,
@@ -4774,7 +4788,7 @@ app.get("/m/:slug/meta", async (req, res) => {
       role: c.master.role || "",
       title: `${c.master.name}${c.master.role ? " · " + c.master.role : ""}`,
       description: c.times.length
-        ? `Свободные окошки ${when}: ${c.times.map((t) => t.t).join(", ")}. Запись за минуту, без звонков.`
+        ? `Свободные окошки ${c.when}: ${c.times.map((t) => t.t).join(", ")}. Запись за минуту, без звонков.`
         : "Запись за минуту, без звонков. Посмотрите свободное время и выберите удобное.",
       image: `${BOT_WEBHOOK_BASE}/m/${encodeURIComponent(slug)}/card.png`,
       deeplink: `https://t.me/UspotTG_bot/Uspot_BY?startapp=Uspot-${encodeURIComponent(slug)}`,

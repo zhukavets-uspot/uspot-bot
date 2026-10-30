@@ -235,15 +235,21 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
   };
 
   /* ── Формат «Окошки» на сегодня или завтра ─────────────────── */
+  /* scope — "today", "tomorrow" или число дней вперёд. Число нужно
+     публичной странице мастера: её ссылка живёт в шапке профиля
+     неделями, и в пятницу вечером «сегодня и завтра» пусты у всех, у
+     кого суббота выходная. Сторис и вечерний сигнал про числа не знают
+     и работают как раньше. */
   const slotsStory = async (entityId, scope = "tomorrow", opts = {}) => {
     const e = await loadEntity(entityId);
     if (!e) return { error: "master_not_found" };
     if (!e.memberIds.length) return { error: "no_masters" };
-    const iso = minskDateStr(scope === "today" ? 0 : 1);
+    const dayOff = typeof scope === "number" ? scope : scope === "today" ? 0 : 1;
+    const iso = minskDateStr(dayOff);
     const all = await loadBundle(e.memberIds, iso, iso);
     const services = all.services;
     const members = forService(all.members, opts.service);
-    const notBefore = scope === "today" ? minskMinutes() + BOOK_LEAD_MIN : null;
+    const notBefore = dayOff === 0 ? minskMinutes() + BOOK_LEAD_MIN : null;
     const { starts, capacity, free, working } = freeOnDate(members, iso, notBefore);
     if (!working) return { error: "day_off" };
     if (!starts.length) return { error: "no_slots" };
@@ -256,14 +262,16 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
       format: "slots",
       data: {
         title: opts.title || (open ? "Записываю на приём" : "Свободные окошки"),
-        dateLabel: `${scope === "today" ? "Сегодня" : "Завтра"}, ${ruWeekday(iso)} · ${ruDayMonth(iso)}`,
+        dateLabel: dayOff <= 1
+          ? `${dayOff === 0 ? "Сегодня" : "Завтра"}, ${ruWeekday(iso)} · ${ruDayMonth(iso)}`
+          : `${ruWeekday(iso)} · ${ruDayMonth(iso)}`,
         priceLine: opts.showPrice === false ? "" : serviceLine(services, opts.service, dur),
         groups: groupTimes(times, off),
         master: await cardOf(e.entity),
       },
       /* times отдаём наружу: кабинет по ним предлагает повесить скидку
          ровно на те окна, которые попали на картинку. */
-      meta: { date: iso, free: starts.length, capacity, shown: times.length, open,
+      meta: { date: iso, dayOffset: dayOff, free: starts.length, capacity, shown: times.length, open,
               times: times.map(hhmm), masters: members.length, service: opts.service || null },
     };
   };
