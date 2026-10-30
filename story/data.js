@@ -400,5 +400,18 @@ module.exports = ({ db, BOOK_LEAD_MIN = 60 }) => {
     };
   };
 
-  return { slotsStory, weekStory, hotStory, reviewStory, toSlug, minskDateStr };
+  /* Карточка без привязки ко дню — запасной вариант для публичной
+     страницы мастера. Нужна, когда окон нет ни сегодня, ни завтра:
+     ссылка висит в шапке профиля неделями, и выходной у мастера не
+     повод показать пустой прямоугольник. */
+  const loadPublicCard = async (entityId) => {
+    const e = await loadEntity(entityId);
+    if (!e) return null;
+    const today = minskDateStr(0);
+    const all = e.memberIds.length ? await loadBundle(e.memberIds, today, today) : { services: [] };
+    const card = await cardOf(e.entity);
+    return { ...card, meta: priceLineOf(all.services, 60) };
+  };
+
+  return { slotsStory, weekStory, hotStory, reviewStory, loadPublicCard, toSlug, minskDateStr };
 };

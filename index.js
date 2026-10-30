@@ -1356,7 +1356,7 @@ bot.on("callback_query", async (query) => {
     const time = `${hm.slice(0, 2)}:${hm.slice(2)}`;
     try {
       const { data: bk } = await db.from("bookings")
-        .select("client_telegram_id, service_name, booked_date, booked_time, master_id, total_price, status")
+        .select("client_telegram_id, service_name, booked_date, booked_time, master_id, total_price, status, address, address_lat, address_lng")
         .eq("id", bookingId).single();
       if (!bk) { await bot.answerCallbackQuery(query.id, { text: "Запись не найдена" }); return; }
       /* Список окон мог пролежать в чате долго: за это время запись
@@ -1391,7 +1391,7 @@ bot.on("callback_query", async (query) => {
           `💇 ${bk.service_name || "Услуга"}\n` +
           `📅 Вы просили: ${dateRu(bk.booked_date)}, ${timeShort(bk.booked_time)}\n` +
           `📅 Мастер предлагает: <b>${dateRu(iso)}, ${time}</b>\n` +
-          addrBlock(visitPlace(b, mFull)) +
+          addrBlock(visitPlace(bk, mFull)) +
           `\nПодходит новое время?`,
           [[{ text: "✅ Подтвердить", callback_data: `sok_${bookingId}_${iso}_${hm}` }],
            [{ text: "📅 Выбрать другое время", callback_data: `reschedule_${bookingId}` }]],
@@ -1455,7 +1455,7 @@ bot.on("callback_query", async (query) => {
         `💇 ${bk.service_name || "Услуга"}\n` +
         `📆 <b>${dateRu(iso)}, ${time}</b>\n` +
         (bk.total_price ? `💳 ${priceTag(bk)}\n` : "") +
-        addrBlock(visitPlace(b, mFull)) +
+        addrBlock(visitPlace(bk, mFull)) +
         `\nЖдём вас! 💜`,
         [[{ text: "📅 Перенести", callback_data: `reschedule_${bookingId}` },
           { text: "❌ Отменить",  callback_data: `client_cancel_${bookingId}` }]],
@@ -4646,6 +4646,7 @@ app.post("/promo/slot/list", async (req, res) => {
 
 const storyData = require("./story/data")({ db, BOOK_LEAD_MIN });
 const { render: renderStory } = require("./story");
+const { renderCard } = require("./story/card");
 
 const STORY_TTL_MS = 30 * 60 * 1000;
 const STORY_MAX    = 24;                    /* верхняя граница памяти под кэш: тема
@@ -4691,6 +4692,126 @@ app.get("/story/:file", (req, res) => {
   res.set("Content-Type", "image/png");
   res.set("Cache-Control", "private, max-age=600");
   res.send(hit.png);
+});
+
+// ════════════════════════════════════════════════════════════
+// ПУБЛИЧНАЯ КАРТОЧКА МАСТЕРА — uspot.by/m/<слаг>
+// ════════════════════════════════════════════════════════════
+/* Адрес uspot.by/m/anna_kovalski напечатан на каждой сторис и живёт в
+   шапке профиля. Вставленный в переписку, он до сих пор разворачивался
+   в превью бота: наше имя, наше описание, ничего про мастера. А нажать
+   на саму сторис нельзя — Instagram не даёт API для кликабельных
+   стикеров. Значит кликабельным носителем становится ссылка, и ей
+   нужна своя карточка: имя мастера, свободные окошки, призыв.
+
+   Отсюда две ручки: разметку страницы собирает Netlify, данные и
+   картинку отдаёт бот. Обе публичные — это и есть реклама. */
+
+const CARD_TTL_MS = 10 * 60 * 1000;         // окна меняются, карточка не должна врать
+const cardCache = new Map();                // слаг → { png, at }
+const slugCache = { at: 0, map: new Map() };
+
+/* Слаг считается из имени, отдельной колонки в базе нет. Список
+   маленький, поэтому раз в пять минут перечитываем всех видимых и
+   строим соответствие целиком — так не нужно ни ILIKE, ни индекс.
+   Два одинаковых имени дадут один слаг: берём того, кто зарегистрирован
+   раньше, чтобы ссылка не переезжала между людьми от перезапуска. */
+const resolveSlug = async (slug) => {
+  const key = String(slug || "").toLowerCase();
+  if (!key) return null;
+  if (Date.now() - slugCache.at > 5 * 60 * 1000) {
+    const { data } = await db.from("masters")
+      .select("id, name, created_at, kind, salon_id")
+      .eq("is_active", true).eq("moderation_status", "approved");
+    const map = new Map();
+    for (const m of (data || []).slice().sort((a, b) =>
+      String(a.created_at || "").localeCompare(String(b.created_at || "")))) {
+      /* Мастер салона своей публичной страницы не получает: клиент
+         записывается в салон, и ссылка должна вести туда. */
+      if (m.salon_id && m.kind !== "salon") continue;
+      const sl = storyData.toSlug(m.name || "");
+      if (sl && !map.has(sl)) map.set(sl, m.id);
+    }
+    slugCache.map = map;
+    slugCache.at = Date.now();
+  }
+  return slugCache.map.get(key) || null;
+};
+
+/* Что показать на карточке: ближайший день, где есть окна. Завтра —
+   основной случай, сегодня — если завтра выходной, иначе общий текст.
+   Пустую карточку не отдаём никогда: ссылка висит неделями, и выходной
+   у мастера не повод отдать пустоту. */
+const cardContent = async (masterId) => {
+  for (const scope of ["tomorrow", "today"]) {
+    const built = await storyData.slotsStory(masterId, scope,
+      { findSlotDiscounts: slotDiscountsFor });
+    if (built.error) continue;
+    const d = built.data;
+    const times = (d.groups || []).flatMap((g) => g.times || []);
+    return { master: d.master, title: d.title, dateLabel: d.dateLabel,
+             priceLine: d.priceLine, times, free: built.meta.free };
+  }
+  const e = await storyData.loadPublicCard(masterId);
+  return e && { master: e, title: "Запись онлайн", dateLabel: "", priceLine: e.meta || "",
+                times: [], free: 0 };
+};
+
+// ── GET /m/:slug/meta ──────────────────────────────────────
+// Данные для разметки страницы. Netlify забирает их и вклеивает в теги.
+app.get("/m/:slug/meta", async (req, res) => {
+  try {
+    const id = await resolveSlug(req.params.slug);
+    if (!id) return res.status(404).json({ ok: false, error: "not_found" });
+    const c = await cardContent(id);
+    if (!c) return res.status(404).json({ ok: false, error: "not_found" });
+    const slug = String(req.params.slug).toLowerCase();
+    const when = c.dateLabel ? c.dateLabel.replace(/ ·.*$/, "").toLowerCase() : "";
+    res.set("Cache-Control", "public, max-age=300");
+    res.json({
+      ok: true,
+      name: c.master.name,
+      role: c.master.role || "",
+      title: `${c.master.name}${c.master.role ? " · " + c.master.role : ""}`,
+      description: c.times.length
+        ? `Свободные окошки ${when}: ${c.times.map((t) => t.t).join(", ")}. Запись за минуту, без звонков.`
+        : "Запись за минуту, без звонков. Посмотрите свободное время и выберите удобное.",
+      image: `${BOT_WEBHOOK_BASE}/m/${encodeURIComponent(slug)}/card.png`,
+      deeplink: `https://t.me/UspotTG_bot/Uspot_BY?startapp=Uspot-${encodeURIComponent(slug)}`,
+      free: c.free,
+    });
+  } catch (e) {
+    console.error("/m/:slug/meta:", e.message);
+    res.status(500).json({ ok: false, error: "meta_failed" });
+  }
+});
+
+// ── GET /m/:slug/card.png ──────────────────────────────────
+// Картинка превью. Её запрашивает не человек, а Telegram и прочие
+// обходчики ссылок, поэтому отдаём публично и с общим кэшем.
+app.get("/m/:slug/card.png", async (req, res) => {
+  try {
+    const slug = String(req.params.slug || "").toLowerCase();
+    const hit = cardCache.get(slug);
+    if (hit && Date.now() - hit.at < CARD_TTL_MS) {
+      res.set("Content-Type", "image/png");
+      res.set("Cache-Control", "public, max-age=600");
+      return res.send(hit.png);
+    }
+    const id = await resolveSlug(slug);
+    if (!id) return res.status(404).send("not found");
+    const c = await cardContent(id);
+    if (!c) return res.status(404).send("not found");
+    const { png } = renderCard({ ...c, tagline: STORY_TAGLINE });
+    cardCache.set(slug, { png, at: Date.now() });
+    while (cardCache.size > 40) cardCache.delete(cardCache.keys().next().value);
+    res.set("Content-Type", "image/png");
+    res.set("Cache-Control", "public, max-age=600");
+    res.send(png);
+  } catch (e) {
+    console.error("/m/:slug/card.png:", e.message);
+    res.status(500).send("render failed");
+  }
 });
 
 // ── POST /story/make ───────────────────────────────────────
@@ -5262,15 +5383,49 @@ app.get("/gcal/status", async (req, res) => {
   res.json({ ok: true, connected: !!data, updated_at: data?.updated_at });
 });
 
-// DELETE /gcal/disconnect?master_tg_id=XXX — revoke Google Calendar access
-app.delete("/gcal/disconnect", async (req, res) => {
-  const { master_tg_id } = req.query;
-  if (!master_tg_id) return res.status(400).json({ error: "Missing master_tg_id" });
+/* ── Отключение Google Календаря ───────────────────────────────────
+   Раньше ручка верила адресу: DELETE /gcal/disconnect?master_tg_id=… —
+   и всё. Любой, кто знает Telegram id мастера, отключал ему календарь:
+   записи переставали попадать в расписание, а мастер узнавал об этом,
+   придя на пустое место. Теперь личность берём из сессии.
+
+   Свой календарь отключает любой: привязка хранится по Telegram id, и у
+   клиента с мастером она одна на двоих. Чужой — только администратор
+   салона, которому этот календарь по должности и принадлежит: экран
+   салона шлёт Telegram салона, а он не равен Telegram администратора. */
+const mayManageGcal = async (sessionTgId, targetTgId) => {
+  if (String(sessionTgId) === String(targetTgId)) return true;
+  const { data: mine, error } = await db.from("masters")
+    .select("salon_id, salon_role").eq("telegram_user_id", String(sessionTgId));
+  if (error) { console.error("Права на календарь:", error.message); return false; }
+  const salonIds = (mine || [])
+    .filter((r) => r.salon_role === "admin" && r.salon_id).map((r) => r.salon_id);
+  if (!salonIds.length) return false;
+  const { data: salons } = await db.from("masters")
+    .select("telegram_user_id").in("id", salonIds);
+  return (salons || []).some((s) => String(s.telegram_user_id || "") === String(targetTgId));
+};
+
+/* POST /gcal/disconnect { token, master_tg_id } — отключить календарь.
+   Токен в теле, а не в адресе: адреса оседают в логах прокси и в referer.
+   DELETE оставлен тем же обработчиком — старая вкладка получит 401 и
+   честно скажет «войдите заново», а не отключит втихую чужое. */
+const gcalDisconnect = async (req, res) => {
+  const tgId = readSession(req.body?.token);
+  if (!tgId) return res.status(401).json({ error: "not_authorized" });
+  const target = String(req.body?.master_tg_id || tgId);
+  if (!(await mayManageGcal(tgId, target))) {
+    console.warn(`🚫 /gcal/disconnect: сессия ${tgId} просила чужой календарь ${target}`);
+    return res.status(403).json({ error: "forbidden" });
+  }
   const { error } = await db.from("master_gcal_tokens")
-    .delete().eq("master_telegram_id", String(master_tg_id));
+    .delete().eq("master_telegram_id", target);
   if (error) return res.status(500).json({ error: error.message });
+  console.log(`📅 Календарь отключён: ${target} (сессия ${tgId})`);
   res.json({ ok: true, disconnected: true });
-});
+};
+app.post("/gcal/disconnect", gcalDisconnect);
+app.delete("/gcal/disconnect", gcalDisconnect);
 
 // Delete any active polling/webhook then register new webhook, retrying on 409
 const registerWebhook = async (botInstance, url, label, attempts = 5) => {
