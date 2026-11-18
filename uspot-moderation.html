@@ -848,6 +848,7 @@ CREATE TABLE IF NOT EXISTS client_ratings (
 ALTER TABLE client_ratings ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Anon client_ratings" ON client_ratings;
 CREATE POLICY "Anon client_ratings" ON client_ratings FOR ALL USING (true) WITH CHECK (true);
+GRANT SELECT, INSERT, UPDATE, DELETE ON client_ratings TO anon, authenticated, service_role;
 
 -- ── Таблица master_blacklist ──────────────────────────────────
 CREATE TABLE IF NOT EXISTS master_blacklist (
@@ -862,6 +863,7 @@ CREATE TABLE IF NOT EXISTS master_blacklist (
 ALTER TABLE master_blacklist ENABLE ROW LEVEL SECURITY;
 DROP POLICY IF EXISTS "Anon master_blacklist" ON master_blacklist;
 CREATE POLICY "Anon master_blacklist" ON master_blacklist FOR ALL USING (true) WITH CHECK (true);
+GRANT SELECT, INSERT, UPDATE, DELETE ON master_blacklist TO anon, authenticated, service_role;
 
 -- После запуска SQL обновите кеш схемы:
 -- NOTIFY pgrst, 'reload schema';</pre>
@@ -901,6 +903,10 @@ CREATE TABLE IF NOT EXISTS portfolio (
   created_at timestamptz DEFAULT now()
 );
 ALTER TABLE portfolio ENABLE ROW LEVEL SECURITY;
+
+-- С 30 октября 2026 Supabase не выдаёт права на новые таблицы в public
+-- автоматически — без GRANT таблица не видна ни сайту, ни боту.
+GRANT SELECT, INSERT, UPDATE, DELETE ON portfolio TO anon, authenticated, service_role;
 
 -- ── Уникальный индекс для расписания (один раз!) ─────────────
 DO $$ BEGIN
@@ -1152,25 +1158,17 @@ async function loadMasters() {
 async function loadSalonApps() {
   showState('salons', 'loading');
   try {
-    const { data, error } = await sb
-      .from('salon_applications')
-      .select('*')
-      .eq('status', 'pending')
-      .order('created_at', { ascending: true });
-    if (error) throw error;
+    /* Заявки отдаёт бот по ключу модерации: в них телефоны заявителей,
+       и публичным ключом их читал кто угодно (патч v28 это закрыл).
+       Профили заявителя бот подкладывает сам — полем _owned. */
+    const r = await fetch('/moderation/salon-apps', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: MOD_KEY }),
+    });
+    const body = await r.json().catch(() => null);
+    if (!r.ok || !body || body.ok !== true) throw new Error(body?.error || 'Не удалось загрузить заявки');
 
-    salonItems = data || [];
-    // Есть ли у заявителя уже профили в Uspot — это меняет решение
-    if (salonItems.length) {
-      const tgs = [...new Set(salonItems.map(a => a.telegram_user_id).filter(Boolean))];
-      if (tgs.length) {
-        const { data: owned } = await sb.from('masters')
-          .select('id, name, kind, telegram_user_id').in('telegram_user_id', tgs);
-        const byTg = {};
-        (owned || []).forEach(m => { (byTg[m.telegram_user_id] = byTg[m.telegram_user_id] || []).push(m); });
-        salonItems.forEach(a => { a._owned = byTg[a.telegram_user_id] || []; });
-      }
-    }
+    salonItems = body.rows || [];
     document.getElementById('badge-salons').textContent = salonItems.length;
     if (!salonItems.length) { showState('salons', 'empty'); return; }
     showState('salons', 'list');
@@ -1376,6 +1374,10 @@ async function loadRegistry() {
         if (!m.contact_phone) gaps.push('телефон');
         if (!m.contact_email) gaps.push('почта');
         if (!all.some(x => x.salon_id === m.id)) gaps.push('мастера');
+      } else if (m.salon_role === 'admin' && m.is_active === false) {
+        /* Строка только для входа в кабинет: клиентов не принимает,
+           поэтому услуги, график и фото с неё спрашивать незачем. */
+        if (!m.telegram_user_id) gaps.push('Telegram');
       } else {
         if (!m.photo_url) gaps.push('фото');
         if (!m.bio) gaps.push('описание');
@@ -1383,8 +1385,9 @@ async function loadRegistry() {
         if (!(dayN[m.id] > 0)) gaps.push('рабочие дни');
         if (!m.telegram_user_id) gaps.push('Telegram');
         if (m.kind !== 'salon_master' && !(portN[m.id] > 0)) gaps.push('портфолио');
+        if (!m.lat || !m.lng) gaps.push('точка на карте');
       }
-      if (!m.lat || !m.lng) gaps.push('точка на карте');
+      if (isSalon && (!m.lat || !m.lng)) gaps.push('точка на карте');
       return { ...m, _svc: svcN[m.id] || 0, _days: dayN[m.id] || 0, _port: portN[m.id] || 0,
                _gaps: gaps, _salonName: m.salon_id ? (salonName[m.salon_id] || '—') : null };
     });
@@ -1480,6 +1483,7 @@ function buildRegistryCard(m) {
       </div>
       <div class="client-row">
         <strong>${esc(m.role || (isSalon ? 'Салон красоты' : 'Мастер'))}</strong>
+        ${m.salon_role === 'admin' ? '<span class="tag-chip">администратор</span>' : ''}
         ${m._salonName ? `<span class="tag-chip">${esc(m._salonName)}</span>` : ''}
         ${m.telegram_user_id ? `<span class="tg-id">${esc(m.telegram_user_id)}</span>` : ''}
       </div>
